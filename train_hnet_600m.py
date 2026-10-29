@@ -356,7 +356,16 @@ def main():
             graph_step = GraphStep(model, optimizer, x0, y0, args)
         elif rank == 0:
             print(f"CUDA graphs disabled: {reason}", flush=True)
-    log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
+    log = {
+        "args": vars(args),
+        "params": n_params,
+        "world": world,
+        "loss": [],
+        "ratio": [],
+        "time_ms": [],
+        "power_w": [],
+        "nonfinite": [],
+    }
     latest_power = []
     for step in range(start_step, args.steps):
         x, y = stream.get(step, device)
@@ -407,6 +416,8 @@ def main():
             step == start_step or step % args.power_every == 0
         ):
             latest_power = read_power_watts()
+        if rank == 0:
+            log["power_w"].append(list(latest_power))
         if rank == 0 and (step < 3 or step % args.log_every == 0):
             print(
                 f"step={step} loss={float(reduced):.6f} time_ms={elapsed:.1f} "

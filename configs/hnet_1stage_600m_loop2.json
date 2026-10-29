@@ -18,7 +18,7 @@
     "inner_loops": 2,
     "msar": true,
     "msar_stream_kernels": [1, 4, 8, 12],
-    "swa_window_size": 1023,
+    "swa_window_size": 512,
     "fbt": true,
     "fbt_jitter": 0.02,
     "max_seq_len": 4096,
