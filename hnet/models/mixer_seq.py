@@ -64,8 +64,18 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         self.backbone._init_weights(0.02)
 
     def forward(self, input_ids, mask=None, inference_params=None, fbt_passes=1, **mixer_kwargs):
-        if input_ids.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
+        if input_ids.dtype not in integer_dtypes:
             raise TypeError("H-Net byte inputs must be integer byte IDs")
+        # The trainer supplies uint8 directly, so the hot path has no range
+        # reduction or host synchronization.  Public callers may use signed
+        # integer tensors; validate those explicitly instead of letting -1
+        # silently wrap to byte 255 through index_select.
+        if input_ids.dtype != torch.uint8 and input_ids.numel():
+            low = int(input_ids.detach().amin().item())
+            high = int(input_ids.detach().amax().item())
+            if low < 0 or high > 255:
+                raise ValueError(f"H-Net byte IDs must be in [0, 255], got [{low}, {high}]")
         # MoE routing statistics are accumulated across recurrent inner loops
         # and FBT passes.  Reset once at the outer model boundary so a stale
         # value from the previous minibatch cannot leak into this loss.
