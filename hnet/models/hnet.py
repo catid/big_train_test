@@ -290,6 +290,18 @@ class HNet(nn.Module):
         )
 
         n_passes = max(1, int(fbt_passes)) if self.fbt_enabled else 1
+        # A normal one-pass prefill must populate the allocated recurrent/KV
+        # caches for autoregressive ``step``. FBT uses fresh inner passes and
+        # is explicitly disallowed with inference caches above.
+        cached_main_state = (
+            inference_params.main_network_state if n_passes == 1 else None
+        )
+        cached_dechunk_state = (
+            inference_params.dechunk_state if n_passes == 1 else None
+        )
+        cached_decoder_state = (
+            inference_params.decoder_state if n_passes == 1 else None
+        )
         feedback_logits = []
         base_chunk_states = hidden_states
         previous_inner = None
@@ -335,7 +347,7 @@ class HNet(nn.Module):
                 cu_seqlens=next_cu_seqlens,
                 max_seqlen=next_max_seqlen,
                 mask=next_mask,
-                inference_params=None,
+                inference_params=cached_main_state,
                 **mixer_kwargs,
             )
             previous_inner = inner_out
@@ -347,7 +359,7 @@ class HNet(nn.Module):
                 bpred_output.boundary_prob,
                 next_cu_seqlens,
                 mask=mask,
-                inference_params=None,
+                inference_params=cached_dechunk_state,
             )
             decoded = self.residual_func(
                 decoded.to(dtype=residual.dtype), residual, bpred_output.selected_probs
@@ -357,7 +369,7 @@ class HNet(nn.Module):
                 cu_seqlens=cu_seqlens,
                 max_seqlen=max_seqlen,
                 mask=mask,
-                inference_params=None,
+                inference_params=cached_decoder_state,
                 **mixer_kwargs,
             )
             if return_feedback:
