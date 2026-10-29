@@ -102,6 +102,7 @@ class SparseMoESwiGLU(nn.Module):
         self.router = nn.Linear(d_model, self.num_experts, bias=False, **factory_kwargs)
         self.shared_gate = nn.Linear(d_model, 1, bias=True, **factory_kwargs)
         self._aux_loss = None
+        self._aux_loss_count = 0
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -118,8 +119,21 @@ class SparseMoESwiGLU(nn.Module):
 
     @property
     def aux_loss(self):
-        """Router load-balancing loss from the most recent forward."""
-        return self._aux_loss
+        """Mean router load-balancing loss for this model forward.
+
+        The deepest stack may execute the same MoE layer multiple times from
+        recurrent inner loops and FBT passes.  Keep every call in the
+        objective, while averaging over calls so enabling a loop does not
+        silently multiply the auxiliary-loss coefficient.
+        """
+        if self._aux_loss is None:
+            return None
+        return self._aux_loss / max(1, self._aux_loss_count)
+
+    def reset_aux_loss(self):
+        """Clear per-forward routing statistics before a new model call."""
+        self._aux_loss = None
+        self._aux_loss_count = 0
 
     def _shared(self, x):
         y, gate = self.shared_fc1(x).chunk(2, dim=-1)
@@ -152,9 +166,14 @@ class SparseMoESwiGLU(nn.Module):
         active_one_hot = active_one_hot * active_f[:, None]
         dispatch_fraction = active_one_hot.sum(dim=0) / active_count
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
-        self._aux_loss = self.aux_loss_weight * self.num_experts * (
+        current_aux_loss = self.aux_loss_weight * self.num_experts * (
             dispatch_fraction * mean_probs
         ).sum()
+        if self._aux_loss is None:
+            self._aux_loss = current_aux_loss
+        else:
+            self._aux_loss = self._aux_loss + current_aux_loss
+        self._aux_loss_count += 1
 
         # Fixed per-expert capacity and grouped dispatch.  Capacity is derived
         # from the static token count of the graph; overflow tokens are left on

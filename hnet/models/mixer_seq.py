@@ -120,6 +120,10 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
         """
         num_last_tokens: if > 0, only return the logits for the last n tokens
         """
+        for module in self.backbone.modules():
+            reset_aux_loss = getattr(module, "reset_aux_loss", None)
+            if reset_aux_loss is not None:
+                reset_aux_loss()
         hidden_states = self.embeddings(input_ids)
 
         B, L, D = hidden_states.shape
@@ -204,6 +208,13 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
     def forward(self, input_ids, mask=None, inference_params=None, fbt_passes=1, **mixer_kwargs):
         if input_ids.dtype not in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
             raise TypeError("H-Net byte inputs must be integer byte IDs")
+        # MoE routing statistics are accumulated across recurrent inner loops
+        # and FBT passes.  Reset once at the outer model boundary so a stale
+        # value from the previous minibatch cannot leak into this loss.
+        for module in self.backbone.modules():
+            reset_aux_loss = getattr(module, "reset_aux_loss", None)
+            if reset_aux_loss is not None:
+                reset_aux_loss()
         hidden_dtype = self.input_dtype
         hidden_states = self.byte_features(input_ids, hidden_dtype)
         B, L, D = hidden_states.shape
