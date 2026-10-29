@@ -44,29 +44,58 @@ class _CroissAttn(torch.autograd.Function):
         qf = _fp8_qdq(q)
         kf = _fp8_qdq(k)
         vf = _fp8_qdq(v)
-        scores = torch.bmm(qf, kf.transpose(1, 2)) * scale
-        causal = torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool).triu(1)
-        scores = scores.masked_fill(causal, float("-inf"))
-        p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        out = torch.bmm(_fp8_qdq(p), vf)
-        # Keep a separate unrounded auxiliary output O'=P@V_f.  Reusing the
-        # rounded FP8 PV output here is the CroissAttn bug fixed in ~/fp8.
-        aux = torch.bmm(p.float(), vf.float()).to(q.dtype)
-        ctx.save_for_backward(qf, kf, vf, p, aux)
+        seqlen = qf.shape[1]
+        # Materialize attention probabilities in query tiles.  The previous
+        # implementation allocated [B*H,S,S], which made batch scaling fail
+        # at S=4096 even on 256 GiB GPUs.  A 512-row tile preserves the exact
+        # CroissAttn arithmetic while bounding peak score memory.
+        block = min(512, seqlen)
+        outputs = []
+        for start in range(0, seqlen, block):
+            end = min(start + block, seqlen)
+            scores = torch.bmm(qf[:, start:end], kf[:, :end].transpose(1, 2)) * scale
+            causal = torch.ones((end - start, end), device=scores.device, dtype=torch.bool).triu(1 + start)
+            scores = scores.masked_fill(causal, float("-inf"))
+            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            outputs.append(torch.bmm(_fp8_qdq(p), vf[:, :end]))
+        out = torch.cat(outputs, dim=1)
+        # Keep only quantized operands for autograd.  Recomputing P and the
+        # unrounded auxiliary O'=P@V_f in backward avoids retaining the full
+        # [batch*heads, seqlen, seqlen] probability and auxiliary tensors for
+        # every recurrent/FBT invocation.  This is essential for batch scaling
+        # while preserving the CroissAttn correction (O' is never the rounded
+        # FP8 PV output).
+        ctx.save_for_backward(qf, kf, vf)
         ctx.scale = scale
-        ctx.causal = causal
+        ctx.seqlen = seqlen
+        ctx.block = block
         return out
 
     @staticmethod
     def backward(ctx, dout):
-        qf, kf, vf, p, aux = ctx.saved_tensors
-        dpf = torch.bmm(_fp8_qdq(dout, True), vf.transpose(1, 2))
-        dv = torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(dout, True))
-        dstar = (dout.float() * aux.float()).sum(dim=-1, keepdim=True)
-        ds = p * (dpf.float() - dstar).to(p.dtype)
-        ds = ds.masked_fill(ctx.causal, 0)
-        dq = torch.bmm(_fp8_qdq(ds, True), kf) * ctx.scale
-        dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf) * ctx.scale
+        qf, kf, vf = ctx.saved_tensors
+        seqlen, block = ctx.seqlen, ctx.block
+        dq = torch.zeros_like(qf)
+        dk = torch.zeros_like(kf)
+        dv = torch.zeros_like(vf)
+        for start in range(0, seqlen, block):
+            end = min(start + block, seqlen)
+            key_len = end
+            scores = torch.bmm(qf[:, start:end], kf[:, :key_len].transpose(1, 2)) * ctx.scale
+            causal = torch.ones((end - start, key_len), device=qf.device, dtype=torch.bool).triu(1 + start)
+            scores = scores.masked_fill(causal, float("-inf"))
+            p = torch.softmax(scores.float(), dim=-1).to(qf.dtype)
+            d_out = dout[:, start:end]
+            dpf = torch.bmm(_fp8_qdq(d_out, True), vf[:, :key_len].transpose(1, 2))
+            dv[:, :key_len] += torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(d_out, True))
+            # CroissAttn's corrected auxiliary O'=P@V_f uses the unrounded
+            # probability/value product in the softmax derivative.
+            aux = torch.bmm(p.float(), vf[:, :key_len].float()).to(qf.dtype)
+            dstar = (d_out.float() * aux.float()).sum(dim=-1, keepdim=True)
+            ds = p * (dpf.float() - dstar).to(p.dtype)
+            ds = ds.masked_fill(causal, 0)
+            dq[:, start:end] = torch.bmm(_fp8_qdq(ds, True), kf[:, :key_len]) * ctx.scale
+            dk[:, :key_len] += torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf[:, start:end]) * ctx.scale
         return dq, dk, dv, None
 
 
