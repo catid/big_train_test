@@ -8,6 +8,9 @@ class AttnConfig:
     num_heads: List = field(default_factory=list)
     rotary_emb_dim: List = field(default_factory=list)
     window_size: List = field(default_factory=list)
+    # Opt-in CroissAttn FP8 backward correction.  This keeps the auxiliary
+    # unrounded O'=P@V_f used by the softmax derivative; see ~/fp8.
+    croissattn_aux: bool = False
 
 
 @dataclass
@@ -41,3 +44,14 @@ class HNetConfig:
     fbt_prefix_mixin: bool = True
     max_seq_len: int = 4096
     static_chunking: bool = False
+    # Optional DeepSeek/Mixtral-style sparse FFN.  Eight routed experts with
+    # top-1 dispatch give the requested 1:8 active expert sparsity.  The
+    # shared expert is always evaluated and is deliberately narrow so it
+    # carries common features without duplicating every routed expert.
+    moe_enabled: bool = False
+    moe_num_experts: int = 8
+    moe_top_k: int = 1
+    moe_expert_intermediate: int = 0
+    moe_shared_intermediate: int = 0
+    moe_capacity_factor: float = 1.25
+    moe_aux_loss_weight: float = 0.01

@@ -110,9 +110,10 @@ Scalar/vector tensors and any parameters explicitly placed in a fallback group
 use the same SODA anchor plus AdamATan2 by default. Optional fallback modes
 exist for narrow experiments on scalar/vector parameters only, but they do not
 affect the matrix direction generator. Automatic matrix eligibility is based
-only on effective shape after ignoring singleton dimensions: for example
-``[1, 1, width]`` is a vector, while ``[1, tokens, width]`` is a matrix. Names
-are never used for routing in this standalone file.
+only on effective shape after ignoring singleton dimensions. Two-dimensional
+weights use the spectral matrix path. Stacked expert banks use a batched
+spectral path, keeping each expert's matrix independent; names are never used
+for routing in this standalone file.
 
 The default ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
 an AdamATan2-style bounded angular update:
@@ -391,9 +392,12 @@ def _matrix_view(x: torch.Tensor) -> torch.Tensor:
         raise ValueError("matrix update requires at least two non-singleton dimensions")
     if len(effective_shape) == 2:
         return x.reshape(effective_shape)
-    rows = effective_shape[0]
-    cols = math.prod(effective_shape[1:])
-    return x.reshape(rows, cols)
+    # Preserve the final two matrix dimensions and flatten only leading bank
+    # dimensions. This makes [experts, out, in] a batch of independent Muon
+    # matrices instead of one matrix that couples all experts.
+    rows, cols = effective_shape[-2:]
+    banks = math.prod(effective_shape[:-2])
+    return x.reshape(banks, rows, cols)
 
 
 @torch.no_grad()
@@ -884,18 +888,18 @@ class AnchorMuon(torch.optim.Optimizer):
     def _ensure_matrix_state(
         self,
         p: torch.Tensor,
-        rows: int,
+        row_shape: tuple[int, ...],
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         state = self.state[p]
         row_ema = state.get("pmuoneq_row_ema")
-        if isinstance(row_ema, torch.Tensor) and row_ema.shape == (rows,):
+        if isinstance(row_ema, torch.Tensor) and tuple(row_ema.shape) == row_shape:
             if row_ema.device != device or row_ema.dtype != torch.float32:
                 row_ema = state["pmuoneq_row_ema"] = row_ema.to(device=device, dtype=torch.float32)
         else:
-            row_ema = state["pmuoneq_row_ema"] = torch.ones(rows, device=device, dtype=torch.float32)
+            row_ema = state["pmuoneq_row_ema"] = torch.ones(*row_shape, device=device, dtype=torch.float32)
         second = state.get("normuon_second_momentum")
-        second_shape = (rows, 1)
+        second_shape = (*row_shape, 1)
         if isinstance(second, torch.Tensor) and second.shape == second_shape:
             if second.device != device or second.dtype != torch.float32:
                 second = state["normuon_second_momentum"] = second.to(device=device, dtype=torch.float32)
@@ -910,26 +914,29 @@ class AnchorMuon(torch.optim.Optimizer):
     ) -> torch.Tensor:
         sources = torch.stack([entry[2].to(torch.float32) for entry in entries], dim=0)
         grads = torch.stack([entry[3].to(torch.float32) for entry in entries], dim=0)
-        _batch, rows, _cols = grads.shape
 
         row_buffers: list[torch.Tensor] = []
         second_buffers: list[torch.Tensor] = []
-        for p, _anchor, _source, _grad in entries:
-            row_ema, second = self._ensure_matrix_state(p, rows, grads.device)
+        for p, _anchor, source, _grad in entries:
+            # State follows every independent matrix in a stacked bank. For a
+            # normal 2-D weight this is simply (rows,), while an expert bank
+            # has shape (experts, rows).
+            row_shape = tuple(int(v) for v in source.shape[:-1])
+            row_ema, second = self._ensure_matrix_state(p, row_shape, grads.device)
             row_buffers.append(row_ema)
             second_buffers.append(second)
 
         row_stack = torch.stack(row_buffers, dim=0)
         if self.use_pmuoneq:
             beta_p = float(group["pmuoneq_beta"])
-            row_stack.mul_(beta_p).add_(grads.square().mean(dim=2), alpha=1.0 - beta_p)
+            row_stack.mul_(beta_p).add_(grads.square().mean(dim=-1), alpha=1.0 - beta_p)
             row_factor = _diag_inverse_power(
                 row_stack, gamma=float(group["row_gamma"]), eps=float(group["pmuoneq_eps"])
             )
         else:
             row_factor = torch.ones_like(row_stack)
 
-        preconditioned = sources * row_factor[:, :, None]
+        preconditioned = sources * row_factor.unsqueeze(-1)
         update = self._orthogonalizer(preconditioned)
         update = update * (0.2 * math.sqrt(max(update.size(-2), update.size(-1))))
 

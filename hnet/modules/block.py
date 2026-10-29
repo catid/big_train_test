@@ -9,7 +9,7 @@ from flash_attn.ops.triton.layer_norm import RMSNorm
 from mamba_ssm.modules.mamba2 import Mamba2
 
 from .mha import CausalMHA
-from .mlp import SwiGLU
+from .mlp import SwiGLU, SparseMoESwiGLU
 
 
 class Mamba2Wrapper(Mamba2):
@@ -43,6 +43,7 @@ def create_block(
     residual_in_fp32=True,
     device=None,
     dtype=None,
+    moe_cfg=None,
 ):
     factory_kwargs = {"device": device, "dtype": dtype}
 
@@ -60,11 +61,24 @@ def create_block(
 
     # MLP
     if arch in ("T", "M"):
-        mlp_cls = partial(
-            SwiGLU,
-            d_intermediate=d_intermediate,
-            **factory_kwargs,
-        )
+        if moe_cfg is not None and bool(getattr(moe_cfg, "moe_enabled", False)):
+            mlp_cls = partial(
+                SparseMoESwiGLU,
+                d_intermediate=d_intermediate,
+                num_experts=int(getattr(moe_cfg, "moe_num_experts", 8)),
+                top_k=int(getattr(moe_cfg, "moe_top_k", 1)),
+                expert_intermediate=int(getattr(moe_cfg, "moe_expert_intermediate", 0)),
+                shared_intermediate=int(getattr(moe_cfg, "moe_shared_intermediate", 0)),
+                capacity_factor=float(getattr(moe_cfg, "moe_capacity_factor", 1.25)),
+                aux_loss_weight=float(getattr(moe_cfg, "moe_aux_loss_weight", 0.01)),
+                **factory_kwargs,
+            )
+        else:
+            mlp_cls = partial(
+                SwiGLU,
+                d_intermediate=d_intermediate,
+                **factory_kwargs,
+            )
     elif arch in ("t", "m"):
         mlp_cls = nn.Identity
     else:
@@ -111,6 +125,7 @@ class Block(nn.Module):
         residual: Optional[Tensor] = None,
         inference_params=None,
         mixer_kwargs=None,
+        active_mask=None,
     ):
         hidden_states, residual = self.norm1(
             hidden_states,
@@ -132,7 +147,7 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, active_mask=active_mask)
 
         return hidden_states, residual
 

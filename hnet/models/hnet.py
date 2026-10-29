@@ -315,6 +315,7 @@ class HNet(nn.Module):
                 # The projection is kept outside any FP8 region and the gate
                 # is evaluated in FP32 for stable sigmoid gradients.
                 gate = torch.sigmoid(self.fbt_gate(pass_input).float()).to(pass_input.dtype)
+                shifted = shifted.to(dtype=self.fbt_up.weight.dtype)
                 pass_input = pass_input + self.fbt_up(shifted).to(pass_input.dtype) * gate
                 if getattr(self.config, "fbt_prefix_mixin", False):
                     # Keep a plain prefix so training matches prompt-prefill

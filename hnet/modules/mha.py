@@ -15,6 +15,73 @@ from flash_attn import (
 from .rotary import RotaryEmbedding
 
 
+def _fp8_qdq(x: torch.Tensor, backward: bool = False) -> torch.Tensor:
+    """Round an activation to FP8 and decode it without a host-side fallback.
+
+    CroissAttn's correction is applied to FP8 training products.  The B300
+    PyTorch build does not expose a batched ``_scaled_mm`` API, so products
+    use vectorized ``bmm`` on decoded BF16 operands; this preserves the
+    algorithm and avoids a Python loop over heads or tokens.  Transformer
+    Engine's fused path remains available in ``train_600m_fp8.py``.
+    """
+    dtype = torch.float8_e5m2 if backward else torch.float8_e4m3fn
+    limit = 57344.0 if backward else 448.0
+    scale = x.detach().float().abs().amax().div(limit).clamp_min(torch.finfo(torch.float32).tiny)
+    return (x / scale).to(dtype).to(x.dtype) * scale.to(x.dtype)
+
+
+class _CroissAttn(torch.autograd.Function):
+    """Vectorized CroissAttn reference with the corrected auxiliary O'.
+
+    This opt-in path is used only for regular (unpacked) training attention.
+    It follows ~/fp8's six-product schedule and zeros the strictly upper
+    causal triangle before dQ/dK, preventing masked logits from contributing
+    gradients.  There is no Python per-token fallback.
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, scale):
+        qf = _fp8_qdq(q)
+        kf = _fp8_qdq(k)
+        vf = _fp8_qdq(v)
+        scores = torch.bmm(qf, kf.transpose(1, 2)) * scale
+        causal = torch.ones(scores.shape[-2:], device=scores.device, dtype=torch.bool).triu(1)
+        scores = scores.masked_fill(causal, float("-inf"))
+        p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        out = torch.bmm(_fp8_qdq(p), vf)
+        # Keep a separate unrounded auxiliary output O'=P@V_f.  Reusing the
+        # rounded FP8 PV output here is the CroissAttn bug fixed in ~/fp8.
+        aux = torch.bmm(p.float(), vf.float()).to(q.dtype)
+        ctx.save_for_backward(qf, kf, vf, p, aux)
+        ctx.scale = scale
+        ctx.causal = causal
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        qf, kf, vf, p, aux = ctx.saved_tensors
+        dpf = torch.bmm(_fp8_qdq(dout, True), vf.transpose(1, 2))
+        dv = torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(dout, True))
+        dstar = (dout.float() * aux.float()).sum(dim=-1, keepdim=True)
+        ds = p * (dpf.float() - dstar).to(p.dtype)
+        ds = ds.masked_fill(ctx.causal, 0)
+        dq = torch.bmm(_fp8_qdq(ds, True), kf) * ctx.scale
+        dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf) * ctx.scale
+        return dq, dk, dv, None
+
+
+def croissattn_fp8(q, k, v, scale):
+    """Apply corrected CroissAttn to [B,H,S,D] tensors."""
+    b, h, s, d = q.shape
+    out = _CroissAttn.apply(
+        q.reshape(b * h, s, d),
+        k.reshape(b * h, s, d),
+        v.reshape(b * h, s, d),
+        scale,
+    )
+    return out.reshape(b, h, s, d)
+
+
 class FlashCausalSelfAttention(nn.Module):
     """Implement the scaled dot product attention with softmax.
     Arguments
@@ -201,6 +268,7 @@ class CausalMHA(nn.Module):
         rotary_emb_dim=0,
         rotary_emb_base=10000.0,
         rotary_emb_interleaved=False,
+        croissattn_aux=False,
         device=None,
         dtype=None,
     ) -> None:
@@ -216,6 +284,7 @@ class CausalMHA(nn.Module):
         self.softmax_scale = softmax_scale
         self.rotary_emb_dim = rotary_emb_dim
         self.window_size = window_size
+        self.croissattn_aux = bool(croissattn_aux)
         # The decode path chooses between the fused KV-cache kernel and the
         # portable cache update below.
         self.use_flash_attn = flash_attn_with_kvcache is not None
@@ -408,7 +477,18 @@ class CausalMHA(nn.Module):
                 #     qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                 # )
                 qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, **kwargs)
-            if inference_params is None:
+            if (inference_params is None and self.croissattn_aux and cu_seqlens is None
+                    and self.window_size in (-1, (-1, -1))):
+                # CroissAttn is defined for padded training batches. Packed
+                # batches continue through FlashAttention's varlen kernel.
+                q, k, v = qkv.unbind(dim=2)
+                context = croissattn_fp8(
+                    q.permute(0, 2, 1, 3),
+                    k.permute(0, 2, 1, 3),
+                    v.permute(0, 2, 1, 3),
+                    self.softmax_scale or (self.head_dim ** -0.5),
+                ).permute(0, 2, 1, 3)
+            elif inference_params is None:
                 context = self.inner_attn(qkv, **kwargs)
             else:
                 context = self._update_kvcache_attention(

@@ -148,7 +148,11 @@ def loss_for_output(out, target, args):
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     for router in out.bpred_output:
         ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
-    return losses[0] + (sum(losses[1:]) if len(losses) > 1 else 0.0) + args.ratio_weight * ratio, losses[0], ratio
+    moe_aux_value = getattr(out, "moe_aux_loss", None)
+    moe_aux = (moe_aux_value.float() if moe_aux_value is not None
+               else out.logits.new_zeros((), dtype=torch.float32))
+    return (losses[0] + (sum(losses[1:]) if len(losses) > 1 else 0.0)
+            + args.ratio_weight * ratio + moe_aux), losses[0], ratio
 
 
 def read_power_watts():
@@ -178,22 +182,55 @@ class GraphStep:
         for _ in range(3):
             out = model(self.x, mask=self.mask, fbt_passes=args.fbt_passes)
             loss, _, _ = loss_for_output(out, self.y, args)
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=False)
             loss.backward()
-            optimizer.step()
-        torch.cuda.synchronize()
+        optimizer.zero_grad(set_to_none=False)
         with torch.cuda.graph(self.graph):
             out = model(self.x, mask=self.mask, fbt_passes=args.fbt_passes)
-            self.static_loss, _, _ = loss_for_output(out, self.y, args)
-            optimizer.zero_grad(set_to_none=True)
+            self.static_loss, _, self.static_ratio = loss_for_output(out, self.y, args)
             self.static_loss.backward()
-            optimizer.step()
 
     def __call__(self, x, y):
         self.x.copy_(x)
         self.y.copy_(y)
+        # Keep Python-side optimizer state and learning-rate schedules outside
+        # the graph; the graph contains only fixed-shape forward/backward.
+        self.optimizer.zero_grad(set_to_none=False)
         self.graph.replay()
-        return self.static_loss
+        if not bool(torch.isfinite(self.static_loss)):
+            return self.static_loss, self.static_ratio
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        self.optimizer.step()
+        return self.static_loss, self.static_ratio
+
+
+def _cuda_graphs_supported(cfg, args):
+    """Return whether this model has replay-stable CUDA graph shapes.
+
+    H-Net routing compacts each sequence according to a learned boundary mask.
+    ``static_chunking`` pads the compacted representation to the configured
+    bound, so the graph sees fixed tensor shapes while the mask still carries
+    the learned boundaries.  The optimizer update remains outside the graph,
+    which keeps Muon/ANVIL counters and learning-rate schedules correct.
+    """
+    if not bool(getattr(cfg, "static_chunking", False)):
+        return False, "static_chunking is required for replay-stable routed shapes"
+    if args.fbt_passes != 1:
+        return False, "FBT multi-pass execution is not CUDA-graph stable"
+    if args.warmup:
+        return False, "learning-rate warmup is outside the captured graph"
+    if args.optimizer != "adamw":
+        return False, "Muon/ANVIL Python state counters stay outside the graph"
+    # The current Mamba2 and FlashAttention kernels use legacy/default CUDA
+    # streams during backward. Capturing the hierarchical stack therefore
+    # raises cudaErrorStreamCaptureImplicit (or hangs on a side stream).
+    # Keep graph capture for an explicitly graph-safe attention-only config;
+    # canonical m4/T19/m4 runs remain eager until those kernels expose stream
+    # capture support.
+    layout_text = str(getattr(cfg, "arch_layout", ""))
+    if "m" in layout_text.lower():
+        return False, "Mamba2 encoder/decoder kernels are not CUDA-graph stream safe"
+    return True, ""
 
 
 def main():
@@ -212,20 +249,33 @@ def main():
     stream = ByteStream(args.data, args.seq, args.batch, rank, world)
     graph_step = None
     if args.cuda_graphs and device.type == "cuda":
-        x0, y0 = stream.get(0, device)
-        graph_step = GraphStep(model, optimizer, x0, y0, args)
+        graph_ok, reason = _cuda_graphs_supported(cfg, args)
+        if graph_ok:
+            x0, y0 = stream.get(0, device)
+            graph_step = GraphStep(model, optimizer, x0, y0, args)
+        elif rank == 0:
+            print(f"CUDA graphs disabled: {reason}", flush=True)
     log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
     for step in range(args.steps):
         x, y = stream.get(step, device)
         lr_scale = min(1.0, (step + 1) / max(1, args.warmup))
         for group in optimizer.param_groups:
-            group["lr"] = args.lr * lr_scale
+            # AnchorMuon splits matrix and fallback tensors into separate
+            # groups, while Anvil keeps both rates in one group.  Preserve the
+            # requested fallback rate in either representation.
+            if "use_matrix_update" in group:
+                base_lr = args.lr if group["use_matrix_update"] else args.fallback_lr
+                group["lr"] = base_lr * lr_scale
+            else:
+                group["lr"] = args.lr * lr_scale
             if "fallback_lr" in group:
                 group["fallback_lr"] = args.fallback_lr * lr_scale
         t0 = time.perf_counter()
         if graph_step is not None:
-            loss = graph_step(x, y)
-            ratio = torch.tensor(float("nan"), device=device)
+            loss, ratio = graph_step(x, y)
+            if not bool(torch.isfinite(loss)):
+                log["nonfinite"].append(step)
+                raise RuntimeError("non-finite loss encountered during CUDA-graph replay")
         else:
             mask = torch.ones_like(x, dtype=torch.bool)
             out = model(x, mask=mask, fbt_passes=args.fbt_passes)
@@ -242,11 +292,14 @@ def main():
             torch.cuda.synchronize()
         elapsed = (time.perf_counter() - t0) * 1e3
         reduced = loss.detach().float()
+        reduced_ratio = ratio.detach().float()
         if world > 1:
             dist.all_reduce(reduced)
             reduced /= world
+            dist.all_reduce(reduced_ratio)
+            reduced_ratio /= world
         log["loss"].append(float(reduced))
-        log["ratio"].append(float(ratio.detach().float()))
+        log["ratio"].append(float(reduced_ratio))
         log["time_ms"].append(elapsed)
         if rank == 0 and (step < 3 or step % args.log_every == 0):
             power = read_power_watts()

@@ -12,7 +12,8 @@
     "attn_cfg": {
         "num_heads": [16, 16],
         "rotary_emb_dim": [32, 48],
-        "window_size": [1023, -1]
+        "window_size": [1023, -1],
+        "croissattn_aux": [false, true]
     },
     "tie_embeddings": false,
     "inner_loops": 2,
@@ -21,5 +22,12 @@
     "fbt": true,
     "fbt_jitter": 0.02,
     "max_seq_len": 4096,
-    "static_chunking": true
+    "static_chunking": true,
+    "moe_enabled": true,
+    "moe_num_experts": 8,
+    "moe_top_k": 1,
+    "moe_expert_intermediate": 512,
+    "moe_shared_intermediate": 256,
+    "moe_capacity_factor": 1.25,
+    "moe_aux_loss_weight": 0.01
 }

@@ -44,6 +44,7 @@ class CausalLMOutput:
     bpred_output: list[RoutingModuleOutput]
     inference_params: HNetState
     feedback_logits: list[torch.Tensor] | None = None
+    moe_aux_loss: torch.Tensor | None = None
 
 
 class HNetForCausalLM(nn.Module, GenerationMixin):
@@ -237,11 +238,15 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         hidden_states = hidden_states.view(B, L, D)
         logits = self.lm_head(hidden_states.float())
         feedback_logits = [self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden]
+        moe_losses = [m.aux_loss for m in self.backbone.modules()
+                      if getattr(m, "aux_loss", None) is not None]
+        moe_aux_loss = torch.stack(moe_losses).mean() if moe_losses else None
         return CausalLMOutput(
             logits=logits,
             bpred_output=bpred_output,
             inference_params=inference_params,
             feedback_logits=feedback_logits,
+            moe_aux_loss=moe_aux_loss,
         )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):

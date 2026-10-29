@@ -97,6 +97,7 @@ class Isotropic(nn.Module):
                     ssm_cfg=self.ssm_cfg,
                     attn_cfg=self.attn_cfg,
                     layer_idx=(layer_idx + i),
+                    moe_cfg=config,
                     **factory_kwargs,
                 )
                 for i in range(int(n_layer))
@@ -145,7 +146,7 @@ class Isotropic(nn.Module):
         if cu_seqlens is None:
             y = F.conv1d(
                 F.pad(x.transpose(1, 2), (kernel - 1, 0)),
-                weight.unsqueeze(1),
+                weight.to(dtype=x.dtype).unsqueeze(1),
                 groups=self.d_model,
             ).transpose(1, 2)
             return y.squeeze(0) if original_2d else y
@@ -156,7 +157,7 @@ class Isotropic(nn.Module):
             pieces.append(
                 F.conv1d(
                     F.pad(seg.transpose(1, 2), (kernel - 1, 0)),
-                    weight.unsqueeze(1),
+                    weight.to(dtype=x.dtype).unsqueeze(1),
                     groups=self.d_model,
                 ).transpose(1, 2)
             )
@@ -260,6 +261,10 @@ class Isotropic(nn.Module):
                         layer_input = layer_input.unsqueeze(0)
                     elif arch in ("t", "T") and packed and layer_input.dim() == 3:
                         layer_input = layer_input.squeeze(0)
+                    # MSAR retrieves in FP32 for stable cosine/softmax math;
+                    # restore the block's parameter dtype before its fused
+                    # mixer projection.
+                    layer_input = layer_input.to(dtype=layer.norm1.weight.dtype)
                     msar_out, msar_residual = layer(
                         layer_input,
                         None,
@@ -268,6 +273,7 @@ class Isotropic(nn.Module):
                             ssm_mixer_kwargs if arch in ("m", "M")
                             else {**attn_mixer_kwargs, "loop_idx": _loop_idx}
                         ),
+                        active_mask=mask,
                     )
                     msar_state = msar_out if msar_residual is None else msar_out + msar_residual
                     if packed and msar_state.dim() == 3:
@@ -288,6 +294,10 @@ class Isotropic(nn.Module):
             # autoregressive context; rotary offsets advance once per token,
             # after all loops finish.
             for layer, arch in zip(self.layers, self.arch_full):
+                # Dechunk/residual paths may promote activations to FP32;
+                # fused Mamba/FlashAttention projections are BF16 in the
+                # production model.
+                hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
                 if arch in ("m", "M"):
                     layer_mixer_kwargs = ssm_mixer_kwargs
                     if hidden_states.dim() == 2:
@@ -306,6 +316,7 @@ class Isotropic(nn.Module):
                     residual,
                     inference_params=inference_params,
                     mixer_kwargs=layer_mixer_kwargs,
+                    active_mask=mask,
                 )
 
         # Setting prenorm=False ignores the residual
@@ -330,6 +341,7 @@ class Isotropic(nn.Module):
         for _loop_idx in range(self.loop_count):
             residual = None
             for layer in self.layers:
+                hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
                 hidden_states, residual = layer.step(
                     hidden_states, inference_params, residual=residual, loop_idx=_loop_idx
                 )
