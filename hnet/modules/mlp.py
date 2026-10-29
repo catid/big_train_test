@@ -148,9 +148,9 @@ class SparseMoESwiGLU(nn.Module):
         # in FP32 so BF16/FP8 router logits cannot poison the training loss.
         active_f = active.to(dtype=torch.float32)
         active_count = active_f.sum().clamp_min(1.0)
-        dispatch_fraction = (
-            F.one_hot(expert_idx, self.num_experts).float() * active_f[:, None]
-        ).sum(dim=0) / active_count
+        active_one_hot = F.one_hot(expert_idx, self.num_experts).to(torch.float32)
+        active_one_hot = active_one_hot * active_f[:, None]
+        dispatch_fraction = active_one_hot.sum(dim=0) / active_count
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
         self._aux_loss = self.aux_loss_weight * self.num_experts * (
             dispatch_fraction * mean_probs
@@ -160,6 +160,12 @@ class SparseMoESwiGLU(nn.Module):
         # from the static token count of the graph; overflow tokens are left on
         # the shared path, preserving a finite output with no host sync.
         n_tokens = flat.shape[0]
+        # Keep the capacity derived from the static graph bound.  The active
+        # mask still removes padding from the cumsum below, so inactive rows
+        # cannot consume slots or displace real tokens.  Computing a smaller
+        # device-dependent capacity from ``active_count`` would change tensor
+        # shapes and make CUDA graph capture unsafe; the bounded allocation is
+        # the same fixed-capacity contract used by the TE grouped router.
         capacity = max(1, int(math.ceil(self.capacity_factor * n_tokens / self.num_experts)))
         # Generation batches are tiny and may legitimately route several
         # sequences to one expert. Avoid dropping tokens at inference; the
@@ -169,9 +175,10 @@ class SparseMoESwiGLU(nn.Module):
             # of a device-to-host bincount/max read. This keeps decode capture
             # free of synchronization and guarantees no token is dropped.
             capacity = max(1, n_tokens)
-        positions = torch.cumsum(
-            F.one_hot(expert_idx, self.num_experts).to(torch.int32), dim=0
-        ) - 1
+        # Count only active rows.  Inactive static-chunk padding receives a
+        # zero position and is discarded by ``valid`` without perturbing the
+        # priority of later real tokens.
+        positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
         token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
         valid = (token_pos < capacity) & active
         slot = expert_idx * capacity + token_pos.clamp_max(capacity - 1)
