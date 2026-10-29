@@ -328,9 +328,13 @@ class DeChunkLayer(nn.Module):
         D = hidden_states.shape[-1]
 
         p = torch.zeros(B, device=hidden_states.device, dtype=hidden_states.dtype)
+        # Routing probabilities are computed in FP32 for numerical stability,
+        # while the recurrent/dechunk state follows the model activation dtype
+        # (BF16 in production).  Cast before indexed assignment; otherwise
+        # generation fails with a dtype mismatch after a valid prefill.
         p[boundary_mask] = boundary_prob[boundary_mask, -1].clamp(
             min=1e-4, max=1 - (1e-4)
-        )
+        ).to(dtype=p.dtype)
 
         current_hidden_states = torch.zeros(
             B, D, device=hidden_states.device, dtype=hidden_states.dtype
