@@ -10,6 +10,7 @@ and captures a fixed-shape CUDA graph when requested.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -47,6 +48,11 @@ def parse_args():
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--out", default="/home/catid/hnet/artifacts/hnet_600m_train.json")
     p.add_argument("--checkpoint", default="/home/catid/hnet/artifacts/hnet_600m_last.pt")
+    p.add_argument(
+        "--resume",
+        default=None,
+        help="checkpoint to resume (model, optimizer, and step); defaults to a fresh run",
+    )
     p.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--autotune-batch", action="store_true")
     p.add_argument("--target-power", type=float, default=1000.0)
@@ -85,6 +91,52 @@ def load_config(path):
         attn_cfg=AttnConfig(**raw["attn_cfg"]),
         ssm_cfg=SSMConfig(**raw["ssm_cfg"]),
     )
+
+
+def _config_dict(cfg):
+    """Return a stable, serializable architecture signature for checkpoints."""
+    if dataclasses.is_dataclass(cfg):
+        cfg = dataclasses.asdict(cfg)
+    if isinstance(cfg, dict):
+        return {k: _config_dict(v) if isinstance(v, (dict,)) or dataclasses.is_dataclass(v) else v
+                for k, v in cfg.items()}
+    return cfg
+
+
+def _validate_resume(checkpoint, cfg, args, n_params):
+    """Reject resumes that silently mix incompatible model/data shapes."""
+    saved_params = checkpoint.get("params")
+    if saved_params is not None and int(saved_params) != int(n_params):
+        raise ValueError(
+            f"resume parameter mismatch: checkpoint={saved_params}, current={n_params}"
+        )
+    saved_seq = checkpoint.get("seq")
+    if saved_seq is not None and int(saved_seq) != int(args.seq):
+        raise ValueError(
+            f"resume sequence mismatch: checkpoint={saved_seq}, current={args.seq}"
+        )
+    saved_batch = checkpoint.get("batch")
+    if saved_batch is not None and int(saved_batch) != int(args.batch):
+        raise ValueError(
+            f"resume batch mismatch: checkpoint={saved_batch}, current={args.batch}"
+        )
+    saved_cfg = checkpoint.get("config_signature")
+    if saved_cfg is None:
+        # Older checkpoints stored ``vars(cfg)``.  It is still useful to
+        # validate the fields when they contain plain dictionaries.
+        saved_cfg = checkpoint.get("config")
+    if saved_cfg is not None:
+        expected = _config_dict(cfg)
+        saved_cfg = _config_dict(saved_cfg)
+        # Ignore max_seq_len from old checkpoints whose config was saved
+        # before the command-line sequence length was applied.
+        if isinstance(saved_cfg, dict):
+            saved_cfg = dict(saved_cfg)
+            saved_cfg.pop("max_seq_len", None)
+            expected = dict(expected)
+            expected.pop("max_seq_len", None)
+            if saved_cfg != expected:
+                raise ValueError("resume architecture/configuration does not match current config")
 
 
 def init_dist():
@@ -246,6 +298,33 @@ def main():
     if world > 1:
         model = DDP(model, device_ids=[device.index], broadcast_buffers=False, bucket_cap_mb=256, static_graph=True)
     optimizer = make_optimizer(model.module if world > 1 else model, args)
+    start_step = 0
+    resume_state = None
+    if args.resume:
+        resume_path = Path(args.resume)
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+        # Checkpoints contain only tensors, optimizer state, and plain
+        # configuration metadata.  Explicitly disable ``weights_only`` so
+        # older checkpoints with nested dataclass metadata remain loadable.
+        resume_state = torch.load(resume_path, map_location="cpu", weights_only=False)
+        _validate_resume(resume_state, cfg, args, n_params)
+        target_model = model.module if world > 1 else model
+        missing, unexpected = target_model.load_state_dict(
+            resume_state["model"], strict=True
+        )
+        if missing or unexpected:
+            raise ValueError(f"resume state mismatch: missing={missing}, unexpected={unexpected}")
+        optimizer.load_state_dict(resume_state["optimizer"])
+        start_step = int(resume_state.get("step", -1)) + 1
+        if start_step < 0 or start_step > args.steps:
+            raise ValueError(f"resume step {start_step} is outside requested [0, {args.steps}]")
+        if "rng_state" in resume_state:
+            torch.set_rng_state(resume_state["rng_state"])
+        if device.type == "cuda" and "cuda_rng_state" in resume_state:
+            torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
+        if rank == 0:
+            print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(args.data, args.seq, args.batch, rank, world)
     graph_step = None
     if args.cuda_graphs and device.type == "cuda":
@@ -256,7 +335,7 @@ def main():
         elif rank == 0:
             print(f"CUDA graphs disabled: {reason}", flush=True)
     log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         x, y = stream.get(step, device)
         lr_scale = min(1.0, (step + 1) / max(1, args.warmup))
         for group in optimizer.param_groups:
@@ -311,7 +390,20 @@ def main():
         if rank == 0 and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             path = Path(args.checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save({"step": step, "config": vars(cfg), "model": (model.module if world > 1 else model).state_dict(), "optimizer": optimizer.state_dict()}, path)
+            torch.save(
+                {
+                    "step": step,
+                    "seq": args.seq,
+                    "batch": args.batch,
+                    "params": n_params,
+                    "config_signature": _config_dict(cfg),
+                    "model": (model.module if world > 1 else model).state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "rng_state": torch.get_rng_state(),
+                    "cuda_rng_state": torch.cuda.get_rng_state() if device.type == "cuda" else None,
+                },
+                path,
+            )
     if rank == 0:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(log, indent=2))
