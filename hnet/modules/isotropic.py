@@ -169,18 +169,47 @@ class Isotropic(nn.Module):
         return y.squeeze(0) if original_2d else y
 
     def _msar_mix(self, sources, layer_idx, cu_seqlens=None):
-        expanded = []
-        conv_idx = 0
-        for source in sources:
-            streams = [source]
-            for kernel in self.msar_kernels[1:]:
-                streams.append(
-                    self._msar_expand(source, kernel, self.msar_conv[conv_idx], cu_seqlens)
+        # For the regular padded path, fold the source dimension into the
+        # channel dimension and run one grouped depthwise convolution per
+        # kernel.  The prior source-by-source loop launched N*M convolutions
+        # for every layer; this keeps the exact causal padding while reducing
+        # launch overhead and remains static-shape friendly.  Packed streams
+        # retain the per-document reset path below because each cu_seqlens
+        # segment must be padded independently.
+        if cu_seqlens is None and sources and sources[0].dim() == 3:
+            base = torch.stack(sources, dim=0)  # [N,B,L,D]
+            n_sources, batch, seqlen, d_model = base.shape
+            # Fold sources into the convolution batch, rather than channels;
+            # the existing [D,1,K] depthwise weights can then be reused with
+            # no expanded/copy-on-write N*D kernel bank.
+            grouped_input = base.permute(0, 1, 3, 2).reshape(
+                n_sources * batch, d_model, seqlen
+            )
+            streams = [base]
+            for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                weight = self.msar_conv[kernel_idx].to(dtype=grouped_input.dtype).unsqueeze(1)
+                expanded = F.conv1d(
+                    F.pad(grouped_input, (kernel - 1, 0)),
+                    weight,
+                    groups=d_model,
                 )
-                conv_idx += 1
-            expanded.append(torch.stack(streams, dim=0))
-            conv_idx = 0
-        stream_sources = torch.stack(expanded, dim=0)  # [N,m,...,D]
+                expanded = expanded.transpose(1, 2).reshape(
+                    n_sources, batch, seqlen, d_model
+                )
+                streams.append(expanded)
+            stream_sources = torch.stack(streams, dim=1)  # [N,m,B,L,D]
+        else:
+            expanded = []
+            for source in sources:
+                streams = [source]
+                for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                    streams.append(
+                        self._msar_expand(
+                            source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+                        )
+                    )
+                expanded.append(torch.stack(streams, dim=0))
+            stream_sources = torch.stack(expanded, dim=0)  # [N,m,...,D]
         normed = stream_sources.float() * torch.rsqrt(
             stream_sources.float().square().mean(dim=-1, keepdim=True).add(1e-6)
         )

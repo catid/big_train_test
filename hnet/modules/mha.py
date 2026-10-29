@@ -55,7 +55,11 @@ class _CroissAttn(torch.autograd.Function):
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             out = torch.bmm(_fp8_qdq(p), vf)
             aux = torch.bmm(p.float(), vf.float()).to(q.dtype)
-            ctx.save_for_backward(qf, kf, vf, p, aux)
+            # Keep the original activation operands so each backward product can
+            # independently recast both operands to E5M2.  Reusing the E4M3
+            # forward operands here would violate CroissAttn's six-product
+            # schedule and noticeably bias dP/dQ/dK.
+            ctx.save_for_backward(q, k, v, p, aux)
             ctx.tiled = False
             ctx.scale = scale
             return out
@@ -73,13 +77,16 @@ class _CroissAttn(torch.autograd.Function):
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             outputs.append(torch.bmm(_fp8_qdq(p), vf[:, :end]))
         out = torch.cat(outputs, dim=1)
-        # Keep only quantized operands for autograd.  Recomputing P and the
-        # unrounded auxiliary O'=P@V_f in backward avoids retaining the full
+        # Recompute P and the unrounded auxiliary O'=P@V_f in backward to
+        # avoid retaining the full
         # [batch*heads, seqlen, seqlen] probability and auxiliary tensors for
         # every recurrent/FBT invocation.  This is essential for batch scaling
         # while preserving the CroissAttn correction (O' is never the rounded
         # FP8 PV output).
-        ctx.save_for_backward(qf, kf, vf)
+        # Save original operands; backward reconstructs both E4M3 forward
+        # values and independent E5M2 backward operands without retaining two
+        # decoded copies of every Q/K/V tensor.
+        ctx.save_for_backward(q, k, v)
         ctx.scale = scale
         ctx.seqlen = seqlen
         ctx.block = block
@@ -89,17 +96,29 @@ class _CroissAttn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout):
         if not ctx.tiled:
-            qf, kf, vf, p, aux = ctx.saved_tensors
-            dpf = torch.bmm(_fp8_qdq(dout, True), vf.transpose(1, 2))
+            q, k, v, p, aux = ctx.saved_tensors
+            # Each backward GEMM independently quantizes both operands to
+            # E5M2.  The auxiliary O' above intentionally remains P@V_f,
+            # where V_f is the E4M3 forward value.
+            qb = _fp8_qdq(q, True)
+            kb = _fp8_qdq(k, True)
+            vb = _fp8_qdq(v, True)
+            dpf = torch.bmm(_fp8_qdq(dout, True), vb.transpose(1, 2))
             dv = torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(dout, True))
             dstar = (dout.float() * aux.float()).sum(dim=-1, keepdim=True)
             causal = torch.ones((p.shape[-2], p.shape[-1]), device=p.device, dtype=torch.bool).triu(1)
             ds = p * (dpf.float() - dstar).to(p.dtype)
             ds = ds.masked_fill(causal, 0)
-            dq = torch.bmm(_fp8_qdq(ds, True), kf) * ctx.scale
-            dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf) * ctx.scale
+            dq = torch.bmm(_fp8_qdq(ds, True), kb) * ctx.scale
+            dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qb) * ctx.scale
             return dq, dk, dv, None
-        qf, kf, vf = ctx.saved_tensors
+        q, k, v = ctx.saved_tensors
+        qf = _fp8_qdq(q)
+        kf = _fp8_qdq(k)
+        vf = _fp8_qdq(v)
+        qb = _fp8_qdq(q, True)
+        kb = _fp8_qdq(k, True)
+        vb = _fp8_qdq(v, True)
         seqlen, block = ctx.seqlen, ctx.block
         dq = torch.zeros_like(qf)
         dk = torch.zeros_like(kf)
@@ -112,16 +131,24 @@ class _CroissAttn(torch.autograd.Function):
             scores = scores.masked_fill(causal, float("-inf"))
             p = torch.softmax(scores.float(), dim=-1).to(qf.dtype)
             d_out = dout[:, start:end]
-            dpf = torch.bmm(_fp8_qdq(d_out, True), vf[:, :key_len].transpose(1, 2))
-            dv[:, :key_len] += torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(d_out, True))
+            dpf = torch.bmm(
+                _fp8_qdq(d_out, True), vb[:, :key_len].transpose(1, 2)
+            )
+            dv[:, :key_len] += torch.bmm(
+                _fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(d_out, True)
+            )
             # CroissAttn's corrected auxiliary O'=P@V_f uses the unrounded
             # probability/value product in the softmax derivative.
             aux = torch.bmm(p.float(), vf[:, :key_len].float()).to(qf.dtype)
             dstar = (d_out.float() * aux.float()).sum(dim=-1, keepdim=True)
             ds = p * (dpf.float() - dstar).to(p.dtype)
             ds = ds.masked_fill(causal, 0)
-            dq[:, start:end] = torch.bmm(_fp8_qdq(ds, True), kf[:, :key_len]) * ctx.scale
-            dk[:, :key_len] += torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf[:, start:end]) * ctx.scale
+            dq[:, start:end] = torch.bmm(
+                _fp8_qdq(ds, True), kb[:, :key_len]
+            ) * ctx.scale
+            dk[:, :key_len] += torch.bmm(
+                _fp8_qdq(ds.transpose(1, 2), True), qb[:, start:end]
+            ) * ctx.scale
         return dq, dk, dv, None
 
 
@@ -158,6 +185,16 @@ class FlashCausalSelfAttention(nn.Module):
         self.softmax_scale = softmax_scale
         self.window_size = window_size
 
+    def _window(self):
+        # FlashAttention expects one ``(left, right)`` tuple.  Accept both
+        # the scalar shorthand used by H-Net configs and an explicit tuple;
+        # nesting a tuple here would produce an invalid SWA shape.
+        if isinstance(self.window_size, (tuple, list)):
+            if len(self.window_size) != 2:
+                raise ValueError("window_size must be a scalar or (left, right) pair")
+            return tuple(self.window_size)
+        return (self.window_size, -1)
+
     def forward(self, qkv, cu_seqlens=None, max_seqlen=None):
         """Implements the multihead softmax attention.
         Arguments
@@ -186,14 +223,14 @@ class FlashCausalSelfAttention(nn.Module):
                 max_seqlen,
                 softmax_scale=self.softmax_scale,
                 causal=True,
-                window_size=(self.window_size, -1),
+                window_size=self._window(),
             )
         else:
             return flash_attn_qkvpacked_func(
                 qkv,
                 softmax_scale=self.softmax_scale,
                 causal=True,
-                window_size=(self.window_size, -1),
+                window_size=self._window(),
             )
 
 
@@ -314,7 +351,7 @@ class CausalMHA(nn.Module):
             rotary_interleaved=(
                 self.rotary_emb.interleaved if self.rotary_emb_dim > 0 else False
             ),
-            window_size=(self.window_size, -1),
+            window_size=self.inner_attn._window(),
         )
         return context
 
@@ -338,7 +375,7 @@ class CausalMHA(nn.Module):
             cache_seqlens=cache_seqlens,
             softmax_scale=self.softmax_scale,
             causal=True,
-            window_size=(self.window_size, -1)
+            window_size=self.inner_attn._window()
         )
 
     def forward(
@@ -401,7 +438,7 @@ class CausalMHA(nn.Module):
                 # )
                 qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, **kwargs)
             if (inference_params is None and self.croissattn_aux and cu_seqlens is None
-                    and self.window_size in (-1, (-1, -1))):
+                    and self.inner_attn._window() == (-1, -1)):
                 # CroissAttn is defined for padded training batches. Packed
                 # batches continue through FlashAttention's varlen kernel.
                 q, k, v = qkv.unbind(dim=2)
