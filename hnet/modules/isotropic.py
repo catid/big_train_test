@@ -338,6 +338,13 @@ class Isotropic(nn.Module):
         """
         Assumes hidden_states is (B, 1, D). Steps each of the layers in order, and then steps the main model.
         """
+        if self.loop_count > 1 and any(arch in ("m", "M") for arch in self.arch_full):
+            # Mamba2Wrapper owns one recurrent state per layer; unlike
+            # CausalMHA it does not allocate loop-indexed state slots.
+            raise RuntimeError(
+                "inner recurrent loops with Mamba require per-loop SSM state; "
+                "use attention-only inner blocks"
+            )
         for _loop_idx in range(self.loop_count):
             residual = None
             for layer in self.layers:
