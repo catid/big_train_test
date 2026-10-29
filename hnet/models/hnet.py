@@ -311,16 +311,27 @@ class HNet(nn.Module):
             if pass_idx > 0:
                 # Shift within each packed document; no cross-document latent
                 # state is allowed to enter a new byte stream.
-                shifted = torch.zeros_like(previous_inner)
                 if next_cu_seqlens is None:
-                    shifted[:, 1:] = previous_inner[:, :-1]
+                    shifted = torch.cat(
+                        (torch.zeros_like(previous_inner[:, :1]), previous_inner[:, :-1]),
+                        dim=1,
+                    )
                 else:
                     # Packed feedback is shifted within each document.  Use
-                    # tensor indexing instead of ``tolist``/Python slices so
-                    # CUDA graph capture never synchronizes the host on the
-                    # learned chunk counts.
-                    shifted[1:] = previous_inner[:-1]
-                    shifted.index_fill_(0, next_cu_seqlens[:-1], 0)
+                    # differentiable tensor operations instead of indexed
+                    # writes into a ``zeros_like`` destination.  Indexed
+                    # writes there detach the previous pass and silently
+                    # freeze both FBT projection matrices at zero.
+                    shifted = torch.cat(
+                        (torch.zeros_like(previous_inner[:1]), previous_inner[:-1]),
+                        dim=0,
+                    )
+                    starts = next_cu_seqlens[:-1]
+                    is_start = torch.zeros(
+                        (shifted.shape[0],), device=shifted.device, dtype=torch.bool
+                    )
+                    is_start.scatter_(0, starts, True)
+                    shifted = torch.where(is_start[:, None], torch.zeros_like(shifted), shifted)
                 if self.training and getattr(self.config, "fbt_jitter", 0.0) > 0:
                     shifted = shifted + torch.empty_like(shifted).uniform_(
                         -float(self.config.fbt_jitter), float(self.config.fbt_jitter)
