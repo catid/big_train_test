@@ -31,7 +31,6 @@ class HNetConfig:
     vocab_size: int = 256
     ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
     attn_cfg: AttnConfig = field(default_factory=AttnConfig)
-    tie_embeddings: bool = False
     # MSAR is enabled only for the innermost main network.  Outer encoder and
     # decoder stacks remain standard residual networks because they implement
     # input/output chunking and must preserve the routing/dechunking identity.

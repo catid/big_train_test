@@ -15,7 +15,6 @@
         "window_size": [1023, -1],
         "croissattn_aux": [false, true]
     },
-    "tie_embeddings": false,
     "inner_loops": 2,
     "msar": true,
     "msar_stream_kernels": [1, 4, 8, 12],

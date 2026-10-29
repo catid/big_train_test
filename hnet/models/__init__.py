@@ -4,4 +4,4 @@ from .config_hnet import (
     HNetConfig,
 )
 from .hnet import HNet
-from .mixer_seq import HNetForCausalLM
+from .mixer_seq import HNetForByteCausalLM

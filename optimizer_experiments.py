@@ -965,7 +965,7 @@ class AnchorMuon(torch.optim.Optimizer):
             if grad.is_sparse:
                 raise RuntimeError(
                     "AnchorMuon does not support sparse gradients. "
-                    "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
+                    "Use dense gradients for this parameter or a different optimizer."
                 )
             if not _is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
                 fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
@@ -1017,7 +1017,7 @@ class AnchorMuon(torch.optim.Optimizer):
         if grad.is_sparse:
             raise RuntimeError(
                 "AnchorMuon does not support sparse gradients. "
-                "Use dense gradients for this parameter or a different optimizer for sparse embeddings."
+                    "Use dense gradients for this parameter or a different optimizer."
             )
         state = self.state[p]
         mode = str(group.get("fallback_mode", "atan2")).lower()

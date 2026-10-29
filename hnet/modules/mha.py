@@ -22,7 +22,7 @@ def _fp8_qdq(x: torch.Tensor, backward: bool = False) -> torch.Tensor:
     PyTorch build does not expose a batched ``_scaled_mm`` API, so products
     use vectorized ``bmm`` on decoded BF16 operands; this preserves the
     algorithm and avoids a Python loop over heads or tokens.  Transformer
-    Engine's fused path remains available in ``train_600m_fp8.py``.
+    Engine's fused path is provided by the production training environment.
     """
     dtype = torch.float8_e5m2 if backward else torch.float8_e4m3fn
     limit = 57344.0 if backward else 448.0

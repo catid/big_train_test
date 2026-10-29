@@ -7,7 +7,7 @@ NOTE: This file is not used inside the HNet package, but contains useful utiliti
 import torch
 
 from hnet.modules.dc import RoutingModuleOutput
-from hnet.models.mixer_seq import HNetForCausalLM
+from hnet.models.mixer_seq import HNetForByteCausalLM
 from hnet.modules.utils import apply_optimization_params
 
 def load_balancing_loss(
@@ -41,7 +41,7 @@ def load_balancing_loss(
 
 
 def group_params(
-    model: HNetForCausalLM,
+    model: HNetForByteCausalLM,
 ) -> list[dict[str, list[torch.Tensor] | float]]:
     """
     Creates parameter groups for the optimizer, based on the learning rate multiplier and weight decay.
