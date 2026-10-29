@@ -1,0 +1,10 @@
+artifacts/
+checkpoints/
+*.json
+*.pt
+__pycache__/
+__pycache__/
+artifacts/
+checkpoints/
+*.pt
+*.jsonl
