@@ -9,7 +9,7 @@ two shared-weight inner executions, chunk-level FBT feedback, FP32 CE/router
 losses, Muon/GramNS plus AdamATan2 fallback, weight decay, and DDP. CUDA graph
 capture is implemented for fixed-shape attention-only configurations. The
 all-attention SWA/FA path is eligible when the fixed-shape and optimizer
-requirements are met.  The measured production SWA width is 512 tokens;
+requirements are met.  The production SWA width is 128 tokens;
 three SWA layers still provide a stacked receptive span above the 4096-byte
 training context before each global FA layer.
 

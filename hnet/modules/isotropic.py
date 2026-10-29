@@ -91,7 +91,7 @@ class Isotropic(nn.Module):
             assert n_layer.isdigit()
             block_attn_cfg = dict(self.attn_cfg)
             if arch in ("s", "S"):
-                block_attn_cfg["window_size"] = int(getattr(config, "swa_window_size", 1023))
+                block_attn_cfg["window_size"] = int(getattr(config, "swa_window_size", 128))
                 block_attn_cfg["croissattn_aux"] = False
             layers += [
                 create_block(

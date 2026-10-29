@@ -37,7 +37,7 @@ class HNetConfig:
     msar: bool = False
     msar_stream_kernels: List[int] = field(default_factory=lambda: [1, 4, 8, 12])
     # Window width used by sliding-window attention (S/s) layers.
-    swa_window_size: int = 1023
+    swa_window_size: int = 128
     # Shared recurrent execution count for the deepest (middle) network.
     inner_loops: int = 1
     fbt: bool = False
