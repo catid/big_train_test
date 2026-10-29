@@ -338,6 +338,11 @@ class Isotropic(nn.Module):
         """
         Assumes hidden_states is (B, 1, D). Steps each of the layers in order, and then steps the main model.
         """
+        if self.msar_enabled:
+            raise RuntimeError(
+                "MSAR autoregressive stepping requires stream state; "
+                "generation with MSAR-enabled training weights is unsupported"
+            )
         if self.loop_count > 1 and any(arch in ("m", "M") for arch in self.arch_full):
             # Mamba2Wrapper owns one recurrent state per layer; unlike
             # CausalMHA it does not allocate loop-indexed state slots.
