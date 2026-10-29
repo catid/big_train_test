@@ -76,12 +76,17 @@ class ByteStream:
 
     def get(self, step, device):
         base = ((step % self.n_batches) * self.world + self.rank) * self.stride
-        x = self.data[base : base + self.stride].view(self.batch, self.seq)
-        # The final target byte is loaded by taking a contiguous one-byte
-        # overlap from the stream. This keeps every rank's sequence fixed for
-        # CUDA graph replay.
-        y = self.data[base + 1 : base + self.stride + 1].view(self.batch, self.seq)
-        return x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+        # Input and target are adjacent in the byte stream. Copy the shared
+        # ``stride + 1`` span once, then form overlapping views on-device;
+        # this removes one host-to-device launch and avoids transferring the
+        # duplicated overlap byte twice while preserving exact sequence
+        # boundaries for every rank and CUDA-graph replay.
+        batch = self.data[base : base + self.stride + 1].to(
+            device=device, non_blocking=True
+        )
+        x = batch[:-1].view(self.batch, self.seq)
+        y = batch[1:].view(self.batch, self.seq)
+        return x, y
 
 
 def load_config(path):
