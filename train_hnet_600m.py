@@ -45,6 +45,12 @@ def parse_args():
     p.add_argument("--ratio-weight", type=float, default=0.03)
     p.add_argument("--ratio-target", type=float, default=6.0)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument(
+        "--power-every",
+        type=int,
+        default=100,
+        help="sample nvidia-smi power at this cadence; reuse the latest reading in logs",
+    )
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--out", default="/home/catid/hnet/artifacts/hnet_600m_train.json")
     p.add_argument("--checkpoint", default="/home/catid/hnet/artifacts/hnet_600m_last.pt")
@@ -351,6 +357,7 @@ def main():
         elif rank == 0:
             print(f"CUDA graphs disabled: {reason}", flush=True)
     log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
+    latest_power = []
     for step in range(start_step, args.steps):
         x, y = stream.get(step, device)
         lr_scale = min(1.0, (step + 1) / max(1, args.warmup))
@@ -396,11 +403,14 @@ def main():
         log["loss"].append(float(reduced))
         log["ratio"].append(float(reduced_ratio))
         log["time_ms"].append(elapsed)
+        if rank == 0 and args.power_every > 0 and (
+            step == start_step or step % args.power_every == 0
+        ):
+            latest_power = read_power_watts()
         if rank == 0 and (step < 3 or step % args.log_every == 0):
-            power = read_power_watts()
             print(
                 f"step={step} loss={float(reduced):.6f} time_ms={elapsed:.1f} "
-                f"power_w={','.join(f'{x:.0f}' for x in power) or 'n/a'}",
+                f"power_w={','.join(f'{x:.0f}' for x in latest_power) or 'n/a'}",
                 flush=True,
             )
         if args.ckpt_every and (step + 1) % args.ckpt_every == 0:
