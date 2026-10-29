@@ -45,6 +45,22 @@ class _CroissAttn(torch.autograd.Function):
         kf = _fp8_qdq(k)
         vf = _fp8_qdq(v)
         seqlen = qf.shape[1]
+        score_bytes = qf.shape[0] * seqlen * seqlen * 4
+        # Keep the fast fused-sized path for ordinary batch-1 chunks.  Use
+        # tiled CroissAttn only when the score tensor would exceed the memory
+        # budget; this preserves the baseline latency while allowing batch
+        # scaling to make progress without an O(S^2) allocation failure.
+        if score_bytes <= 1536 * 1024 * 1024:
+            scores = torch.bmm(qf, kf.transpose(1, 2)) * scale
+            causal = torch.ones((seqlen, seqlen), device=scores.device, dtype=torch.bool).triu(1)
+            scores = scores.masked_fill(causal, float("-inf"))
+            p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            out = torch.bmm(_fp8_qdq(p), vf)
+            aux = torch.bmm(p.float(), vf.float()).to(q.dtype)
+            ctx.save_for_backward(qf, kf, vf, p, aux)
+            ctx.tiled = False
+            ctx.scale = scale
+            return out
         # Materialize attention probabilities in query tiles.  The previous
         # implementation allocated [B*H,S,S], which made batch scaling fail
         # at S=4096 even on 256 GiB GPUs.  A 512-row tile preserves the exact
@@ -69,10 +85,22 @@ class _CroissAttn(torch.autograd.Function):
         ctx.scale = scale
         ctx.seqlen = seqlen
         ctx.block = block
+        ctx.tiled = True
         return out
 
     @staticmethod
     def backward(ctx, dout):
+        if not ctx.tiled:
+            qf, kf, vf, p, aux = ctx.saved_tensors
+            dpf = torch.bmm(_fp8_qdq(dout, True), vf.transpose(1, 2))
+            dv = torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(dout, True))
+            dstar = (dout.float() * aux.float()).sum(dim=-1, keepdim=True)
+            causal = torch.ones((p.shape[-2], p.shape[-1]), device=p.device, dtype=torch.bool).triu(1)
+            ds = p * (dpf.float() - dstar).to(p.dtype)
+            ds = ds.masked_fill(causal, 0)
+            dq = torch.bmm(_fp8_qdq(ds, True), kf) * ctx.scale
+            dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qf) * ctx.scale
+            return dq, dk, dv, None
         qf, kf, vf = ctx.saved_tensors
         seqlen, block = ctx.seqlen, ctx.block
         dq = torch.zeros_like(qf)
