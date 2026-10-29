@@ -31,6 +31,7 @@ import transformer_engine.pytorch as te
 from transformer_engine.common import recipe
 from optimizer_experiments import AnchorMuon
 from vha_attention_te import VHAAttention
+from kronlstm_te import KronLSTMAttention
 
 
 class TokenStream:
@@ -52,8 +53,10 @@ class TokenStream:
 
 def _expand_attention_pattern(layers: int, spec: str) -> list[str]:
     pattern = [item.strip().upper() for item in spec.split(",") if item.strip()]
-    if not pattern or any(item not in {"SWA", "FA", "VHA"} for item in pattern):
-        raise ValueError("--attention-pattern must contain only SWA, FA, and VHA entries")
+    aliases = {"KRON": "KDR", "KRONLSTM": "KDR"}
+    pattern = [aliases.get(item, item) for item in pattern]
+    if not pattern or any(item not in {"KDR", "SWA", "FA", "VHA"} for item in pattern):
+        raise ValueError("--attention-pattern must contain only KDR, SWA, FA, and VHA entries")
     return [pattern[index % len(pattern)] for index in range(layers)]
 
 
@@ -87,6 +90,31 @@ class VHALayer(nn.Module):
         return x
 
 
+class KDRLayer(nn.Module):
+    """Pre-norm Transformer block using the paper's KronLSTM mixer."""
+
+    def __init__(self, args: argparse.Namespace, device: torch.device):
+        super().__init__()
+        bf16 = torch.bfloat16
+        self.ln1 = te.LayerNorm(args.hidden, device=device, params_dtype=bf16)
+        self.attn = KronLSTMAttention(
+            hidden_size=args.hidden,
+            num_heads=args.heads,
+            params_dtype=bf16,
+            device=device,
+            chunk_size=args.kdr_chunk_size,
+            checkpoint_chunks=args.kdr_checkpoint,
+        )
+        self.ln2 = te.LayerNorm(args.hidden, device=device, params_dtype=bf16)
+        self.fc1 = te.Linear(args.hidden, args.ffn, bias=False, params_dtype=bf16, device=device)
+        self.fc2 = te.Linear(args.ffn, args.hidden, bias=False, params_dtype=bf16, device=device)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.ln1(x))
+        x = x + self.fc2(F.gelu(self.fc1(self.ln2(x)), approximate="tanh"))
+        return x
+
+
 class GPT600M(nn.Module):
     def __init__(self, args: argparse.Namespace, device: torch.device):
         super().__init__()
@@ -103,6 +131,8 @@ class GPT600M(nn.Module):
                 (
                     VHALayer(args, i + 1, device)
                     if self.attention_pattern[i] == "VHA"
+                    else KDRLayer(args, device)
+                    if self.attention_pattern[i] == "KDR"
                     else te.TransformerLayer(
                     hidden_size=args.hidden,
                     ffn_hidden_size=args.ffn,
@@ -318,8 +348,7 @@ def _build_optimizers(model: nn.Module, args: argparse.Namespace):
         for name, parameter in named
         if parameter.ndim == 2 and not name.startswith(("emb.", "head."))
     ]
-    matrix_names = {name for name, _ in matrix_named}
-    fallback_named = [(name, parameter) for name, parameter in named if name not in matrix_names]
+    fallback_named = [(name, parameter) for name, parameter in named if (name, parameter) not in matrix_named]
     if not matrix_named:
         raise RuntimeError("no 2-D hidden matrices were found for GramNS/AnchorMuon")
     variant = args.optimizer
@@ -380,13 +409,13 @@ def main() -> None:
     parser.add_argument("--seq", type=int, default=512)
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--hidden", type=int, default=1536)
-    parser.add_argument("--ffn", type=int, default=6400)
+    parser.add_argument("--ffn", type=int, default=6144)
     parser.add_argument("--heads", type=int, default=24)
     parser.add_argument("--layers", type=int, default=16)
     parser.add_argument(
         "--attention-pattern",
-        default="SWA,SWA,SWA,VHA",
-        help="repeated per-layer pattern; VHA replaces GQA in full-attention slots",
+        default="KDR,KDR,KDR,VHA",
+        help="repeated per-layer pattern; KDR is KronLSTM, VHA is compressed full attention",
     )
     parser.add_argument(
         "--swa-window",
@@ -396,6 +425,13 @@ def main() -> None:
     )
     parser.add_argument("--vha-kv-heads", type=int, default=2)
     parser.add_argument("--vha-postmix-rank", type=int, default=6)
+    parser.add_argument("--kdr-chunk-size", type=int, default=64)
+    parser.add_argument(
+        "--kdr-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="checkpoint KronLSTM chunks to reduce activation memory",
+    )
     parser.add_argument("--vocab", type=int, default=50304)
     parser.add_argument("--tokens", type=int, default=20_000_000_000)
     parser.add_argument("--steps", type=int, default=0)
@@ -524,23 +560,9 @@ def main() -> None:
         "weight_decay": args.weight_decay,
         "muon": {
             "lr": args.muon_lr,
-            "fallback_lr": args.muon_fallback_lr,
             "momentum": args.muon_momentum,
             "ns_steps": args.muon_ns_steps,
             "adjust_lr": args.muon_adjust_lr,
-            "fallback_mode": "atan2",
-            "weight_decay": args.weight_decay,
-            "soda_lambda_scale": args.soda_lambda_scale,
-            "pmuoneq_beta": args.pmuoneq_beta,
-            "row_gamma": args.anchor_row_gamma,
-            "normuon_beta2": args.normuon_beta2,
-            "stages": {
-                "gramns": ["momentum", "gramns"],
-                "anchor_soda": ["momentum", "gramns", "soda"],
-                "anchor_pmuoneq": ["momentum", "gramns", "soda", "pmuoneq"],
-                "anchor_normuon": ["momentum", "gramns", "soda", "pmuoneq", "normuon"],
-                "anchor": ["momentum", "gramns", "soda", "pmuoneq", "normuon"],
-            }.get(args.optimizer),
         },
         "adamw": {"lr": args.adamw_lr},
         "diagnostics": diagnostics,
@@ -572,8 +594,14 @@ def main() -> None:
     times: list[float] = []
     for step in range(start, steps):
         for name, optimizer in optimizers.items():
-            base_lr = args.muon_lr if name == "muon" else args.adamw_lr
             for group in optimizer.param_groups:
+                # AnchorMuon carries separate matrix and AdamATan2 fallback
+                # groups. Preserve the requested fallback LR instead of
+                # overwriting every group with the matrix rate.
+                if name == "muon":
+                    base_lr = args.muon_lr if group.get("use_matrix_update", False) else args.muon_fallback_lr
+                else:
+                    base_lr = args.adamw_lr
                 group["lr"] = lr_at(step, base_lr)
         tok = train.get(step, rank, device)
         x, y = tok[:, :-1], tok[:, 1:]
@@ -586,8 +614,9 @@ def main() -> None:
         loss.backward()
         gnorm = torch.nn.utils.clip_grad_norm_(ddp.parameters(), 1.0)
         finite = bool(torch.isfinite(loss) and torch.isfinite(gnorm))
-        for optimizer in optimizers.values():
-            optimizer.step()
+        if finite:
+            for optimizer in optimizers.values():
+                optimizer.step()
         torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
         reduced_loss = loss.detach().clone()
