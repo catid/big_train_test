@@ -200,7 +200,11 @@ class SparseMoESwiGLU(nn.Module):
         positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
         token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
         valid = (token_pos < capacity) & active
-        slot = expert_idx * capacity + token_pos.clamp_max(capacity - 1)
+        # Inactive rows have token_pos=-1 after the masked cumsum. Clamp both
+        # ends before the gather path; ``valid`` still zeros these rows, while
+        # the lower bound avoids a negative index if a backend checks gather
+        # bounds eagerly during CUDA graph capture.
+        slot = expert_idx * capacity + token_pos.clamp(0, capacity - 1)
         # Include one trash row so every token follows the same-shape
         # index_copy_ path. Boolean compaction (`flat[valid]`) performs a
         # data-dependent nonzero/host synchronization and breaks CUDA graph
