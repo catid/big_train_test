@@ -242,6 +242,11 @@ class Isotropic(nn.Module):
             )
             packed = True
 
+        if self.loop_count > 1 and inference_params is not None and any(
+            arch in ("m", "M") for arch in self.arch_full
+        ):
+            raise RuntimeError("inner recurrent loops with Mamba require per-loop SSM state; use attention-only inner blocks")
+
         for _loop_idx in range(self.loop_count):
             if self.msar_enabled:
                 msar_state = hidden_states
@@ -278,10 +283,10 @@ class Isotropic(nn.Module):
                 residual = None
                 continue
             residual = None
-            # Reusing the same layer objects shares weights. During inference
-            # each attention/Mamba layer keeps its layer_idx, so its KV/state
-            # cache is shared across recurrent loops; the current position is
-            # overwritten by the refined representation on the next loop.
+            # Reusing the same layer objects shares weights. CausalMHA uses a
+            # loop-indexed cache slot so each recurrent depth has exact
+            # autoregressive context; rotary offsets advance once per token,
+            # after all loops finish.
             for layer, arch in zip(self.layers, self.arch_full):
                 if arch in ("m", "M"):
                     layer_mixer_kwargs = ssm_mixer_kwargs
