@@ -319,10 +319,18 @@ def main():
         start_step = int(resume_state.get("step", -1)) + 1
         if start_step < 0 or start_step > args.steps:
             raise ValueError(f"resume step {start_step} is outside requested [0, {args.steps}]")
-        if "rng_state" in resume_state:
+        saved_rng = resume_state.get("rng_state_by_rank")
+        if saved_rng is not None and rank < len(saved_rng):
+            cpu_rng, cuda_rng = saved_rng[rank]
+            if cpu_rng is not None:
+                torch.set_rng_state(cpu_rng)
+            if device.type == "cuda" and cuda_rng is not None:
+                torch.cuda.set_rng_state(cuda_rng, device=device)
+        elif rank == 0 and "rng_state" in resume_state:
+            # Compatibility with checkpoints written before per-rank RNGs.
             torch.set_rng_state(resume_state["rng_state"])
-        if device.type == "cuda" and "cuda_rng_state" in resume_state:
-            torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
+            if device.type == "cuda" and resume_state.get("cuda_rng_state") is not None:
+                torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(args.data, args.seq, args.batch, rank, world)
@@ -387,6 +395,16 @@ def main():
                 f"power_w={','.join(f'{x:.0f}' for x in power) or 'n/a'}",
                 flush=True,
             )
+        if args.ckpt_every and (step + 1) % args.ckpt_every == 0:
+            local_rng = (
+                torch.get_rng_state(),
+                torch.cuda.get_rng_state(device=device) if device.type == "cuda" else None,
+            )
+            rng_by_rank = [None] * world if rank == 0 else None
+            if world > 1:
+                dist.gather_object(local_rng, rng_by_rank, dst=0)
+            else:
+                rng_by_rank = [local_rng]
         if rank == 0 and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             path = Path(args.checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -399,8 +417,9 @@ def main():
                     "config_signature": _config_dict(cfg),
                     "model": (model.module if world > 1 else model).state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "rng_state": torch.get_rng_state(),
-                    "cuda_rng_state": torch.cuda.get_rng_state() if device.type == "cuda" else None,
+                    "rng_state_by_rank": rng_by_rank,
+                    "rng_state": rng_by_rank[0][0],
+                    "cuda_rng_state": rng_by_rank[0][1],
                 },
                 path,
             )
