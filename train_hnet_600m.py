@@ -296,7 +296,14 @@ def main():
     if rank == 0:
         print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
     if world > 1:
-        model = DDP(model, device_ids=[device.index], broadcast_buffers=False, bucket_cap_mb=256, static_graph=True)
+        model = DDP(
+            model,
+            device_ids=[device.index],
+            broadcast_buffers=False,
+            bucket_cap_mb=256,
+            static_graph=True,
+            gradient_as_bucket_view=True,
+        )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
     start_step = 0
     resume_state = None
