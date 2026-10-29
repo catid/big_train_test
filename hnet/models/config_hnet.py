@@ -38,5 +38,6 @@ class HNetConfig:
     inner_loops: int = 1
     fbt: bool = False
     fbt_jitter: float = 0.02
+    fbt_prefix_mixin: bool = True
     max_seq_len: int = 4096
     static_chunking: bool = False

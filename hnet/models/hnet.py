@@ -316,6 +316,19 @@ class HNet(nn.Module):
                 # is evaluated in FP32 for stable sigmoid gradients.
                 gate = torch.sigmoid(self.fbt_gate(pass_input).float()).to(pass_input.dtype)
                 pass_input = pass_input + self.fbt_up(shifted).to(pass_input.dtype) * gate
+                if getattr(self.config, "fbt_prefix_mixin", False):
+                    # Keep a plain prefix so training matches prompt-prefill
+                    # followed by feedback-conditioned generation.
+                    plain = torch.zeros(pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device)
+                    if next_cu_seqlens is None:
+                        # A fixed midpoint is graph-safe; eager experiments
+                        # can randomize this boundary outside graph capture.
+                        plain[:, : pass_input.shape[1] // 2] = True
+                    else:
+                        for start, end in zip(next_cu_seqlens[:-1].tolist(), next_cu_seqlens[1:].tolist()):
+                            prefix = int(torch.randint(0, end - start + 1, ()).item())
+                            plain[start : start + prefix] = True
+                    pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
                 pass_input,
                 cu_seqlens=next_cu_seqlens,

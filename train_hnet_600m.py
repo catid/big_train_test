@@ -54,7 +54,9 @@ def parse_args():
 
 class ByteStream:
     def __init__(self, path, seq, batch, rank, world):
-        self.data = torch.from_file(str(path), shared=False, size=-1, dtype=torch.uint8)
+        self.data = torch.from_file(
+            str(path), shared=False, size=os.path.getsize(path), dtype=torch.uint8
+        )
         self.seq = seq
         self.batch = batch
         self.rank = rank
