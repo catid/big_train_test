@@ -49,6 +49,7 @@ def parse_args():
     p.add_argument("--checkpoint", default="/home/catid/hnet/artifacts/hnet_600m_last.pt")
     p.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--autotune-batch", action="store_true")
+    p.add_argument("--target-power", type=float, default=1000.0)
     return p.parse_args()
 
 
@@ -150,6 +151,19 @@ def loss_for_output(out, target, args):
     return losses[0] + (sum(losses[1:]) if len(losses) > 1 else 0.0) + args.ratio_weight * ratio, losses[0], ratio
 
 
+def read_power_watts():
+    try:
+        raw = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            text=True,
+            timeout=2,
+        )
+        values = [float(x.strip()) for x in raw.splitlines() if x.strip()]
+        return values
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
 class GraphStep:
     def __init__(self, model, optimizer, x, y, args):
         self.model, self.optimizer, self.args = model, optimizer, args
@@ -235,7 +249,12 @@ def main():
         log["ratio"].append(float(ratio.detach().float()))
         log["time_ms"].append(elapsed)
         if rank == 0 and (step < 3 or step % args.log_every == 0):
-            print(f"step={step} loss={float(reduced):.6f} time_ms={elapsed:.1f}", flush=True)
+            power = read_power_watts()
+            print(
+                f"step={step} loss={float(reduced):.6f} time_ms={elapsed:.1f} "
+                f"power_w={','.join(f'{x:.0f}' for x in power) or 'n/a'}",
+                flush=True,
+            )
         if rank == 0 and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             path = Path(args.checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)
