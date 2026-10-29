@@ -36,6 +36,8 @@ class HNetConfig:
     # input/output chunking and must preserve the routing/dechunking identity.
     msar: bool = False
     msar_stream_kernels: List[int] = field(default_factory=lambda: [1, 4, 8, 12])
+    # Window width used by sliding-window attention (S/s) layers.
+    swa_window_size: int = 1023
     # Shared recurrent execution count for the deepest (middle) network.
     inner_loops: int = 1
     fbt: bool = False
@@ -47,7 +49,9 @@ class HNetConfig:
     # top-1 dispatch give the requested 1:8 active expert sparsity.  The
     # shared expert is always evaluated and is deliberately narrow so it
     # carries common features without duplicating every routed expert.
-    moe_enabled: bool = False
+    # Sparse MoE/shared expert is part of the production architecture.  A
+    # disabled dense FFN path is intentionally unsupported.
+    moe_enabled: bool = True
     moe_num_experts: int = 8
     moe_top_k: int = 1
     moe_expert_intermediate: int = 0

@@ -5,9 +5,7 @@ import torch.nn as nn
 from einops import rearrange
 
 from flash_attn import (
-    flash_attn_kvpacked_func,
     flash_attn_qkvpacked_func,
-    flash_attn_varlen_kvpacked_func,
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
 )
@@ -199,119 +197,6 @@ class FlashCausalSelfAttention(nn.Module):
             )
 
 
-class FlashCausalCrossAttention(nn.Module):
-    """Implement the scaled dot product attention with softmax.
-    Arguments
-    ---------
-        softmax_scale: The temperature to use for the softmax attention.
-                      (default: 1/sqrt(d_keys) where d_keys is computed at
-                      runtime)
-        window_size: The window size to use for the attention.
-    """
-
-    def __init__(
-        self,
-        softmax_scale=None,
-        window_size=(-1, -1),
-    ):
-        super().__init__()
-        assert (
-            flash_attn_varlen_kvpacked_func is not None
-        ), "FlashAttention is not installed"
-        assert flash_attn_kvpacked_func is not None, "FlashAttention is not installed"
-        self.softmax_scale = softmax_scale
-        self.window_size = window_size
-
-    def forward(
-        self,
-        q,
-        kv,
-        cu_seqlens=None,
-        max_seqlen=None,
-        cu_seqlens_k=None,
-        max_seqlen_k=None,
-    ):
-        """Implements the multihead softmax attention.
-        Arguments
-        ---------
-            q: The tensor containing the query. (B, Sq, H, D)
-            kv: The tensor containing the key and value. (B, Sk, 2, H_k, D)
-            causal: if passed, will override self.causal
-            cu_seqlens: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-                of the sequences in the batch, used to index into q.
-            max_seqlen: int. Maximum sequence length in the batch of q.
-            cu_seqlens_k: (batch_size + 1,), dtype torch.int32. The cumulative sequence lengths
-                of the sequences in the batch, used to index into kv.
-            max_seqlen_k: int. Maximum sequence length in the batch of k and v.
-        """
-        assert q.dtype in [torch.float16, torch.bfloat16]
-        assert q.is_cuda and kv.is_cuda
-        if cu_seqlens is not None:
-            assert cu_seqlens.dtype == torch.int32
-            assert max_seqlen is not None
-            assert isinstance(max_seqlen, int)
-            assert cu_seqlens_k is not None
-            assert cu_seqlens_k.dtype == torch.int32
-            assert max_seqlen_k is not None
-            assert isinstance(max_seqlen_k, int)
-            return flash_attn_varlen_kvpacked_func(
-                q,
-                kv,
-                cu_seqlens,
-                cu_seqlens_k,
-                max_seqlen,
-                max_seqlen_k,
-                softmax_scale=self.softmax_scale,
-                causal=True,
-                window_size=(self.window_size, -1),
-            )
-        else:
-            assert kv.shape[0] == q.shape[0] and kv.shape[4] == q.shape[3]
-            return flash_attn_kvpacked_func(
-                q,
-                kv,
-                softmax_scale=self.softmax_scale,
-                causal=True,
-                window_size=(self.window_size, -1),
-            )
-
-
-class LinearResidual(nn.Linear):
-    """Wrap nn.Linear to return the residual as well. For compatibility with FusedDense."""
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        return super().forward(input), input
-
-
-def _update_kv_cache(kv, inference_params, layer_idx):
-    """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
-    # Pre-allocate memory for key-values for inference.
-    num_heads, head_dim = kv.shape[-2:]
-    if layer_idx not in inference_params.key_value_memory_dict:
-        kv_cache = torch.empty(
-            inference_params.max_batch_size,
-            inference_params.max_seqlen,
-            2,
-            num_heads,
-            head_dim,
-            dtype=kv.dtype,
-            device=kv.device,
-        )
-        inference_params.key_value_memory_dict[layer_idx] = kv_cache
-    else:
-        kv_cache = inference_params.key_value_memory_dict[layer_idx]
-    # Adjust key and value for inference
-    batch_start = inference_params.batch_size_offset
-    batch_end = batch_start + kv.shape[0]
-    sequence_start = inference_params.seqlen_offset
-    sequence_end = sequence_start + kv.shape[1]
-    assert batch_end <= kv_cache.shape[0]
-    assert sequence_end <= kv_cache.shape[1]
-    assert kv_cache is not None
-    kv_cache[batch_start:batch_end, sequence_start:sequence_end, ...] = kv
-    return kv_cache[batch_start:batch_end, :sequence_end, ...]
-
-
 class CausalMHA(nn.Module):
     def __init__(
         self,
@@ -342,9 +227,11 @@ class CausalMHA(nn.Module):
         self.rotary_emb_dim = rotary_emb_dim
         self.window_size = window_size
         self.croissattn_aux = bool(croissattn_aux)
-        # The decode path chooses between the fused KV-cache kernel and the
-        # portable cache update below.
-        self.use_flash_attn = flash_attn_with_kvcache is not None
+        if flash_attn_with_kvcache is None:
+            raise RuntimeError(
+                "H-Net requires FlashAttention's fused KV-cache kernel; "
+                "portable decode fallbacks are unsupported"
+            )
 
         self.num_heads = num_heads
         assert self.d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -364,10 +251,6 @@ class CausalMHA(nn.Module):
             softmax_scale=softmax_scale,
             window_size=window_size,
         )
-        self.inner_cross_attn = FlashCausalCrossAttention(
-            softmax_scale=softmax_scale,
-            window_size=window_size,
-        )
         self.out_proj = nn.Linear(
             d_model, d_model, bias=out_proj_bias, **factory_kwargs
         )
@@ -384,14 +267,6 @@ class CausalMHA(nn.Module):
             dtype=dtype,
             device=device,
         )
-
-    def _update_kv_cache(self, kv, inference_params, cache_layer_idx=None):
-        """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
-        assert (
-            self.layer_idx is not None
-        ), "Generation requires layer_idx in the constructor"
-        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
-        return _update_kv_cache(kv, inference_params, cache_layer_idx)
 
     def _ensure_loop_cache(self, inference_params, cache_layer_idx):
         if cache_layer_idx not in inference_params.key_value_memory_dict:
@@ -445,35 +320,26 @@ class CausalMHA(nn.Module):
 
     def _update_kvcache_attention(self, q, kv, inference_params, cache_layer_idx=None):
         """Write kv to inference_params, then do attention"""
-        if (
-            inference_params.seqlen_offset == 0
-            or flash_attn_with_kvcache is None
-            or not self.use_flash_attn
-        ):
-            # TODO: this only uses seqlen_offset and not lengths_per_sample.
-            kv = self._update_kv_cache(kv, inference_params, cache_layer_idx=cache_layer_idx)
-            return self.inner_cross_attn(q, kv)
-        else:
-            batch = q.shape[0]
-            cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
-            self._ensure_loop_cache(inference_params, cache_layer_idx)
-            kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
-            cache_seqlens = (
-                inference_params.lengths_per_sample[:batch]
-                if inference_params.lengths_per_sample is not None
-                else inference_params.seqlen_offset
-            )
-            return flash_attn_with_kvcache(
-                q,
-                kv_cache[:, :, 0],
-                kv_cache[:, :, 1],
-                kv[:, :, 0],
-                kv[:, :, 1],
-                cache_seqlens=cache_seqlens,
-                softmax_scale=self.inner_cross_attn.softmax_scale,
-                causal=True,
-                window_size=(self.window_size, -1)
-            )
+        batch = q.shape[0]
+        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+        self._ensure_loop_cache(inference_params, cache_layer_idx)
+        kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
+        cache_seqlens = (
+            inference_params.lengths_per_sample[:batch]
+            if inference_params.lengths_per_sample is not None
+            else inference_params.seqlen_offset
+        )
+        return flash_attn_with_kvcache(
+            q,
+            kv_cache[:, :, 0],
+            kv_cache[:, :, 1],
+            kv[:, :, 0],
+            kv[:, :, 1],
+            cache_seqlens=cache_seqlens,
+            softmax_scale=self.softmax_scale,
+            causal=True,
+            window_size=(self.window_size, -1)
+        )
 
     def forward(
         self,

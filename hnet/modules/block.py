@@ -9,7 +9,7 @@ from flash_attn.ops.triton.layer_norm import RMSNorm
 from mamba_ssm.modules.mamba2 import Mamba2
 
 from .mha import CausalMHA
-from .mlp import SwiGLU, SparseMoESwiGLU
+from .mlp import SparseMoESwiGLU
 
 
 class Mamba2Wrapper(Mamba2):
@@ -48,7 +48,7 @@ def create_block(
     factory_kwargs = {"device": device, "dtype": dtype}
 
     # Mixer
-    if arch in ("t", "T"):
+    if arch in ("s", "S", "t", "T"):
         mixer_cls = partial(
             CausalMHA, **attn_cfg, **factory_kwargs, layer_idx=layer_idx
         )
@@ -60,26 +60,23 @@ def create_block(
         raise NotImplementedError
 
     # MLP
-    if arch in ("T", "M"):
-        if moe_cfg is not None and bool(getattr(moe_cfg, "moe_enabled", False)):
-            mlp_cls = partial(
-                SparseMoESwiGLU,
-                d_intermediate=d_intermediate,
-                num_experts=int(getattr(moe_cfg, "moe_num_experts", 8)),
-                top_k=int(getattr(moe_cfg, "moe_top_k", 1)),
-                expert_intermediate=int(getattr(moe_cfg, "moe_expert_intermediate", 0)),
-                shared_intermediate=int(getattr(moe_cfg, "moe_shared_intermediate", 0)),
-                capacity_factor=float(getattr(moe_cfg, "moe_capacity_factor", 1.25)),
-                aux_loss_weight=float(getattr(moe_cfg, "moe_aux_loss_weight", 0.01)),
-                **factory_kwargs,
+    if arch in ("S", "T", "M"):
+        if moe_cfg is None or not bool(getattr(moe_cfg, "moe_enabled", False)):
+            raise ValueError(
+                "uppercase H-Net layers require the configured sparse MoE/shared expert"
             )
-        else:
-            mlp_cls = partial(
-                SwiGLU,
-                d_intermediate=d_intermediate,
-                **factory_kwargs,
-            )
-    elif arch in ("t", "m"):
+        mlp_cls = partial(
+            SparseMoESwiGLU,
+            d_intermediate=d_intermediate,
+            num_experts=int(getattr(moe_cfg, "moe_num_experts", 8)),
+            top_k=int(getattr(moe_cfg, "moe_top_k", 1)),
+            expert_intermediate=int(getattr(moe_cfg, "moe_expert_intermediate", 0)),
+            shared_intermediate=int(getattr(moe_cfg, "moe_shared_intermediate", 0)),
+            capacity_factor=float(getattr(moe_cfg, "moe_capacity_factor", 1.25)),
+            aux_loss_weight=float(getattr(moe_cfg, "moe_aux_loss_weight", 0.01)),
+            **factory_kwargs,
+        )
+    elif arch in ("s", "t", "m"):
         mlp_cls = nn.Identity
     else:
         raise NotImplementedError

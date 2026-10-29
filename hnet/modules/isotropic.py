@@ -78,7 +78,7 @@ class Isotropic(nn.Module):
         for _ in range(stage_idx):
             arch_layout = arch_layout[1]
         arch_layout = arch_layout[pos_idx]
-        layout_parse = re.findall(r"([mMtT])(\d+)", arch_layout)
+        layout_parse = re.findall(r"([mMsStT])(\d+)", arch_layout)
 
         layers = []
         layer_idx = 0
@@ -87,15 +87,19 @@ class Isotropic(nn.Module):
         # self.height counts the number of things that get added to the residual stream
         self.height = 0
         for arch, n_layer in layout_parse:
-            assert arch in ("m", "M", "t", "T")
+            assert arch in ("m", "M", "s", "S", "t", "T")
             assert n_layer.isdigit()
+            block_attn_cfg = dict(self.attn_cfg)
+            if arch in ("s", "S"):
+                block_attn_cfg["window_size"] = int(getattr(config, "swa_window_size", 1023))
+                block_attn_cfg["croissattn_aux"] = False
             layers += [
                 create_block(
                     arch,
                     self.d_model,
                     d_intermediate=config.d_intermediate[self.stage_idx],
                     ssm_cfg=self.ssm_cfg,
-                    attn_cfg=self.attn_cfg,
+                    attn_cfg=block_attn_cfg,
                     layer_idx=(layer_idx + i),
                     moe_cfg=config,
                     **factory_kwargs,
@@ -259,7 +263,7 @@ class Isotropic(nn.Module):
                     )
                     if arch in ("m", "M") and layer_input.dim() == 2:
                         layer_input = layer_input.unsqueeze(0)
-                    elif arch in ("t", "T") and packed and layer_input.dim() == 3:
+                    elif arch in ("s", "S", "t", "T") and packed and layer_input.dim() == 3:
                         layer_input = layer_input.squeeze(0)
                     # MSAR retrieves in FP32 for stable cosine/softmax math;
                     # restore the block's parameter dtype before its fused
@@ -303,7 +307,7 @@ class Isotropic(nn.Module):
                     if hidden_states.dim() == 2:
                         hidden_states = hidden_states.unsqueeze(0)
                         residual = None if residual is None else residual.unsqueeze(0)
-                elif arch in ("t", "T"):
+                elif arch in ("s", "S", "t", "T"):
                     layer_mixer_kwargs = {**attn_mixer_kwargs, "loop_idx": _loop_idx}
                     if hidden_states.dim() == 3 and packed:
                         hidden_states = hidden_states.squeeze(0)

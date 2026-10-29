@@ -156,10 +156,10 @@ def annotate_decay(model):
 
 
 def make_optimizer(model, args):
-    try:
-        from scripts.optimizer_experiments import AnchorMuon, AnvilII
-    except ModuleNotFoundError:
-        from optimizer_experiments import AnchorMuon, AnvilII
+    # The canonical trainer uses the repository's reviewed optimizer module.
+    # Do not silently switch to an alternate scripts/ checkout: a training run
+    # must fail loudly if its pinned optimizer implementation is unavailable.
+    from optimizer_experiments import AnchorMuon, AnvilII
     annotate_decay(model)
     if args.optimizer == "adamw":
         decay, no_decay = [], []
@@ -273,12 +273,8 @@ def _cuda_graphs_supported(cfg, args):
         return False, "learning-rate warmup is outside the captured graph"
     if args.optimizer != "adamw":
         return False, "Muon/ANVIL Python state counters stay outside the graph"
-    # The current Mamba2 and FlashAttention kernels use legacy/default CUDA
-    # streams during backward. Capturing the hierarchical stack therefore
-    # raises cudaErrorStreamCaptureImplicit (or hangs on a side stream).
-    # Keep graph capture for an explicitly graph-safe attention-only config;
-    # canonical m4/T19/m4 runs remain eager until those kernels expose stream
-    # capture support.
+    # The selected S/SWA/T/FA hierarchy uses only FlashAttention mixers, so
+    # graph capture is stream-safe once the fixed-shape gates above pass.
     layout_text = str(getattr(cfg, "arch_layout", ""))
     if "m" in layout_text.lower():
         return False, "Mamba2 encoder/decoder kernels are not CUDA-graph stream safe"

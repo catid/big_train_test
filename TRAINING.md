@@ -2,13 +2,14 @@
 
 `train_hnet_600m.py` is the canonical run. It reads a raw UTF-8 byte file,
 uses the frozen 256-row byte code (zero trainable embedding parameters), and
-trains `m4 -> T19 -> m4` with learned routing, MSAR in the innermost stack,
+trains `S4 -> (SSST)×5 -> S4` with learned routing. Each group starts with
+three sliding-window attention (SWA) layers and ends with one full-attention
+(FA) layer; the first layer is SWA. MSAR remains in the innermost stack,
 two shared-weight inner executions, chunk-level FBT feedback, FP32 CE/router
 losses, Muon/GramNS plus AdamATan2 fallback, weight decay, and DDP. CUDA graph
 capture is implemented for fixed-shape attention-only configurations. The
-canonical `m4 -> T19 -> m4` path currently logs and skips capture because the
-installed Mamba2/FlashAttention backward kernels use legacy CUDA streams; an
-attempted capture fails or deadlocks, so running it would be unsafe.
+all-attention SWA/FA path is eligible when the fixed-shape and optimizer
+requirements are met.
 
 The loop cache is indexed by recurrent depth for exact autoregressive context;
 weights are shared while KV state is kept separate per loop. FBT training uses
@@ -37,7 +38,7 @@ dispatch (1:8 active routed sparsity), plus one always-on shared SwiGLU expert.
 Each routed expert has intermediate width 512, so the eight routed experts
 have the same aggregate parameter count as the dense width 4096 FFN; the
 shared expert adds a narrow 256-wide common path. This keeps the direct model
-near 600M parameters (the shared path adds about 22M weights across T19).
+near 600M parameters (the shared path adds about 22M weights across the FA/SWA blocks).
 Dispatch uses fixed per-expert
 capacity and grouped tensor contractions so the token shape remains stable
 for CUDA graphs. The router auxiliary loss is accumulated in FP32.
