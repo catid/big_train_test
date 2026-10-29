@@ -14,7 +14,10 @@ The loop cache is indexed by recurrent depth for exact autoregressive context;
 weights are shared while KV state is kept separate per loop. FBT training uses
 fresh caches and fixed chunk boundaries, as required by its multipass
 objective. The outer encoder, router, chunker, dechunker, and decoder do not
-use MSAR or FBT.
+use MSAR or FBT. MSAR currently has no recurrent stream-state implementation
+for token-by-token decoding; `Isotropic.step` rejects that combination instead
+of silently serving a model with different residual dynamics. Training and
+full-sequence evaluation remain supported.
 
 Example launch (artifacts stay outside this repository):
 
