@@ -99,7 +99,7 @@ def parse_args():
     p.add_argument(
         "--cuda-graphs",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="capture the fixed-shape canonical forward/backward with CUDA graphs",
     )
     return p.parse_args()

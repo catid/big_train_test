@@ -18,8 +18,9 @@ configuration is unspecified. The 128-token SWA width and 3:1 SWA/FA schedule
 here are this project's explicit 600M design choices, rather than claims about
 the unreleased Cartesia model.
 
-The canonical DDP + FBT2 + AnchorMuon update can use `--cuda-graphs` for fixed
-shapes. Router-selected chunks are left-aligned with trailing padding; causal
+The canonical DDP + FBT2 + AnchorMuon update uses CUDA graphs by default for
+fixed shapes; pass `--no-cuda-graphs` only for a diagnostic eager run.
+Router-selected chunks are left-aligned with trailing padding; causal
 attention cannot see that future padding, and active masks clear padded MLP and
 residual rows. The graph path fails during capture if a TE kernel or DDP setup
 still performs a host shape read. DDP capture uses a dedicated stream and
