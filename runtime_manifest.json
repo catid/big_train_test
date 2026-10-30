@@ -1,0 +1,13 @@
+{
+  "transformer_engine_commit": "9646c3ef22455b6948cbe870f1aaf20fc8238d69",
+  "binaries": {
+    "transformer_engine_core": "f5e783ca33d3aa0d46721a416c04e5ad31dc2d7501b5d41011b0890f08b20975",
+    "transformer_engine_torch": "542aac0d37d49d26a2cc132485aedd048f37d8d882892e71b59546f54a4cc854",
+    "transformer_engine_nccl_ep": "a277060771bfd0285dd00d440102281246c7c8551cc15f34e3b110cdc0c6b1b4",
+    "flash_attn_2_cuda": "841c5965caad5c3c52b3919308302ac040349fffcd7f487766f5165d2e44e71a",
+    "selective_scan_cuda": "1e29c07bc454c5341a96397832517000fe551418f1e528e65a8df00d75c88b26",
+    "causal_conv1d_cuda": "3360b6af8d8c0853e3b6f19d2f993296d24fd5e69b2255dbcf9e4b68c612a70a",
+    "libcublasLt": "d8d152ba3ce95fe54912894c2e8ced216f11a590bc4e61db65c20bcdb9af33be",
+    "libcublas": "c7983bdbcfc3628f9d964c6c82ca506f8f28bf29b8ab6dd9d27365a2b5a0cbca"
+  }
+}

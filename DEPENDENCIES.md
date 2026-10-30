@@ -25,3 +25,12 @@ floating Git revisions during a training run.
 
 Before a long run, record `pip freeze`, the CUDA driver/runtime versions, and
 the exact git SHAs for every source-built package in the run artifact log.
+
+The committed `runtime_manifest.json` is the binary trust anchor for the
+canonical environment. It records SHA-256 hashes for the loaded Transformer
+Engine core/torch/NCCL extension, FlashAttention, selective-scan, causal-conv,
+and CUDA cuBLAS libraries. `assert_fp8_runtime()` verifies those exact files
+before model construction; generated TE build directories are permitted only
+when the loaded binaries still match this manifest. The installed
+FlashAttention, Mamba-SSM, and causal-conv1d distributions do not expose
+source commit metadata, so their loaded extension hashes are recorded instead.

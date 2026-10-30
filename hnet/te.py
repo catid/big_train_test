@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import os
 import ctypes
+import hashlib
+import importlib.util
+import json
 import site
 import subprocess
 from pathlib import Path
@@ -37,6 +40,7 @@ _GROUPED_LINEAR_EAGER_ORIGINAL = None
 _EXPECTED_TE_COMMIT = "9646c3ef22455b6948cbe870f1aaf20fc8238d69"
 _CUBLASLT_PATH = None
 _CUBLASLT_VERSION = None
+_RUNTIME_MANIFEST = Path(__file__).resolve().parents[1] / "runtime_manifest.json"
 
 
 def _preload_pinned_cuda_blas() -> None:
@@ -431,7 +435,76 @@ def assert_fp8_runtime() -> None:
             "The canonical H-Net requires NVTE_DPA_CROISSATTN_AUX=1 for the "
             "patched CroissAttn FP8 backward correction"
         )
+    _verify_runtime_binaries()
     assert_fp8_attention_backend()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _runtime_binary_paths() -> dict[str, Path]:
+    """Resolve the exact shared objects used by the canonical runtime."""
+    root = Path("/home/catid/fp8/TransformerEngine").resolve()
+    torch_libs = sorted(root.glob("transformer_engine_torch*.so"))
+    if len(torch_libs) != 1:
+        raise RuntimeError(
+            "Expected exactly one Transformer Engine torch extension under "
+            f"{root}, found {torch_libs}"
+        )
+    paths = {
+        "transformer_engine_core": root / "libtransformer_engine.so",
+        "transformer_engine_torch": torch_libs[0],
+        "transformer_engine_nccl_ep": root / "libnccl_ep.so",
+    }
+    for module_name in (
+        "flash_attn_2_cuda",
+        "selective_scan_cuda",
+        "causal_conv1d_cuda",
+    ):
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or not spec.origin or spec.origin == "built-in":
+            raise RuntimeError(f"Unable to resolve required extension {module_name}")
+        paths[module_name] = Path(spec.origin).resolve()
+    if _CUBLASLT_PATH is None:
+        raise RuntimeError("cuBLASLt must be resolved before runtime verification")
+    paths["libcublasLt"] = Path(_CUBLASLT_PATH).resolve()
+    paths["libcublas"] = paths["libcublasLt"].with_name("libcublas.so.13")
+    return paths
+
+
+def runtime_binary_provenance() -> dict[str, dict[str, str]]:
+    """Return paths and hashes for the reviewed runtime binaries."""
+    result = {}
+    for name, path in _runtime_binary_paths().items():
+        if not path.is_file():
+            raise RuntimeError(f"Required runtime binary is missing: {path}")
+        result[name] = {"path": str(path), "sha256": _sha256_file(path)}
+    return result
+
+
+def _verify_runtime_binaries() -> None:
+    try:
+        manifest = json.loads(_RUNTIME_MANIFEST.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Unable to read runtime allowlist {_RUNTIME_MANIFEST}") from exc
+    if manifest.get("transformer_engine_commit") != _EXPECTED_TE_COMMIT:
+        raise RuntimeError("runtime allowlist has an unexpected Transformer Engine commit")
+    expected = manifest.get("binaries")
+    if not isinstance(expected, dict):
+        raise RuntimeError("runtime allowlist is missing its binary hashes")
+    observed = runtime_binary_provenance()
+    for name, record in observed.items():
+        expected_hash = expected.get(name)
+        if expected_hash != record["sha256"]:
+            raise RuntimeError(
+                f"unreviewed runtime binary {name}: expected {expected_hash!r}, "
+                f"found {record['sha256']!r} at {record['path']}"
+            )
 
 
 def transformer_engine_git_commit() -> str | None:
