@@ -6,6 +6,52 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hnet.te import TEGroupedLinear, make_linear, te
+from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss
+
+
+class FusedTokenRouter(nn.Module):
+    """Run TE's fused top-1 router and return scores plus a routing map.
+
+    TE computes the FP32 softmax scores and the discrete routing map in one
+    CUDA operation.  Capacity remains in :class:`SparseMoESwiGLU` because this
+    model applies causal per-sequence capacity, whereas the generic TE router
+    only sees the flattened token stream.  Keeping that policy outside the
+    fused helper preserves the fixed shapes required by CUDA graph replay.
+    """
+
+    def __init__(self, num_experts: int, top_k: int = 1):
+        super().__init__()
+        if int(top_k) != 1:
+            raise ValueError("FusedTokenRouter currently requires top_k=1")
+        self.num_experts = int(num_experts)
+        self.top_k = int(top_k)
+
+    def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not logits.is_cuda:
+            raise RuntimeError("FusedTokenRouter requires CUDA logits")
+        if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+            raise TypeError(f"unsupported fused-router logits dtype: {logits.dtype}")
+        # TE's fused score kernel requires a contiguous [tokens, experts]
+        # matrix.  Aligned TE projections can return a strided view after
+        # packed/recurrent reshaping, so make this boundary explicit.
+        logits = logits.contiguous()
+        routing_map, probs = fused_compute_score_for_moe_aux_loss(
+            logits,
+            topk=self.top_k,
+            score_function="softmax",
+        )
+        if routing_map.shape != logits.shape or routing_map.shape[-1] != self.num_experts:
+            raise RuntimeError(
+                "Transformer Engine fused router returned an unexpected routing map shape: "
+                f"map={tuple(routing_map.shape)} logits={tuple(logits.shape)}"
+            )
+        if probs.shape != logits.shape or probs.dtype != torch.float32:
+            raise RuntimeError(
+                "Transformer Engine fused router returned unexpected score output: "
+                f"scores={tuple(probs.shape)} dtype={probs.dtype} logits={tuple(logits.shape)}"
+            )
+        return probs, routing_map
+
 
 class SparseMoESwiGLU(nn.Module):
     """Static-shape top-1 sparse SwiGLU with a DeepSeek-style shared expert.
@@ -77,6 +123,7 @@ class SparseMoESwiGLU(nn.Module):
         self.shared_fc1 = make_linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
         self.shared_fc2 = make_linear(shared_intermediate, d_model, bias=bias, **factory_kwargs)
         self.router = make_linear(d_model, self.num_experts, bias=False, **factory_kwargs)
+        self.fused_router = FusedTokenRouter(self.num_experts, self.top_k)
         self.shared_gate = make_linear(d_model, 1, bias=True, **factory_kwargs)
         self._aux_loss = None
         self._aux_loss_count = 0
@@ -162,15 +209,18 @@ class SparseMoESwiGLU(nn.Module):
             if not (0 <= int(layer_idx) < route_counts.shape[1]):
                 raise IndexError(f"MoE layer index {layer_idx} is outside route counter state")
         logits = self.router(flat)
-        probs = torch.softmax(logits.float(), dim=-1)
-        _, expert_idx = probs.max(dim=-1)
+        # TE fuses FP32 score computation and top-1 selection. Capacity is
+        # applied below because it is causal per sequence, outside the generic
+        # flattened-token router's contract.
+        probs, fused_routing_map = self.fused_router(logits)
+        expert_idx = fused_routing_map.to(dtype=torch.int64).argmax(dim=-1)
 
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
         # mean router probability times dispatched token fraction.  Keep this
         # in FP32 so BF16/FP8 router logits cannot poison the training loss.
         active_f = active.to(dtype=torch.float32)
         active_count = active_f.sum().clamp_min(1.0)
-        active_one_hot = F.one_hot(expert_idx, self.num_experts).to(torch.float32)
+        active_one_hot = fused_routing_map.to(torch.float32)
         active_one_hot = active_one_hot * active_f[:, None]
         dispatch_fraction = active_one_hot.sum(dim=0) / active_count
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
@@ -283,7 +333,7 @@ class SparseMoESwiGLU(nn.Module):
             positions = global_positions - offsets.index_select(0, sequence_ids_flat)
             token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
-        routing_map = F.one_hot(expert_idx, self.num_experts).to(torch.int32)
+        routing_map = fused_routing_map.to(torch.int32)
         routing_map = routing_map * valid[:, None].to(torch.int32)
         routing_probs = probs * routing_map.to(probs.dtype)
         if route_counts is not None:
