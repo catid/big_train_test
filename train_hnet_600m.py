@@ -3,8 +3,9 @@
 The model consumes UTF-8 bytes through a frozen categorical byte code, then
 learns boundaries with H-Net routing from the first update. There is no BPE or
 trainable token embedding. The script keeps the CE and router losses in FP32,
-supports Muon/GramNS, ANVIL-II, AdamATan2 fallback, FBT multi-pass training,
-and captures a fixed-shape CUDA graph when requested.
+uses AnchorMuon/GramNS with its AdamATan2 fallback, FBT multi-pass training,
+and reports why CUDA graph capture is unavailable for the canonical
+DDP+FBT2+AnchorMuon path.
 """
 
 from __future__ import annotations
@@ -12,7 +13,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import math
 import os
 import subprocess
 import time
@@ -27,11 +27,13 @@ from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
 from hnet.models.mixer_seq import HNetForByteCausalLM
 from hnet.utils.train import load_balancing_loss
 
+CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_600m_loop2.json"
+FBT_PASSES = 2
+
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True, help="raw UTF-8 byte stream")
-    p.add_argument("--config", default="configs/hnet_1stage_600m_loop2.json")
     p.add_argument("--seq", type=int, default=4096)
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--steps", type=int, default=100000)
@@ -39,8 +41,6 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1.2e-3)
     p.add_argument("--fallback-lr", type=float, default=6e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
-    p.add_argument("--optimizer", choices=["gramns", "anvil", "adamw"], default="gramns")
-    p.add_argument("--fbt-passes", type=int, default=2)
     p.add_argument("--fbt-lambda", type=float, default=1.0)
     p.add_argument("--ratio-weight", type=float, default=0.03)
     p.add_argument("--ratio-target", type=float, default=6.0)
@@ -59,9 +59,12 @@ def parse_args():
         default=None,
         help="checkpoint to resume (model, optimizer, and step); defaults to a fresh run",
     )
-    p.add_argument("--cuda-graphs", action=argparse.BooleanOptionalAction, default=True)
-    p.add_argument("--autotune-batch", action="store_true")
-    p.add_argument("--target-power", type=float, default=1000.0)
+    p.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="request CUDA graph capture; rejected because canonical DDP+FBT2 capture is unsupported",
+    )
     return p.parse_args()
 
 
@@ -95,13 +98,15 @@ class ByteStream:
         return x, y
 
 
-def load_config(path):
-    raw = json.loads(Path(path).read_text())
-    return HNetConfig(
+def load_config():
+    raw = json.loads(CANONICAL_CONFIG.read_text())
+    cfg = HNetConfig(
         **{k: v for k, v in raw.items() if k not in {"attn_cfg", "ssm_cfg"}},
         attn_cfg=AttnConfig(**raw["attn_cfg"]),
         ssm_cfg=SSMConfig(**raw["ssm_cfg"]),
     )
+    cfg.validate_canonical()
+    return cfg
 
 
 def _config_dict(cfg):
@@ -164,24 +169,16 @@ def annotate_decay(model):
     for name, p in model.named_parameters():
         if name.endswith(".bias") or "norm" in name.lower() or "msar_bias" in name:
             p._no_weight_decay = True
+        if "msar_bias" in name:
+            p._force_fallback = True
 
 
 def make_optimizer(model, args):
     # The canonical trainer uses the repository's reviewed optimizer module.
     # Do not silently switch to an alternate scripts/ checkout: a training run
     # must fail loudly if its pinned optimizer implementation is unavailable.
-    from optimizer_experiments import AnchorMuon, AnvilII
+    from optimizer_experiments import AnchorMuon
     annotate_decay(model)
-    if args.optimizer == "adamw":
-        decay, no_decay = [], []
-        for p in model.parameters():
-            (no_decay if getattr(p, "_no_weight_decay", False) else decay).append(p)
-        return torch.optim.AdamW(
-            [{"params": decay, "weight_decay": args.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
-            lr=args.lr, betas=(0.9, 0.95), fused=True,
-        )
-    if args.optimizer == "anvil":
-        return AnvilII(model.parameters(), lr=args.lr, fallback_lr=args.fallback_lr, weight_decay=args.weight_decay)
     return AnchorMuon.from_model(
         model,
         lr=args.lr,
@@ -193,6 +190,8 @@ def make_optimizer(model, args):
         pmuoneq_beta=0.90,
         row_gamma=0.45,
         normuon_beta2=0.93,
+        soda_lambda_scale=0.003,
+        min_matrix_dim=32,
     )
 
 
@@ -231,72 +230,11 @@ def read_power_watts():
         return []
 
 
-class GraphStep:
-    def __init__(self, model, optimizer, x, y, args):
-        self.model, self.optimizer, self.args = model, optimizer, args
-        self.x = torch.zeros_like(x)
-        self.y = torch.zeros_like(y)
-        self.static_loss = torch.zeros((), device=x.device)
-        self.graph = torch.cuda.CUDAGraph()
-        # Static all-true mask keeps dynamic chunk lengths bounded by config
-        # and makes every allocation replay-safe.
-        self.mask = torch.ones_like(self.x, dtype=torch.bool)
-        torch.cuda.synchronize()
-        for _ in range(3):
-            out = model(self.x, mask=self.mask, fbt_passes=args.fbt_passes)
-            loss, _, _ = loss_for_output(out, self.y, args)
-            optimizer.zero_grad(set_to_none=False)
-            loss.backward()
-        optimizer.zero_grad(set_to_none=False)
-        with torch.cuda.graph(self.graph):
-            out = model(self.x, mask=self.mask, fbt_passes=args.fbt_passes)
-            self.static_loss, _, self.static_ratio = loss_for_output(out, self.y, args)
-            self.static_loss.backward()
-
-    def __call__(self, x, y):
-        self.x.copy_(x)
-        self.y.copy_(y)
-        # Keep Python-side optimizer state and learning-rate schedules outside
-        # the graph; the graph contains only fixed-shape forward/backward.
-        self.optimizer.zero_grad(set_to_none=False)
-        self.graph.replay()
-        if not bool(torch.isfinite(self.static_loss)):
-            return self.static_loss, self.static_ratio
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optimizer.step()
-        return self.static_loss, self.static_ratio
-
-
-def _cuda_graphs_supported(cfg, args):
-    """Return whether this model has replay-stable CUDA graph shapes.
-
-    H-Net routing compacts each sequence according to a learned boundary mask.
-    ``static_chunking`` pads the compacted representation to the configured
-    bound, so the graph sees fixed tensor shapes while the mask still carries
-    the learned boundaries.  The optimizer update remains outside the graph,
-    which keeps Muon/ANVIL counters and learning-rate schedules correct.
-    """
-    if not bool(getattr(cfg, "static_chunking", False)):
-        return False, "static_chunking is required for replay-stable routed shapes"
-    if args.fbt_passes != 1:
-        return False, "FBT multi-pass execution is not CUDA-graph stable"
-    if args.warmup:
-        return False, "learning-rate warmup is outside the captured graph"
-    if args.optimizer != "adamw":
-        return False, "Muon/ANVIL Python state counters stay outside the graph"
-    # The selected S/SWA/T/FA hierarchy uses only FlashAttention mixers, so
-    # graph capture is stream-safe once the fixed-shape gates above pass.
-    layout_text = str(getattr(cfg, "arch_layout", ""))
-    if "m" in layout_text.lower():
-        return False, "Mamba2 encoder/decoder kernels are not CUDA-graph stream safe"
-    return True, ""
-
-
 def main():
     args = parse_args()
     rank, world, device = init_dist()
     torch.manual_seed(1729 + rank)
-    cfg = load_config(args.config)
+    cfg = load_config()
     cfg.max_seq_len = args.seq
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -308,7 +246,6 @@ def main():
             device_ids=[device.index],
             broadcast_buffers=False,
             bucket_cap_mb=256,
-            static_graph=True,
             gradient_as_bucket_view=True,
         )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
@@ -348,32 +285,35 @@ def main():
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(args.data, args.seq, args.batch, rank, world)
-    graph_step = None
-    if args.cuda_graphs and device.type == "cuda":
-        graph_ok, reason = _cuda_graphs_supported(cfg, args)
-        if graph_ok:
-            x0, y0 = stream.get(0, device)
-            graph_step = GraphStep(model, optimizer, x0, y0, args)
-        elif rank == 0:
-            print(f"CUDA graphs disabled: {reason}", flush=True)
+    if args.cuda_graphs:
+        raise RuntimeError(
+            "CUDA graphs are not supported for the canonical DDP+FBT2+AnchorMuon "
+            "training path: DDP gradient-bucket logging is illegal during capture"
+        )
     log = {
         "args": vars(args),
         "params": n_params,
         "world": world,
+        "optimizer_groups": optimizer.group_summary(),
         "loss": [],
         "ratio": [],
         "time_ms": [],
         "power_w": [],
         "nonfinite": [],
     }
+    if rank == 0:
+        print(
+            "optimizer_groups="
+            + json.dumps(optimizer.group_summary(), separators=(",", ":")),
+            flush=True,
+        )
     latest_power = []
     for step in range(start_step, args.steps):
         x, y = stream.get(step, device)
         lr_scale = min(1.0, (step + 1) / max(1, args.warmup))
         for group in optimizer.param_groups:
-            # AnchorMuon splits matrix and fallback tensors into separate
-            # groups, while Anvil keeps both rates in one group.  Preserve the
-            # requested fallback rate in either representation.
+            # AnchorMuon splits matrix and AdamATan2 fallback tensors into
+            # separate groups; preserve the requested fallback rate.
             if "use_matrix_update" in group:
                 base_lr = args.lr if group["use_matrix_update"] else args.fallback_lr
                 group["lr"] = base_lr * lr_scale
@@ -382,23 +322,24 @@ def main():
             if "fallback_lr" in group:
                 group["fallback_lr"] = args.fallback_lr * lr_scale
         t0 = time.perf_counter()
-        if graph_step is not None:
-            loss, ratio = graph_step(x, y)
-            if not bool(torch.isfinite(loss)):
-                log["nonfinite"].append(step)
-                raise RuntimeError("non-finite loss encountered during CUDA-graph replay")
+        mask = torch.ones_like(x, dtype=torch.bool)
+        out = model(x, mask=mask, fbt_passes=FBT_PASSES)
+        loss, _, ratio = loss_for_output(out, y, args)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        finite_local = torch.isfinite(loss) & torch.isfinite(grad_norm)
+        # A single rank with an invalid batch must not advance its optimizer
+        # while the other DDP ranks do.  Reduce the finite flag before any
+        # optimizer mutation so every rank takes the same branch.
+        finite_flag = finite_local.to(dtype=torch.int32)
+        if world > 1:
+            dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
+        finite = bool(finite_flag.item())
+        if finite:
+            optimizer.step()
         else:
-            mask = torch.ones_like(x, dtype=torch.bool)
-            out = model(x, mask=mask, fbt_passes=args.fbt_passes)
-            loss, _, ratio = loss_for_output(out, y, args)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            finite = bool(torch.isfinite(loss) and torch.isfinite(grad_norm))
-            if finite:
-                optimizer.step()
-            else:
-                log["nonfinite"].append(step)
+            log["nonfinite"].append(step)
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed = (time.perf_counter() - t0) * 1e3
@@ -437,8 +378,7 @@ def main():
         if rank == 0 and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             path = Path(args.checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(
-                {
+            checkpoint = {
                     "step": step,
                     "seq": args.seq,
                     "batch": args.batch,
@@ -449,9 +389,12 @@ def main():
                     "rng_state_by_rank": rng_by_rank,
                     "rng_state": rng_by_rank[0][0],
                     "cuda_rng_state": rng_by_rank[0][1],
-                },
-                path,
+                }
+            temp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+            torch.save(
+                checkpoint, temp_path,
             )
+            os.replace(temp_path, path)
     if rank == 0:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(log, indent=2))

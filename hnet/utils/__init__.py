@@ -1,1 +1,3 @@
-from .train import group_params, load_balancing_loss
+from .train import load_balancing_loss
+
+__all__ = ["load_balancing_loss"]

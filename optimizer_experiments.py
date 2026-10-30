@@ -16,11 +16,8 @@ switches:
     no post-NorMuon aspect multiplier
     no optional NorMuon disable path
 
-It does expose a small fallback-only ``fallback_mode`` knob for scalar/vector
-tensors. The default is now the AdamATan2 fallback because it gave the best
-validation loss/accuracy in the latest fallback sweep while remaining tied with
-RMS on official test accuracy. ``"rms"`` and ``"adamc"`` remain available for
-fallback-path experiments and do not alter the matrix direction.
+Scalar/vector tensors use the AdamATan2 fallback. No alternate optimizer or
+fallback mode is part of the canonical trainer.
 
 The current best-supported recipe comes from a CIFAR-10 train/validation/test
 split with the official test split evaluated only once at the end:
@@ -50,7 +47,7 @@ useful starting points. WikiText-103 selected ``lr=0.0015``,
 ``soda_lambda_scale=0.01`` after a 213-candidate 1200-step HPO and 1600-step
 family replay. FineWeb-Edu needed its own tuning: a 255-candidate 1600-step HPO
 with 10k-step family replay selected ``lr=0.0012``, ``fallback_lr=0.0012``,
-``fallback_mode="rms"``, ``row_gamma=0.45``, ``soda_lambda_scale=0.003``,
+``fallback_mode="atan2"``, ``row_gamma=0.45``, ``soda_lambda_scale=0.003``,
 ``pmuoneq_beta=0.90``, and ``normuon_beta2=0.93``. That FineWeb point beat
 tuned plain Muon by 1.1755 vs 1.1798 validation loss while running faster per
 step. These are real-text but byte-level, single-seed optimizer-transfer
@@ -107,35 +104,21 @@ Fallback parameters
 ===================
 
 Scalar/vector tensors and any parameters explicitly placed in a fallback group
-use the same SODA anchor plus AdamATan2 by default. Optional fallback modes
-exist for narrow experiments on scalar/vector parameters only, but they do not
-affect the matrix direction generator. Automatic matrix eligibility is based
+use the same SODA anchor plus AdamATan2. Automatic matrix eligibility is based
 only on effective shape after ignoring singleton dimensions. Two-dimensional
 weights use the spectral matrix path. Stacked expert banks use a batched
 spectral path, keeping each expert's matrix independent; names are never used
 for routing in this standalone file.
 
-The default ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
+The fixed ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
 an AdamATan2-style bounded angular update:
 
        m_t = beta_1 m_{t-1} + (1 - beta_1) g_t
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
        update = atan2(m_hat_t, sqrt(v_hat_t) + eps)
 
-The optional ``fallback_mode="rms"`` uses the earlier RMS-style second-moment
-fallback:
-
-       v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
-       update = g_t / (sqrt(v_t / (1 - beta_2^t)) + eps)
-
-The optional ``fallback_mode="adamc"`` uses the AdamC adaptive direction on
-fallback tensors. If ``fallback_weight_decay`` is nonzero, it applies AdamC's
-``lr^2 * weight_decay`` decoupled decay to the fallback tensor before the
-learned update. The default keeps ``fallback_weight_decay=0`` so the shippable
-recipe still uses SODA as its only regularizer.
-
-There is no ordinary weight decay path in this standalone optimizer. SODA is the
-only regularization mechanism applied by AnchorMuon.
+AnchorMuon applies decoupled matrix and fallback weight decay; SODA is an
+additional anchor regularizer controlled by the trainer.
 
 Recommended starting defaults
 =============================
@@ -199,12 +182,11 @@ Do not tune everything at once. Treat the knobs in three tiers:
             EMA coefficient for row gradient-power estimates.
 
         fallback_mode = "atan2"
-            Scalar/vector fallback update. Leave at "atan2" unless
-            specifically testing "rms" or "adamc" for fallback-only ablations.
+            Scalar/vector AdamATan2 update. The canonical trainer fixes this
+            mode and does not expose alternate fallback optimizers.
 
         fallback_betas = (0.9, 0.95)
-            Fallback first/second moment defaults. The first value is ignored
-            by "rms" mode.
+            AdamATan2 first/second moment defaults.
 
         soda_lambda_scale = 1.0, soda_lambda_power = 1.0
             SODA anchor pull schedule. Changing these changes the regularizer,
@@ -247,7 +229,7 @@ not a verbatim copy of any one paper:
 
 * SODA anchor regularization follows the initialization-anchor/optimistic dual
   averaging idea from ``Optimistic Dual Averaging Unifies Modern Optimizers``
-  (arXiv:2605.11172). Here SODA is always enabled and replaces ordinary weight
+  (arXiv:2605.11172). Here SODA is always enabled alongside decoupled weight
   decay.
 * PMuonEq is this repo's cheap row-only approximation to PMuon-style
   preconditioned Muon directions. Dense PMuon would use
@@ -305,84 +287,7 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = tuple(
     )
     for a, b, c in POLAR_EXPRESS_UNSCALED
 )
-FALLBACK_MODES = {"rms", "atan2", "adamc"}
-
-# Portable ANVIL-II ablation (Keller Jordan, modded-nanogpt PR #360). The
-# production PR uses fused Triton bank kernels; this reference keeps the twin
-# rails and six polynomial maps auditable on the H-Net parameter shapes.
-ANVIL_II_MAPS = (
-    (3.923798038567, -6.095026865488, 3.905234618423),
-    (3.278126713798, -3.328923386476, 0.989127286973),
-    (3.505298394150, -5.137358782410, 1.968325560615),
-    (2.815058591845, -3.685181239622, 1.417196497642),
-    (2.245503932403, -2.443826979899, 0.963091710461),
-    (2.256537145403, -2.166840097229, 0.929501253245),
-)
-
-
-def _anvil_ii_polar(x: torch.Tensor) -> torch.Tensor:
-    x = x.float()
-    scale = x.square().sum(dim=(-2, -1), keepdim=True).sqrt().clamp_min(1e-6) * 1.05
-    x = x / scale
-    for a, b, c in ANVIL_II_MAPS:
-        gram = x @ x.mT
-        x = a * x + (b * gram + c * (gram @ gram)) @ x
-    return x
-
-
-class AnvilII(torch.optim.Optimizer):
-    """Reference ANVIL-II matrix optimizer with AdamATan2 fallback."""
-
-    def __init__(self, params, lr=1.2e-3, fallback_lr=None, weight_decay=0.01,
-                 momentum_fast=0.85, momentum_slow=0.98, fast_weight=0.4385,
-                 engage_step=514, fallback_betas=(0.9, 0.95), eps=1e-8):
-        fallback_lr = lr if fallback_lr is None else fallback_lr
-        super().__init__(params, dict(lr=lr, fallback_lr=fallback_lr,
-                                      weight_decay=weight_decay,
-                                      momentum_fast=momentum_fast,
-                                      momentum_slow=momentum_slow,
-                                      fast_weight=fast_weight,
-                                      engage_step=engage_step,
-                                      betas=fallback_betas, eps=eps))
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        for group in self.param_groups:
-            group["step"] = int(group.get("step", 0)) + 1
-            step = group["step"]
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                g = p.grad.detach().float()
-                state = self.state[p]
-                if p.ndim >= 2 and min(p.shape[-2:]) > 1:
-                    fast = state.setdefault("fast", torch.zeros_like(p, dtype=torch.float32))
-                    slow = state.setdefault("slow", torch.zeros_like(p, dtype=torch.float32))
-                    fast.lerp_(g, 1.0 - group["momentum_fast"])
-                    slow.lerp_(g, 1.0 - group["momentum_slow"])
-                    w = group["fast_weight"] if step >= group["engage_step"] else 1.0
-                    velocity = w * fast + (1.0 - w) * slow
-                    velocity = g.lerp(velocity, group["momentum_fast"])
-                    update = _anvil_ii_polar(_matrix_view(velocity)).reshape_as(p)
-                    agree = (g * slow).mean().sign().item()
-                    decay = 0.0 if getattr(p, "_no_weight_decay", False) else group["weight_decay"]
-                    p.mul_(1.0 - group["lr"] * decay * max(0.0, agree))
-                    p.add_(update.to(p.dtype), alpha=-group["lr"])
-                else:
-                    avg = state.setdefault("avg", torch.zeros_like(p, dtype=torch.float32))
-                    sq = state.setdefault("sq", torch.zeros_like(p, dtype=torch.float32))
-                    beta1, beta2 = group["betas"]
-                    avg.mul_(beta1).add_(g, alpha=1.0 - beta1)
-                    sq.mul_(beta2).addcmul_(g, g, value=1.0 - beta2)
-                    update = torch.atan2(avg, sq.sqrt().add_(group["eps"]))
-                    decay = 0.0 if getattr(p, "_no_weight_decay", False) else group["weight_decay"]
-                    p.mul_(1.0 - group["fallback_lr"] * decay)
-                    p.add_(update.to(p.dtype), alpha=-group["fallback_lr"])
-        return loss
+FALLBACK_MODES = {"atan2"}
 
 
 @torch.no_grad()
@@ -403,7 +308,14 @@ def _matrix_view(x: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def _diag_inverse_power(values: torch.Tensor, *, gamma: float, eps: float) -> torch.Tensor:
     x = values.to(torch.float32)
-    scale = x.mean(dim=-1, keepdim=True).clamp_min(1.0) if x.ndim > 1 else x.mean().clamp_min(1.0)
+    # Scale the ridge relative to the observed row energy.  Clamping this
+    # mean to one makes the fixed 1e-6 epsilon dominate the tiny gradients of
+    # a BF16 transformer and collapses PMuonEq to an almost uniform factor.
+    scale = (
+        x.mean(dim=-1, keepdim=True).clamp_min(eps)
+        if x.ndim > 1
+        else x.mean().clamp_min(eps)
+    )
     lam = (x + eps * scale).clamp_min(eps * scale)
     out = lam.pow(-float(gamma))
     norm = out.norm(dim=-1, keepdim=True).clamp_min(eps) if out.ndim > 1 else out.norm().clamp_min(eps)
@@ -448,8 +360,11 @@ def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bo
     effective_shape = tuple(int(dim) for dim in param.shape if int(dim) > 1)
     if len(effective_shape) < 2:
         return False
-    rows = effective_shape[0]
-    cols = math.prod(effective_shape[1:])
+    # The optimizer treats leading dimensions as independent matrix banks.
+    # Eligibility must therefore use the final two matrix dimensions; using
+    # the first bank dimension would incorrectly route [8, 1024, 1536] by
+    # ``8`` and would route skinny [20, 6144, 4] tensors through GramNS.
+    rows, cols = effective_shape[-2:]
     return min(rows, cols) >= int(min_matrix_dim)
 
 
@@ -570,7 +485,7 @@ class AnchorMuon(torch.optim.Optimizer):
         normuon_eps: float = 1e-10,
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
-        min_matrix_dim: int = 2,
+        min_matrix_dim: int = 32,
         use_soda: bool = True,
         use_pmuoneq: bool = True,
         use_normuon: bool = True,
@@ -704,6 +619,14 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("normuon_beta2", normuon_beta2)
                     group.setdefault("normuon_eps", normuon_eps)
                     group.setdefault("min_matrix_dim", min_matrix_dim)
+                    # Forced fallback parameters (for example MSAR bias)
+                    # retain the fallback schedule even though they share a
+                    # matrix group for compact optimizer state.
+                    group.setdefault("fallback_lr", fallback_lr)
+                    group.setdefault("fallback_mode", fallback_mode)
+                    group.setdefault("betas", fallback_betas)
+                    group.setdefault("fallback_weight_decay", fallback_weight_decay)
+                    group.setdefault("eps", eps)
                 else:
                     group.setdefault("fallback_mode", fallback_mode)
                     group.setdefault("betas", fallback_betas)
@@ -817,6 +740,11 @@ class AnchorMuon(torch.optim.Optimizer):
                     "normuon_beta2": normuon_beta2,
                     "normuon_eps": normuon_eps,
                     "min_matrix_dim": min_matrix_dim,
+                    "fallback_lr": fallback_lr,
+                    "fallback_mode": fallback_mode,
+                    "betas": fallback_betas,
+                    "fallback_weight_decay": fallback_weight_decay,
+                    "eps": eps,
                 }
             )
         if fallback_params:
@@ -838,6 +766,48 @@ class AnchorMuon(torch.optim.Optimizer):
 
     def eval(self) -> "AnchorMuon":
         return self
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        """Restore optimizer state without narrowing its FP32 accumulators.
+
+        ``torch.optim.Optimizer.load_state_dict`` casts floating state tensors
+        to the destination parameter dtype.  The model parameters are BF16,
+        while AnchorMuon deliberately keeps its master parameters, SODA
+        anchors, momentum, row statistics, and AdamATan2 moments in FP32.
+        Re-cast those tensors after the base loader runs so a checkpoint
+        resume has the same numerical state as a continuous run.
+        """
+        # PyTorch's generic loader casts every floating state tensor to the
+        # destination parameter dtype.  Capture the serialized state first,
+        # then restore it by parameter order after the loader has rebuilt its
+        # parameter-id map; otherwise FP32 masters would be irreversibly
+        # narrowed to BF16 during resume.
+        saved_state = state_dict.get("state", {})
+        saved_groups = state_dict.get("param_groups", [])
+        super().load_state_dict(state_dict)
+        for saved_group, current_group in zip(saved_groups, self.param_groups):
+            for saved_id, param in zip(saved_group.get("params", []), current_group["params"]):
+                source = saved_state.get(saved_id)
+                if not isinstance(source, dict):
+                    continue
+                destination = self.state[param]
+                for key, value in source.items():
+                    if isinstance(value, torch.Tensor) and value.is_floating_point():
+                        destination[key] = value.to(device=param.device, dtype=torch.float32)
+        fp32_keys = {
+            "master_param",
+            "soda_z0",
+            "momentum_buffer",
+            "pmuoneq_row_ema",
+            "normuon_second_momentum",
+            "exp_avg",
+            "exp_avg_sq",
+        }
+        for param, state in self.state.items():
+            for key in fp32_keys:
+                value = state.get(key)
+                if isinstance(value, torch.Tensor):
+                    state[key] = value.to(device=param.device, dtype=torch.float32)
 
     def group_summary(self) -> list[dict[str, Any]]:
         """Return a small serializable summary of optimizer parameter routing."""
@@ -862,10 +832,33 @@ class AnchorMuon(torch.optim.Optimizer):
 
     def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
         state = self.state[p]
+        master = self._master_param(p)
         anchor = state.get("soda_z0")
-        if anchor is None:
-            anchor = state["soda_z0"] = torch.clone(p, memory_format=torch.preserve_format)
+        if not isinstance(anchor, torch.Tensor) or anchor.shape != p.shape:
+            anchor = state["soda_z0"] = torch.clone(master, memory_format=torch.preserve_format)
+        elif anchor.device != p.device or anchor.dtype != torch.float32:
+            anchor = state["soda_z0"] = anchor.to(device=p.device, dtype=torch.float32)
         return anchor
+
+    def _master_param(self, p: torch.Tensor) -> torch.Tensor:
+        """Return the FP32 update copy for a low-precision model parameter.
+
+        Forward and backward stay on the fused BF16 model weights, while all
+        optimizer arithmetic is applied to this persistent FP32 copy.  The
+        rounded BF16 value is copied back only after a complete update, so
+        small Muon/AdamATan2 and decay updates are not lost to BF16 spacing.
+        """
+        if p.dtype == torch.float32:
+            return p
+        state = self.state[p]
+        master = state.get("master_param")
+        if not isinstance(master, torch.Tensor) or master.shape != p.shape:
+            master = state["master_param"] = p.detach().to(torch.float32).clone(
+                memory_format=torch.preserve_format
+            )
+        elif master.device != p.device or master.dtype != torch.float32:
+            master = state["master_param"] = master.to(device=p.device, dtype=torch.float32)
+        return master
 
     def _soda_weight(self, t: int) -> float:
         if not self.use_soda:
@@ -897,7 +890,12 @@ class AnchorMuon(torch.optim.Optimizer):
             if row_ema.device != device or row_ema.dtype != torch.float32:
                 row_ema = state["pmuoneq_row_ema"] = row_ema.to(device=device, dtype=torch.float32)
         else:
-            row_ema = state["pmuoneq_row_ema"] = torch.ones(*row_shape, device=device, dtype=torch.float32)
+            # Start with no observed gradient energy.  The row factors are
+            # normalized after the ridge, so a zero EMA gives the first real
+            # gradient an immediate relative preconditioner; initializing to
+            # one would suppress PMuonEq for hundreds of updates on this
+            # workload's small gradients.
+            row_ema = state["pmuoneq_row_ema"] = torch.zeros(*row_shape, device=device, dtype=torch.float32)
         second = state.get("normuon_second_momentum")
         second_shape = (*row_shape, 1)
         if isinstance(second, torch.Tensor) and second.shape == second_shape:
@@ -967,8 +965,12 @@ class AnchorMuon(torch.optim.Optimizer):
                     "AnchorMuon does not support sparse gradients. "
                     "Use dense gradients for this parameter or a different optimizer."
                 )
-            if not _is_matrix_like_parameter(grad, min_matrix_dim=int(group.get("min_matrix_dim", 2))):
-                fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
+            if getattr(p, "_force_fallback", False) or not _is_matrix_like_parameter(
+                grad, min_matrix_dim=int(group.get("min_matrix_dim", 32))
+            ):
+                fallback_count += self._step_fallback_param(
+                    p, group, lr=float(group.get("fallback_lr", lr)), t=t
+                )
                 continue
             anchor = self._soda_anchor(p)
             source, grad_matrix = self._pre_matrix_source(p, grad, beta_m)
@@ -990,11 +992,14 @@ class AnchorMuon(torch.optim.Optimizer):
         for bucket_entries in buckets.values():
             updates = self._transform_matrix_bucket(bucket_entries, group)
             for (p, anchor, _source, _grad), update in zip(bucket_entries, updates.unbind(0), strict=True):
-                p.lerp_(end=anchor, weight=soda_weight)
+                master = self._master_param(p)
+                master.lerp_(end=anchor, weight=soda_weight)
                 matrix_decay = 0.0 if getattr(p, "_no_weight_decay", False) else self.matrix_weight_decay
                 if matrix_decay:
-                    p.mul_(1.0 - lr * matrix_decay)
-                p.add_(update.reshape_as(p).to(p.dtype), alpha=-lr)
+                    master.mul_(1.0 - lr * matrix_decay)
+                master.add_(update.reshape_as(master), alpha=-lr)
+                if master is not p:
+                    p.copy_(master.to(dtype=p.dtype))
                 matrix_count += 1
 
         return {
@@ -1022,7 +1027,7 @@ class AnchorMuon(torch.optim.Optimizer):
         state = self.state[p]
         mode = str(group.get("fallback_mode", "atan2")).lower()
         if mode not in FALLBACK_MODES:
-            raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
+            raise ValueError("the canonical fallback mode is AdamATan2 ('atan2')")
         exp_avg_sq = state.get("exp_avg_sq")
         if isinstance(exp_avg_sq, torch.Tensor) and exp_avg_sq.shape == p.shape:
             if exp_avg_sq.device != p.device or exp_avg_sq.dtype != torch.float32:
@@ -1031,9 +1036,7 @@ class AnchorMuon(torch.optim.Optimizer):
             exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
             state["step"] = 0
         exp_avg = state.get("exp_avg")
-        if mode in {"atan2", "adamc"} and (
-            not isinstance(exp_avg, torch.Tensor) or exp_avg.shape != p.shape
-        ):
+        if not isinstance(exp_avg, torch.Tensor) or exp_avg.shape != p.shape:
             exp_avg = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
         elif isinstance(exp_avg, torch.Tensor) and (exp_avg.device != p.device or exp_avg.dtype != torch.float32):
             exp_avg = state["exp_avg"] = exp_avg.to(device=p.device, dtype=torch.float32)
@@ -1041,27 +1044,24 @@ class AnchorMuon(torch.optim.Optimizer):
         beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
-        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
+        master = self._master_param(p)
+        master.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
         fallback_weight_decay = 0.0 if getattr(p, "_no_weight_decay", False) else float(group.get("fallback_weight_decay", 0.0))
         if fallback_weight_decay != 0.0:
-            p.mul_(1.0 - lr * fallback_weight_decay)
+            master.mul_(1.0 - lr * fallback_weight_decay)
 
         exp_avg_sq.mul_(float(beta2)).addcmul_(g, g, value=1.0 - float(beta2))
         step = int(state["step"])
         bias2 = max(1.0 - float(beta2) ** step, 1e-16)
         denom = (exp_avg_sq / bias2).sqrt().add_(eps)
-        if mode == "rms":
-            update = g / denom
-        else:
-            if exp_avg is None:
-                raise RuntimeError("fallback first-moment state was not initialized")
-            exp_avg.mul_(float(beta1)).add_(g, alpha=1.0 - float(beta1))
-            bias1 = max(1.0 - float(beta1) ** step, 1e-16)
-            if mode == "atan2":
-                update = torch.atan2(exp_avg / bias1, denom)
-            else:
-                update = (exp_avg / bias1) / denom
-        p.add_(update.to(p.dtype), alpha=-lr)
+        if exp_avg is None:
+            raise RuntimeError("AdamATan2 fallback state was not initialized")
+        exp_avg.mul_(float(beta1)).add_(g, alpha=1.0 - float(beta1))
+        bias1 = max(1.0 - float(beta1) ** step, 1e-16)
+        update = torch.atan2(exp_avg / bias1, denom)
+        master.add_(update, alpha=-lr)
+        if master is not p:
+            p.copy_(master.to(dtype=p.dtype))
         return 1
 
     def _step_fallback_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
@@ -1123,7 +1123,7 @@ def build_param_groups(
     pmuoneq_eps: float = 1e-6,
     normuon_beta2: float = 0.93,
     normuon_eps: float = 1e-10,
-    min_matrix_dim: int = 2,
+    min_matrix_dim: int = 32,
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
 
@@ -1184,6 +1184,11 @@ def build_param_groups(
                 "normuon_beta2": normuon_beta2,
                 "normuon_eps": normuon_eps,
                 "min_matrix_dim": min_matrix_dim,
+                "fallback_lr": fallback_lr,
+                "fallback_mode": fallback_mode,
+                "betas": fallback_betas,
+                "fallback_weight_decay": fallback_weight_decay,
+                "eps": eps,
             }
         )
     if fallback_params:
@@ -1205,6 +1210,5 @@ def build_param_groups(
 __all__ = [
     "__version__",
     "AnchorMuon",
-    "AnvilII",
     "build_param_groups",
 ]

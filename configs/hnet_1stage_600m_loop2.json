@@ -1,5 +1,5 @@
 {
-    "arch_layout": ["s4", ["S3T1S3T1S3T1S3T1S3T1"], "s4"],
+    "arch_layout": ["m4", ["S3T1S3T1S3T1S3T1S3T1"], "m4"],
     "d_model": [1024, 1536],
     "d_intermediate": [0, 4096],
     "vocab_size": 256,
@@ -12,7 +12,7 @@
     "attn_cfg": {
         "num_heads": [16, 16],
         "rotary_emb_dim": [32, 48],
-        "window_size": [1023, -1],
+        "window_size": [128, -1],
         "croissattn_aux": [false, true]
     },
     "inner_loops": 2,
@@ -20,6 +20,7 @@
     "msar_stream_kernels": [1, 4, 8, 12],
     "swa_window_size": 128,
     "fbt": true,
+    "fbt_passes": 2,
     "fbt_jitter": 0.02,
     "max_seq_len": 4096,
     "static_chunking": true,

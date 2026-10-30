@@ -9,6 +9,7 @@ from einops import repeat, rearrange
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 from hnet.modules.utils import get_seq_idx
+from torch.utils._pytree import register_pytree_node
 
 
 @dataclass
@@ -16,6 +17,21 @@ class RoutingModuleOutput:
     boundary_prob: torch.Tensor
     boundary_mask: torch.Tensor
     selected_probs: torch.Tensor
+
+
+def _flatten_routing_output(value):
+    return (value.boundary_prob, value.boundary_mask, value.selected_probs), None
+
+
+def _unflatten_routing_output(values, _context):
+    return RoutingModuleOutput(*values)
+
+
+register_pytree_node(
+    RoutingModuleOutput,
+    _flatten_routing_output,
+    _unflatten_routing_output,
+)
 
 
 @dataclass
@@ -86,8 +102,11 @@ class RoutingModule(nn.Module):
         # Router probabilities feed hard selection and the EMA dechunker. Do
         # the normalization in FP32 so BF16 roundoff cannot create NaNs or
         # probabilities outside [0, 1] in long runs.
-        q = F.normalize(self.q_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
-        k = F.normalize(self.k_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
+        # Cartesia's causal router scores the current state against the
+        # immediately preceding state: p_t = 1/2(1-cos(W_q x_t,
+        # W_k x_{t-1})). Keep the first position forced to a boundary.
+        q = F.normalize(self.q_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
         cos_sim = torch.einsum("b l d, b l d -> b l", q, k)
         # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
@@ -141,8 +160,8 @@ class RoutingModule(nn.Module):
     def step(self, hidden_states, inference_params):
         # hidden_states is (B, 1, D)
         hidden_states = hidden_states.squeeze(1)
-        q = F.normalize(self.q_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
-        k = F.normalize(self.k_proj_layer(hidden_states).float(), dim=-1)
+        q = F.normalize(self.q_proj_layer(hidden_states).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
         cos_sim = torch.einsum("b d, b d -> b", q, k)
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
@@ -183,18 +202,26 @@ class ChunkLayer(nn.Module):
             next_mask = None
         else:
             next_cu_seqlens = None
+            L = hidden_states.shape[1]
             num_tokens = boundary_mask.sum(dim=-1)
             # CUDA graph capture cannot depend on a host read of a
             # data-dependent max. A configured static bound keeps all inner
             # tensors at one address/shape; the mask carries the true count.
-            next_max_seqlen = (
-                int(self.static_max_seqlen)
-                if self.static_max_seqlen is not None
-                else int(num_tokens.max())
-            )
+            if self.static_max_seqlen is not None:
+                # Evaluation and prompt prefill may use a shorter sequence
+                # than the training graph bound.  Do not manufacture a mask
+                # longer than the gathered tensor; fixed-shape training still
+                # uses the configured bound because L is constant there.
+                next_max_seqlen = min(int(self.static_max_seqlen), L)
+            else:
+                next_max_seqlen = int(num_tokens.max())
+            if int(num_tokens.max()) > next_max_seqlen:
+                raise ValueError(
+                    "static chunking bound is smaller than the number of input "
+                    "boundaries; increase max_seq_len"
+                )
 
             device = hidden_states.device
-            L = hidden_states.shape[1]
             token_idx = (
                 torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
             )

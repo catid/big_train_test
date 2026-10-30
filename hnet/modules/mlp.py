@@ -86,6 +86,10 @@ class SparseMoESwiGLU(nn.Module):
             nn.init.zeros_(self.shared_fc2.bias)
         nn.init.zeros_(self.shared_gate.weight)
         nn.init.zeros_(self.shared_gate.bias)
+        # Preserve the intended zero-start shared-expert gate when the outer
+        # H-Net initializer walks every Linear module.
+        self.shared_gate.weight._no_reinit = True
+        self.shared_gate.bias._no_reinit = True
 
     @property
     def aux_loss(self):

@@ -262,11 +262,35 @@ class Isotropic(nn.Module):
 
         attn_mixer_kwargs = copy.deepcopy(mixer_kwargs)
         ssm_mixer_kwargs = copy.deepcopy(mixer_kwargs)
+        unpack_mask = None
         if mask is not None:
             packed = False
             assert (
                 hidden_states.dim() == 3
             ), "Hidden states must be (B, L, D) in unpacked mode"
+            # Static chunking left-aligns valid chunks and pads the remainder.
+            # Pack those rows before attention so FlashAttention never
+            # normalizes over zero-valued padding keys. The result is scattered
+            # back to the fixed outer shape after all inner layers finish.
+            if not bool(mask.all()):
+                if inference_params is not None:
+                    raise ValueError("padded static chunking cannot use an inference cache")
+                unpack_mask = mask
+                counts = mask.sum(dim=-1, dtype=torch.int32)
+                cu_seqlens = F.pad(counts.cumsum(0), (1, 0)).to(torch.int32)
+                max_seqlen = int(counts.max())
+                hidden_states = hidden_states[mask]
+                attn_mixer_kwargs.update(
+                    {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
+                )
+                ssm_mixer_kwargs.update(
+                    {"seq_idx": get_seq_idx(cu_seqlens, device=hidden_states.device)}
+                )
+                packed = True
+                mask = None
+            else:
+                active = mask.unsqueeze(-1)
+                hidden_states = hidden_states * active.to(hidden_states.dtype)
         else:
             attn_mixer_kwargs.update(
                 {"cu_seqlens": cu_seqlens.int(), "max_seqlen": max_seqlen}
@@ -308,14 +332,22 @@ class Isotropic(nn.Module):
                         ),
                         active_mask=mask,
                     )
-                    msar_state = msar_out if msar_residual is None else msar_out + msar_residual
+                    if mask is not None:
+                        active_dtype = active.to(msar_out.dtype)
+                        msar_out = msar_out * active_dtype
+                        if msar_residual is not None:
+                            msar_residual = msar_residual * active_dtype
+                    raw_state = msar_out if msar_residual is None else msar_out + msar_residual
+                    # Gate each layer's multi-scale residual independently.
+                    # A single mean scale would force all layers to share one
+                    # scalar gradient and waste the per-layer parameters.
+                    layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
+                    msar_state = layer_input + layer_scale * (raw_state - layer_input)
                     if packed and msar_state.dim() == 3:
                         msar_state = msar_state.squeeze(0)
                     if (layer_idx + 1) % self.msar_block_size == 0:
                         msar_sources.append(msar_state)
-                hidden_states = hidden_states + torch.tanh(self.msar_scale.mean()) * (
-                    msar_state - hidden_states
-                )
+                hidden_states = msar_state
                 hidden_states = self.rmsnorm(
                     hidden_states, residual=None, prenorm=False, residual_in_fp32=True
                 )
@@ -351,6 +383,11 @@ class Isotropic(nn.Module):
                     mixer_kwargs=layer_mixer_kwargs,
                     active_mask=mask,
                 )
+                if mask is not None:
+                    active_dtype = active.to(hidden_states.dtype)
+                    hidden_states = hidden_states * active_dtype
+                    if residual is not None:
+                        residual = residual * active_dtype
 
         # Setting prenorm=False ignores the residual
             hidden_states = self.rmsnorm(
@@ -359,6 +396,14 @@ class Isotropic(nn.Module):
 
         if hidden_states.dim() == 3 and packed:
             hidden_states = hidden_states.squeeze(0)
+
+        if unpack_mask is not None:
+            scattered = hidden_states.new_zeros(
+                unpack_mask.shape + (hidden_states.shape[-1],)
+            )
+            hidden_states = scattered.masked_scatter(
+                unpack_mask.unsqueeze(-1).expand_as(scattered), hidden_states
+            )
 
         if inference_params is not None:
             # here we also explicitly assume the mask is all True

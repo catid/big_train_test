@@ -38,30 +38,51 @@ class _CroissAttn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, q, k, v, scale):
+    def forward(ctx, q, k, v, scale, lengths=None):
+        # q/k/v are flattened to [batch * heads, S, D].  A non-empty lengths
+        # tensor marks padded rows in the packed-document path.
+        if lengths is None:
+            lengths = q.new_empty((0,), dtype=torch.int32)
+        has_lengths = lengths.numel() > 0
+        if has_lengths:
+            if q.shape[0] % lengths.numel() != 0:
+                raise ValueError("CroissAttn lengths must divide batch*heads")
+            lengths_expanded = lengths.to(device=q.device, dtype=torch.int64).repeat_interleave(
+                q.shape[0] // lengths.numel()
+            )
+        else:
+            lengths_expanded = None
         qf = _fp8_qdq(q)
         kf = _fp8_qdq(k)
         vf = _fp8_qdq(v)
         seqlen = qf.shape[1]
         score_bytes = qf.shape[0] * seqlen * seqlen * 4
-        # Keep the fast fused-sized path for ordinary batch-1 chunks.  Use
-        # tiled CroissAttn only when the score tensor would exceed the memory
-        # budget; this preserves the baseline latency while allowing batch
-        # scaling to make progress without an O(S^2) allocation failure.
-        if score_bytes <= 1536 * 1024 * 1024:
+        # Keep the fused-sized path for short chunks. Use tiled CroissAttn for
+        # long sequences so batch scaling does not retain an O(S^2) graph.
+        # Keep the saved probability/auxiliary tensors bounded.  The
+        # canonical 4096-byte inner sequence otherwise retains a dense
+        # [batch * heads, S, S] graph for every FA layer and FBT pass.
+        if score_bytes <= 256 * 1024 * 1024:
             scores = torch.bmm(qf, kf.transpose(1, 2)) * scale
             causal = torch.ones((seqlen, seqlen), device=scores.device, dtype=torch.bool).triu(1)
+            if has_lengths:
+                key_invalid = torch.arange(seqlen, device=scores.device)[None, :] >= lengths_expanded[:, None]
+                causal = causal[None, :, :] | key_invalid[:, None, :]
             scores = scores.masked_fill(causal, float("-inf"))
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             out = torch.bmm(_fp8_qdq(p), vf)
             aux = torch.bmm(p.float(), vf.float()).to(q.dtype)
+            if has_lengths:
+                query_valid = torch.arange(seqlen, device=scores.device)[None, :] < lengths_expanded[:, None]
+                out = torch.where(query_valid[..., None], out, torch.zeros_like(out))
             # Keep the original activation operands so each backward product can
             # independently recast both operands to E5M2.  Reusing the E4M3
             # forward operands here would violate CroissAttn's six-product
             # schedule and noticeably bias dP/dQ/dK.
-            ctx.save_for_backward(q, k, v, p, aux)
+            ctx.save_for_backward(q, k, v, p, aux, lengths)
             ctx.tiled = False
             ctx.scale = scale
+            ctx.has_lengths = has_lengths
             return out
         # Materialize attention probabilities in query tiles.  The previous
         # implementation allocated [B*H,S,S], which made batch scaling fail
@@ -73,9 +94,16 @@ class _CroissAttn(torch.autograd.Function):
             end = min(start + block, seqlen)
             scores = torch.bmm(qf[:, start:end], kf[:, :end].transpose(1, 2)) * scale
             causal = torch.ones((end - start, end), device=scores.device, dtype=torch.bool).triu(1 + start)
+            if has_lengths:
+                key_invalid = torch.arange(end, device=scores.device)[None, :] >= lengths_expanded[:, None]
+                causal = causal[None, :, :] | key_invalid[:, None, :]
             scores = scores.masked_fill(causal, float("-inf"))
             p = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-            outputs.append(torch.bmm(_fp8_qdq(p), vf[:, :end]))
+            tile_out = torch.bmm(_fp8_qdq(p), vf[:, :end])
+            if has_lengths:
+                query_valid = torch.arange(start, end, device=scores.device)[None, :] < lengths_expanded[:, None]
+                tile_out = torch.where(query_valid[..., None], tile_out, torch.zeros_like(tile_out))
+            outputs.append(tile_out)
         out = torch.cat(outputs, dim=1)
         # Recompute P and the unrounded auxiliary O'=P@V_f in backward to
         # avoid retaining the full
@@ -86,17 +114,18 @@ class _CroissAttn(torch.autograd.Function):
         # Save original operands; backward reconstructs both E4M3 forward
         # values and independent E5M2 backward operands without retaining two
         # decoded copies of every Q/K/V tensor.
-        ctx.save_for_backward(q, k, v)
+        ctx.save_for_backward(q, k, v, lengths)
         ctx.scale = scale
         ctx.seqlen = seqlen
         ctx.block = block
         ctx.tiled = True
+        ctx.has_lengths = has_lengths
         return out
 
     @staticmethod
     def backward(ctx, dout):
         if not ctx.tiled:
-            q, k, v, p, aux = ctx.saved_tensors
+            q, k, v, p, aux, lengths = ctx.saved_tensors
             # Each backward GEMM independently quantizes both operands to
             # E5M2.  The auxiliary O' above intentionally remains P@V_f,
             # where V_f is the E4M3 forward value.
@@ -107,12 +136,21 @@ class _CroissAttn(torch.autograd.Function):
             dv = torch.bmm(_fp8_qdq(p.transpose(1, 2), True), _fp8_qdq(dout, True))
             dstar = (dout.float() * aux.float()).sum(dim=-1, keepdim=True)
             causal = torch.ones((p.shape[-2], p.shape[-1]), device=p.device, dtype=torch.bool).triu(1)
+            if ctx.has_lengths:
+                lengths_expanded = lengths.to(device=p.device, dtype=torch.int64).repeat_interleave(
+                    q.shape[0] // lengths.numel()
+                )
+                key_invalid = torch.arange(p.shape[-1], device=p.device)[None, :] >= lengths_expanded[:, None]
+                causal = causal[None, :, :] | key_invalid[:, None, :]
             ds = p * (dpf.float() - dstar).to(p.dtype)
             ds = ds.masked_fill(causal, 0)
+            if ctx.has_lengths:
+                query_valid = torch.arange(p.shape[-2], device=p.device)[None, :] < lengths_expanded[:, None]
+                ds = torch.where(query_valid[..., None], ds, torch.zeros_like(ds))
             dq = torch.bmm(_fp8_qdq(ds, True), kb) * ctx.scale
             dk = torch.bmm(_fp8_qdq(ds.transpose(1, 2), True), qb) * ctx.scale
-            return dq, dk, dv, None
-        q, k, v = ctx.saved_tensors
+            return dq, dk, dv, None, None
+        q, k, v, lengths = ctx.saved_tensors
         qf = _fp8_qdq(q)
         kf = _fp8_qdq(k)
         vf = _fp8_qdq(v)
@@ -120,6 +158,11 @@ class _CroissAttn(torch.autograd.Function):
         kb = _fp8_qdq(k, True)
         vb = _fp8_qdq(v, True)
         seqlen, block = ctx.seqlen, ctx.block
+        lengths_expanded = None
+        if ctx.has_lengths:
+            lengths_expanded = lengths.to(device=q.device, dtype=torch.int64).repeat_interleave(
+                q.shape[0] // lengths.numel()
+            )
         dq = torch.zeros_like(qf)
         dk = torch.zeros_like(kf)
         dv = torch.zeros_like(vf)
@@ -128,6 +171,9 @@ class _CroissAttn(torch.autograd.Function):
             key_len = end
             scores = torch.bmm(qf[:, start:end], kf[:, :key_len].transpose(1, 2)) * ctx.scale
             causal = torch.ones((end - start, key_len), device=qf.device, dtype=torch.bool).triu(1 + start)
+            if ctx.has_lengths:
+                key_invalid = torch.arange(key_len, device=qf.device)[None, :] >= lengths_expanded[:, None]
+                causal = causal[None, :, :] | key_invalid[:, None, :]
             scores = scores.masked_fill(causal, float("-inf"))
             p = torch.softmax(scores.float(), dim=-1).to(qf.dtype)
             d_out = dout[:, start:end]
@@ -143,13 +189,16 @@ class _CroissAttn(torch.autograd.Function):
             dstar = (d_out.float() * aux.float()).sum(dim=-1, keepdim=True)
             ds = p * (dpf.float() - dstar).to(p.dtype)
             ds = ds.masked_fill(causal, 0)
+            if ctx.has_lengths:
+                query_valid = torch.arange(start, end, device=qf.device)[None, :] < lengths_expanded[:, None]
+                ds = torch.where(query_valid[..., None], ds, torch.zeros_like(ds))
             dq[:, start:end] = torch.bmm(
                 _fp8_qdq(ds, True), kb[:, :key_len]
             ) * ctx.scale
             dk[:, :key_len] += torch.bmm(
                 _fp8_qdq(ds.transpose(1, 2), True), qb[:, start:end]
             ) * ctx.scale
-        return dq, dk, dv, None
+        return dq, dk, dv, None, None
 
 
 def croissattn_fp8(q, k, v, scale):
@@ -160,8 +209,44 @@ def croissattn_fp8(q, k, v, scale):
         k.reshape(b * h, s, d),
         v.reshape(b * h, s, d),
         scale,
+        None,
     )
     return out.reshape(b, h, s, d)
+
+
+def croissattn_varlen_fp8(q, k, v, cu_seqlens, max_seqlen, scale):
+    """Corrected CroissAttn for packed, independent causal documents."""
+    if q.dim() != 3 or k.shape != q.shape or v.shape != q.shape:
+        raise ValueError("varlen CroissAttn expects q/k/v with shape [T, H, D]")
+    if cu_seqlens.dtype != torch.int32:
+        cu_seqlens = cu_seqlens.to(torch.int32)
+    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int32)
+    batch = int(lengths.numel())
+    total, heads, dim = q.shape
+    if int(cu_seqlens[-1]) != total:
+        raise ValueError("cu_seqlens[-1] must equal packed token count")
+    if max_seqlen < 1 or bool((lengths > max_seqlen).any()):
+        raise ValueError("max_seqlen is smaller than a packed document")
+    row = torch.arange(total, device=q.device, dtype=torch.long)
+    doc = torch.bucketize(row, cu_seqlens[1:-1].to(torch.long), right=True)
+    pos = row - cu_seqlens[:-1].to(torch.long)[doc]
+    dst = doc * int(max_seqlen) + pos
+    padded_shape = (batch * int(max_seqlen), heads, dim)
+    q_pad = q.new_zeros(padded_shape).index_copy(0, dst, q)
+    k_pad = k.new_zeros(padded_shape).index_copy(0, dst, k)
+    v_pad = v.new_zeros(padded_shape).index_copy(0, dst, v)
+    q_pad = q_pad.view(batch, max_seqlen, heads, dim).transpose(1, 2)
+    k_pad = k_pad.view(batch, max_seqlen, heads, dim).transpose(1, 2)
+    v_pad = v_pad.view(batch, max_seqlen, heads, dim).transpose(1, 2)
+    out_pad = _CroissAttn.apply(
+        q_pad.reshape(batch * heads, max_seqlen, dim),
+        k_pad.reshape(batch * heads, max_seqlen, dim),
+        v_pad.reshape(batch * heads, max_seqlen, dim),
+        scale,
+        lengths,
+    )
+    out_pad = out_pad.view(batch, heads, max_seqlen, dim).transpose(1, 2)
+    return out_pad.reshape(batch * max_seqlen, heads, dim).index_select(0, dst)
 
 
 class FlashCausalSelfAttention(nn.Module):
@@ -404,10 +489,11 @@ class CausalMHA(nn.Module):
         if inference_params is not None:
             assert cu_seqlens is None and max_seqlen is None
 
-        # Used only to document shared-cache recurrent execution; Flash
-        # Attention does not consume this control flag.
-        loop_idx = int(kwargs.pop("loop_idx", 0))
-        cache_layer_idx = self.layer_idx + loop_idx * 10000 if self.layer_idx is not None else None
+        # The recurrent executions share one KV slot. Each loop rewrites the
+        # current token at the same sequence offset, so cache memory stays
+        # constant while the second pass attends to the refined history.
+        kwargs.pop("loop_idx", None)
+        cache_layer_idx = self.layer_idx
 
         kwargs = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
         seqlen_offset = (
@@ -437,17 +523,23 @@ class CausalMHA(nn.Module):
                 #     qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                 # )
                 qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, **kwargs)
-            if (inference_params is None and self.croissattn_aux and cu_seqlens is None
+            if (inference_params is None and self.croissattn_aux
                     and self.inner_attn._window() == (-1, -1)):
-                # CroissAttn is defined for padded training batches. Packed
-                # batches continue through FlashAttention's varlen kernel.
-                q, k, v = qkv.unbind(dim=2)
-                context = croissattn_fp8(
-                    q.permute(0, 2, 1, 3),
-                    k.permute(0, 2, 1, 3),
-                    v.permute(0, 2, 1, 3),
-                    self.softmax_scale or (self.head_dim ** -0.5),
-                ).permute(0, 2, 1, 3)
+                # Padded qkv is [B,S,3,H,D], while packed varlen qkv is
+                # [T,3,H,D].
+                q, k, v = qkv.unbind(dim=1 if cu_seqlens is not None else 2)
+                if cu_seqlens is None:
+                    context = croissattn_fp8(
+                        q.permute(0, 2, 1, 3),
+                        k.permute(0, 2, 1, 3),
+                        v.permute(0, 2, 1, 3),
+                        self.softmax_scale or (self.head_dim ** -0.5),
+                    ).permute(0, 2, 1, 3)
+                else:
+                    context = croissattn_varlen_fp8(
+                        q, k, v, cu_seqlens, max_seqlen,
+                        self.softmax_scale or (self.head_dim ** -0.5),
+                    )
             elif inference_params is None:
                 context = self.inner_attn(qkv, **kwargs)
             else:

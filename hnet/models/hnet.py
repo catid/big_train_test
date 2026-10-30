@@ -108,7 +108,9 @@ class HNet(nn.Module):
                 self.d_model, self.d_model, device=device, dtype=torch.float32
             )
             nn.init.zeros_(self.residual_proj.weight)
+            nn.init.zeros_(self.residual_proj.bias)
             self.residual_proj.weight._no_reinit = True
+            self.residual_proj.bias._no_reinit = True
 
             self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
             # Full-bandwidth feedback is attached only at the outer boundary
@@ -346,9 +348,17 @@ class HNet(nn.Module):
                     # followed by feedback-conditioned generation.
                     plain = torch.zeros(pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device)
                     if next_cu_seqlens is None:
-                        # A fixed midpoint is graph-safe; eager experiments
-                        # can randomize this boundary outside graph capture.
-                        plain[:, : pass_input.shape[1] // 2] = True
+                        # ChunkLayer left-aligns real chunks and pads to a
+                        # static bound. Choose the prefix from the real count,
+                        # rather than the padded width; otherwise short
+                        # sequences make every real chunk plain and FBT never
+                        # trains its feedback projections.
+                        real_counts = next_mask.sum(dim=-1)
+                        token_idx = torch.arange(
+                            pass_input.shape[1], device=pass_input.device
+                        )[None, :]
+                        plain = token_idx < (real_counts[:, None] // 2)
+                        plain = plain & next_mask
                     else:
                         # Draw one prefix length per packed document on the
                         # device and map each token to its document without
