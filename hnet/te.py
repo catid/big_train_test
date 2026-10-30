@@ -340,16 +340,26 @@ def assert_fp8_attention_backend() -> None:
 
 
 def assert_fused_attention_selected() -> None:
-    """Fail if TE selected its quadratic unfused attention implementation."""
+    """Require TE's fused FP8 backend for the CroissAttn-enabled stages.
+
+    TE probes FlashAttention before fused attention.  Merely rejecting the
+    unfused fallback is therefore insufficient: a future backend probe could
+    select FlashAttention, silently bypassing the patched CroissAttn backward
+    correction while still passing the old assertion.
+    """
     try:
         from transformer_engine.pytorch.attention.dot_product_attention import (
             dot_product_attention as dpa_impl,
         )
         backends = dpa_impl._attention_backends
-        if backends.get("use_unfused_attention") and not backends.get("use_fused_attention"):
+        if (
+            not backends.get("use_fused_attention")
+            or backends.get("use_flash_attention")
+            or backends.get("use_unfused_attention")
+        ):
             raise RuntimeError(
-                "Transformer Engine selected UnfusedDotProductAttention; "
-                "the canonical H-Net requires the fused FP8 CroissAttn backend."
+                "Transformer Engine did not select the fused FP8 CroissAttn backend; "
+                f"backends={backends}"
             )
     except RuntimeError:
         raise
