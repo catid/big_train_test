@@ -794,6 +794,8 @@ class CUDAGraphStep:
             torch.bfloat16: {"params": [], "buffer": None},
             torch.float32: {"params": [], "buffer": None},
         }
+        self._ddp_storage_buckets = None
+        self._ddp_direct_storage = False
         if self.ddp:
             for param in self._ddp_params:
                 if param.dtype not in self._ddp_grad_buckets:
@@ -892,6 +894,71 @@ class CUDAGraphStep:
         # capture. Subsequent replays commit both histories below.
         hnet_te.update_fp8_scaling(forward=True)
         hnet_te.update_fp8_scaling(forward=False)
+        if self.ddp:
+            self._prepare_ddp_storage_buckets()
+
+    def _prepare_ddp_storage_buckets(self):
+        """Validate and retain direct views of DDP's gradient bucket storage.
+
+        ``gradient_as_bucket_view=True`` makes each captured parameter gradient
+        a view into one of a few contiguous reducer buckets.  When every rank
+        exposes the same dtype/size sequence, reducing those storage views in
+        place is algebraically identical to the copy/reduce/copy-back path and
+        avoids moving the full model through temporary buffers.  The one-time
+        metadata check is deliberately conservative; any mismatch keeps the
+        existing flat-buffer implementation.
+        """
+        groups = []
+        seen = set()
+        local_ok = True
+        signature = []
+        dtype_codes = {torch.bfloat16: 1, torch.float32: 2}
+        for param in self._ddp_params:
+            grad = param.grad
+            if (
+                grad is None
+                or not grad.is_contiguous()
+                or grad.dtype not in dtype_codes
+            ):
+                local_ok = False
+                break
+            storage = grad.untyped_storage()
+            key = (storage.data_ptr(), grad.dtype)
+            if key in seen:
+                continue
+            element_size = grad.element_size()
+            nbytes = storage.nbytes()
+            if nbytes <= 0 or nbytes % element_size:
+                local_ok = False
+                break
+            flat = torch.empty(0, dtype=grad.dtype, device=self.device).set_(
+                storage,
+                0,
+                (nbytes // element_size,),
+                (1,),
+            )
+            seen.add(key)
+            groups.append(flat)
+            signature.append((dtype_codes[grad.dtype], int(flat.numel())))
+
+        # A compact device-side signature avoids an object collective and lets
+        # all ranks choose the same branch before any gradient collective.
+        sig_value = 1469598103934665603
+        for dtype_code, numel in signature:
+            sig_value = (sig_value ^ (dtype_code * 1000003 + numel))
+            sig_value = (sig_value * 1099511628211) % (2**63 - 1)
+        meta = torch.tensor(
+            [int(local_ok), len(signature), sig_value],
+            device=self.device,
+            dtype=torch.int64,
+        )
+        meta_min = meta.clone()
+        meta_max = meta.clone()
+        dist.all_reduce(meta_min, op=dist.ReduceOp.MIN)
+        dist.all_reduce(meta_max, op=dist.ReduceOp.MAX)
+        compatible = bool(local_ok) and bool(torch.equal(meta_min, meta_max))
+        self._ddp_direct_storage = compatible
+        self._ddp_storage_buckets = groups if compatible else None
 
     def replay(self, x, y):
         if self.capture_stream is None:
@@ -923,6 +990,12 @@ class CUDAGraphStep:
         parameter.  All ranks use the same parameter ordering and bucket sizes
         because they construct the model from the same canonical config.
         """
+
+        if self._ddp_direct_storage:
+            for flat in self._ddp_storage_buckets:
+                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                flat.div_(float(self.world))
+            return
 
         for dtype, bucket in self._ddp_grad_buckets.items():
             params = bucket["params"]
@@ -1123,6 +1196,9 @@ def main():
         "auto_batch_calibration": getattr(args, "_auto_batch_calibration", []),
         "auto_batch_selection_policy": getattr(
             args, "_auto_batch_selection_policy", None
+        ),
+        "ddp_direct_storage_reduce": bool(
+            graph_step is not None and graph_step._ddp_direct_storage
         ),
         "nonfinite": [],
     }
