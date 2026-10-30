@@ -503,8 +503,16 @@ class HNet(nn.Module):
                         )
                         doc_idx = torch.bucketize(token_idx, ends[:-1], right=True)
                         plain = (token_idx - starts[doc_idx]) < prefixes[doc_idx]
-                    pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
-                pass_input = self.fbt_input_norm_1(pass_input)
+                    # Cached prefill feeds the plain latent directly to the
+                    # stack. Normalize only feedback-conditioned rows here so
+                    # the random prefix mixin has the same input distribution
+                    # as prefill once this shared norm learns non-unit scale.
+                    fused_input = self.fbt_input_norm_1(pass_input)
+                    pass_input = torch.where(
+                        plain.unsqueeze(-1), base_chunk_states, fused_input
+                    )
+                else:
+                    pass_input = self.fbt_input_norm_1(pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
                 pass_input,
                 cu_seqlens=next_cu_seqlens,
