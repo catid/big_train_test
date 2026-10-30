@@ -100,7 +100,8 @@ checkpoint reload restores those tensors without narrowing them.
 The CroissAttn correction in `~/fp8` uses the separate unrounded auxiliary
 `O' = P @ V_f` for the softmax backward correction, rather than the rounded
 FP8 output. The innermost H-Net attention config enables the vectorized
-corrected path (`attn_cfg.croissattn_aux=true`) for regular and packed training;
+corrected path (`attn_cfg.croissattn_aux=[false,true]`) for the stage-specific
+SWA/FA training paths;
 finite attention windows and generation retain the fused FlashAttention path.
 The TE FP8 trainer keeps the equivalent correction
 enabled through `NVTE_FP8_DPA_BWD=1`/`NVTE_DPA_CROISSATTN_AUX=1`.
