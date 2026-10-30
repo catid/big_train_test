@@ -36,24 +36,14 @@ from hnet.utils.train import load_balancing_loss
 
 CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_600m_loop2.json"
 FBT_PASSES = 2
+CANONICAL_CUDA_GRAPHS = True
+ADAM_ATAN2_LR_RATIO = 0.5
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True, help="raw UTF-8 byte stream")
     p.add_argument("--seq", type=int, default=4096)
-    p.add_argument(
-        "--batch",
-        type=int,
-        default=1,
-        help="per-rank microbatch; use --auto-batch to size from GPU memory",
-    )
-    p.add_argument(
-        "--auto-batch",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="calibrate a DDP-safe batch against the measured per-GPU power target",
-    )
     p.add_argument(
         "--auto-batch-max",
         type=int,
@@ -64,7 +54,6 @@ def parse_args():
     p.add_argument("--steps", type=int, default=100000)
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1.2e-3)
-    p.add_argument("--fallback-lr", type=float, default=6e-4)
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--fbt-lambda", type=float, default=1.0)
     p.add_argument("--ratio-weight", type=float, default=0.03)
@@ -95,12 +84,6 @@ def parse_args():
         "--resume",
         default=None,
         help="checkpoint to resume (model, optimizer, and step); defaults to a fresh run",
-    )
-    p.add_argument(
-        "--cuda-graphs",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="capture the fixed-shape canonical forward/backward with CUDA graphs",
     )
     return p.parse_args()
 
@@ -322,8 +305,7 @@ def make_optimizer(model, args):
     return AnchorMuon.from_model(
         model,
         lr=args.lr,
-        fallback_lr=args.fallback_lr,
-        fallback_mode="atan2",
+        fallback_lr=args.lr * ADAM_ATAN2_LR_RATIO,
         matrix_weight_decay=args.weight_decay,
         fallback_weight_decay=args.weight_decay,
         momentum=0.95,
@@ -706,7 +688,25 @@ class CUDAGraphStep:
             if self.ddp
             else []
         )
-        self._ddp_grad_flat = None
+        # Keep reduction buffers in the parameter precision.  The prior
+        # implementation converted every BF16 gradient to one giant FP32
+        # buffer (about 2.4 GiB for this model) before NCCL all-reduce, then
+        # converted it back.  BF16 gradients are the normal DDP contract and
+        # reducing them directly removes the conversion bandwidth and makes
+        # the captured step's synchronization considerably cheaper.  The few
+        # FP32 parameters retain an FP32 reduction bucket.
+        self._ddp_grad_buckets = {
+            torch.bfloat16: {"params": [], "buffer": None},
+            torch.float32: {"params": [], "buffer": None},
+        }
+        if self.ddp:
+            for param in self._ddp_params:
+                if param.dtype not in self._ddp_grad_buckets:
+                    raise RuntimeError(
+                        f"unsupported DDP gradient dtype {param.dtype}; "
+                        "the canonical graph expects BF16 or FP32 parameters"
+                    )
+                self._ddp_grad_buckets[param.dtype]["params"].append(param)
         # Materialize scalar diagnostics before capture.  Constructing a new
         # tensor from a Python float inside a CUDA capture is rejected by the
         # runtime even though the arithmetic itself is graph safe.
@@ -820,34 +820,44 @@ class CUDAGraphStep:
         return self.loss, self.metrics
 
     def _sync_ddp_grads(self):
-        """Average captured local gradients without entering the graph."""
+        """Average captured local gradients without entering the graph.
 
-        total = sum(p.numel() for p in self._ddp_params)
-        if self._ddp_grad_flat is None or self._ddp_grad_flat.numel() != total:
-            self._ddp_grad_flat = torch.zeros(
-                (total,), device=self.device, dtype=torch.float32
-            )
-        flat = self._ddp_grad_flat
-        offset = 0
-        for param in self._ddp_params:
-            count = param.numel()
-            view = flat[offset : offset + count]
-            if param.grad is None:
-                view.zero_()
-            else:
-                view.copy_(param.grad.detach().reshape(-1).float())
-            offset += count
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        flat.div_(float(self.world))
-        offset = 0
-        for param in self._ddp_params:
-            count = param.numel()
-            view = flat[offset : offset + count].view_as(param)
-            if param.grad is None:
-                param.grad = view.to(dtype=param.dtype)
-            else:
-                param.grad.copy_(view.to(dtype=param.grad.dtype))
-            offset += count
+        Reduce one flat buffer per parameter precision.  This preserves the
+        usual BF16 DDP communication contract while avoiding a full-model
+        BF16-to-FP32 staging copy and its matching copy back to every
+        parameter.  All ranks use the same parameter ordering and bucket sizes
+        because they construct the model from the same canonical config.
+        """
+
+        for dtype, bucket in self._ddp_grad_buckets.items():
+            params = bucket["params"]
+            if not params:
+                continue
+            total = sum(param.numel() for param in params)
+            flat = bucket["buffer"]
+            if flat is None or flat.numel() != total:
+                flat = torch.empty((total,), device=self.device, dtype=dtype)
+                bucket["buffer"] = flat
+            offset = 0
+            for param in params:
+                count = param.numel()
+                view = flat[offset : offset + count]
+                if param.grad is None:
+                    view.zero_()
+                else:
+                    view.copy_(param.grad.detach().reshape(-1))
+                offset += count
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            flat.div_(float(self.world))
+            offset = 0
+            for param in params:
+                count = param.numel()
+                view = flat[offset : offset + count].view_as(param)
+                if param.grad is None:
+                    param.grad = view
+                else:
+                    param.grad.copy_(view)
+                offset += count
 
 
 def main():
@@ -855,7 +865,7 @@ def main():
     # Select the graph-safe TE grouped-tensor dispatch before constructing the
     # model.  The capture helper temporarily disables it for eager warmup and
     # restores it for the graph itself.
-    hnet_te.set_graph_capture(args.cuda_graphs)
+    hnet_te.set_graph_capture(CANONICAL_CUDA_GRAPHS)
     rank, world, device = init_dist()
     # Validate FP8 only after selecting the local CUDA device. Import-time
     # capability checks would otherwise initialize GPU 0 in every DDP rank.
@@ -880,7 +890,7 @@ def main():
         print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
     graph_stream = (
         torch.cuda.Stream(device=device)
-        if args.cuda_graphs and world > 1
+        if CANONICAL_CUDA_GRAPHS and world > 1
         else None
     )
     if world > 1:
@@ -896,16 +906,13 @@ def main():
                 broadcast_buffers=False,
                 bucket_cap_mb=256,
                 gradient_as_bucket_view=True,
-                static_graph=bool(args.cuda_graphs),
+                static_graph=CANONICAL_CUDA_GRAPHS,
             )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
-    if args.auto_batch:
-        # Calibrate after DDP and optimizer construction so the measured step
-        # includes gradient synchronization and the real AnchorMuon update.
-        # No graph is captured until this shape has been selected.
-        args.batch = calibrate_batch_to_power(
-            model, optimizer, args, device, rank, world
-        )
+    # Calibrate after DDP and optimizer construction so the measured step
+    # includes gradient synchronization and the real AnchorMuon update. The
+    # canonical trainer has no partial/manual-batch execution path.
+    args.batch = calibrate_batch_to_power(model, optimizer, args, device, rank, world)
     start_step = 0
     resume_state = None
     if args.resume:
@@ -956,7 +963,7 @@ def main():
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(args.data, args.seq, args.batch, rank, world, seed=args.data_seed)
     graph_step = None
-    if args.cuda_graphs:
+    if CANONICAL_CUDA_GRAPHS:
         graph_step = CUDAGraphStep(
             model,
             optimizer,
@@ -1012,12 +1019,16 @@ def main():
             # AnchorMuon splits matrix and AdamATan2 fallback tensors into
             # separate groups; preserve the requested fallback rate.
             if "use_matrix_update" in group:
-                base_lr = args.lr if group["use_matrix_update"] else args.fallback_lr
+                base_lr = (
+                    args.lr
+                    if group["use_matrix_update"]
+                    else args.lr * ADAM_ATAN2_LR_RATIO
+                )
                 group["lr"] = base_lr * lr_scale
             else:
                 group["lr"] = args.lr * lr_scale
             if "fallback_lr" in group:
-                group["fallback_lr"] = args.fallback_lr * lr_scale
+                group["fallback_lr"] = args.lr * ADAM_ATAN2_LR_RATIO * lr_scale
         t0 = time.perf_counter()
         if graph_step is not None:
             loss, metrics = graph_step.replay(x, y)

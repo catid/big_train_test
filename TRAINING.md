@@ -18,8 +18,8 @@ configuration is unspecified. The 128-token SWA width and 3:1 SWA/FA schedule
 here are this project's explicit 600M design choices, rather than claims about
 the unreleased Cartesia model.
 
-The canonical DDP + FBT2 + AnchorMuon update uses CUDA graphs by default for
-fixed shapes; pass `--no-cuda-graphs` only for a diagnostic eager run.
+The canonical DDP + FBT2 + AnchorMuon update always uses CUDA graphs for the
+fixed full-system training shape.
 Router-selected chunks are left-aligned with trailing padding; causal
 attention cannot see that future padding, and active masks clear padded MLP and
 residual rows. The graph path fails during capture if a TE kernel or DDP setup
@@ -62,9 +62,8 @@ torchrun --nproc_per_node=8 train_hnet_600m.py \
   --seq 4096
 ```
 
-The trainer logs per-GPU power. Auto-batch calibration is enabled by default
-(`--no-auto-batch` disables it) and runs complete FP8 calibration
-steps at bounded candidate batches, takes the worst-rank reading across DDP, and
+The trainer logs per-GPU power. It always runs complete FP8 auto-batch
+calibration steps at bounded candidate batches, takes the worst-rank reading across DDP, and
 selects a measured draw against the approximately 1000 W per-B300 target. If
 every candidate remains below target, it selects the largest fully validated
 candidate and records that gap rather than pretending the target was reached;
