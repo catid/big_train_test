@@ -280,7 +280,14 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
 
 def init_dist():
     if "RANK" not in os.environ:
-        return 0, 1, torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if torch.cuda.is_available():
+            # Use an explicit logical ordinal even for single-process runs.
+            # ``torch.device("cuda")`` has ``index=None``; passing that to
+            # power logging would query every physical GPU and defeat the
+            # CUDA_VISIBLE_DEVICES mapping in ``read_power_watts``.
+            torch.cuda.set_device(0)
+            return 0, 1, torch.device("cuda", torch.cuda.current_device())
+        return 0, 1, torch.device("cpu")
     dist.init_process_group("nccl")
     rank = dist.get_rank()
     local = int(os.environ.get("LOCAL_RANK", rank))
@@ -369,11 +376,34 @@ def loss_for_output(out, target, args):
     return objective, metrics
 
 
+def _physical_gpu_index(logical_index):
+    """Map a CUDA logical ordinal to the nvidia-smi device selector.
+
+    ``torch.cuda`` ordinals are relative to ``CUDA_VISIBLE_DEVICES`` while
+    nvidia-smi's numeric selectors are host ordinals.  Passing the logical
+    value directly silently samples the wrong GPU whenever a launcher masks or
+    reorders devices.  UUID entries are valid nvidia-smi selectors too, so
+    preserve them rather than attempting to parse them as integers.
+    """
+    if logical_index is None:
+        return None
+    logical_index = int(logical_index)
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible:
+        return str(logical_index)
+    entries = [item.strip() for item in visible.split(",") if item.strip()]
+    if 0 <= logical_index < len(entries):
+        return entries[logical_index]
+    # A malformed mask should not make logging crash after a successful step;
+    # let nvidia-smi return its normal error and report an empty sample.
+    return str(logical_index)
+
+
 def read_power_watts(device_index=None):
     try:
         query = ["nvidia-smi"]
         if device_index is not None:
-            query.extend(["-i", str(int(device_index))])
+            query.extend(["-i", _physical_gpu_index(device_index)])
         query.extend(["--query-gpu=power.draw", "--format=csv,noheader,nounits"])
         raw = subprocess.check_output(
             query,
@@ -384,6 +414,62 @@ def read_power_watts(device_index=None):
         return values
     except (OSError, subprocess.SubprocessError, ValueError):
         return []
+
+
+def _average_gradients_by_dtype(parameters, world, device, buckets=None):
+    """Average gradients with one flat NCCL reduction per parameter dtype.
+
+    Calibration runs outside the captured graph but must measure the same
+    communication shape as production DDP replay. Reducing each parameter
+    separately creates hundreds of tiny NCCL launches and overstates the
+    steady-state step time. The returned bucket state keeps the flat buffers
+    allocated across calibration iterations.
+    """
+    if buckets is None:
+        buckets = {
+            torch.bfloat16: {"params": [], "buffer": None},
+            torch.float32: {"params": [], "buffer": None},
+        }
+        for parameter in parameters:
+            if not parameter.requires_grad:
+                continue
+            if parameter.dtype not in buckets:
+                raise RuntimeError(
+                    f"unsupported DDP gradient dtype {parameter.dtype}; "
+                    "the canonical graph expects BF16 or FP32 parameters"
+                )
+            buckets[parameter.dtype]["params"].append(parameter)
+
+    for dtype, bucket in buckets.items():
+        params = bucket["params"]
+        if not params:
+            continue
+        total = sum(parameter.numel() for parameter in params)
+        flat = bucket["buffer"]
+        if flat is None or flat.numel() != total:
+            flat = torch.empty((total,), device=device, dtype=dtype)
+            bucket["buffer"] = flat
+        offset = 0
+        for parameter in params:
+            count = parameter.numel()
+            view = flat[offset : offset + count]
+            if parameter.grad is None:
+                view.zero_()
+            else:
+                view.copy_(parameter.grad.detach().reshape(-1))
+            offset += count
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+        flat.div_(float(world))
+        offset = 0
+        for parameter in params:
+            count = parameter.numel()
+            view = flat[offset : offset + count].view_as(parameter)
+            if parameter.grad is None:
+                parameter.grad = view
+            else:
+                parameter.grad.copy_(view)
+            offset += count
+    return buckets
 
 
 def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
@@ -426,6 +512,13 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
         candidates.append(max_batch)
 
     target_model = model.module if isinstance(model, DDP) else model
+    # Calibration must not invoke DDP's reducer at all.  ``no_sync`` still
+    # installs reducer autograd hooks, and repeated static-graph probes can
+    # trip PyTorch's reducer state assertion before the explicit OOM gate.
+    # Probe the underlying module directly, then average its gradients with
+    # the explicit collectives below after every rank passes the gate.
+    probe_model = target_model
+    calibration_grad_buckets = None
     # The snapshot is intentionally CPU-resident so candidate tensors and
     # optimizer state can be released before the next measurement.  It also
     # keeps every rank's reset exact after DDP has broadcast the initial model.
@@ -465,25 +558,19 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                 for iteration in range(4):
                     # The first two updates warm kernels and allocator state;
                     # the latter two are the steady-state power samples.
-                    model.zero_grad(set_to_none=True)
+                    probe_model.zero_grad(set_to_none=True)
                     iteration_oom = False
                     try:
                         # Probe the complete local forward/backward without
                         # entering DDP reducer collectives.  If one rank
                         # OOMs, healthy ranks can still reach the OOM gate
                         # below and report it collectively.
-                        sync_context = (
-                            model.no_sync()
-                            if isinstance(model, DDP)
-                            else contextlib.nullcontext()
+                        out = probe_model(x, mask=mask, fbt_passes=FBT_PASSES)
+                        loss, metrics = loss_for_output(out, y, args)
+                        loss.backward()
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            probe_model.parameters(), 1.0
                         )
-                        with sync_context:
-                            out = model(x, mask=mask, fbt_passes=FBT_PASSES)
-                            loss, metrics = loss_for_output(out, y, args)
-                            loss.backward()
-                            grad_norm = torch.nn.utils.clip_grad_norm_(
-                                model.parameters(), 1.0
-                            )
                     except RuntimeError as exc:
                         if "out of memory" not in str(exc).lower():
                             raise
@@ -515,24 +602,17 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                             f"non-finite calibration update at candidate batch {candidate}"
                         )
                     if world > 1:
-                        # ``no_sync`` avoided the reducer during the probe;
-                        # after every rank passes the OOM gate, explicitly
+                        # After every rank passes the OOM gate, explicitly
                         # average gradients so this remains a complete DDP
-                        # optimizer step for power measurement.
-                        for parameter in model.parameters():
-                            if not parameter.requires_grad:
-                                continue
-                            # All ranks must enter the same sequence of
-                            # collectives even when a parameter is unused on
-                            # one rank.  Materialize a zero gradient for that
-                            # rank rather than skipping its collective.
-                            gradient = parameter.grad
-                            if gradient is None:
-                                gradient = torch.zeros_like(parameter)
-                            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
-                            gradient.div_(float(world))
-                            if parameter.grad is None:
-                                parameter.grad = gradient
+                        # optimizer step for power measurement.  Use the same
+                        # two flat dtype buckets as graph replay rather than
+                        # hundreds of per-parameter NCCL collectives.
+                        calibration_grad_buckets = _average_gradients_by_dtype(
+                            probe_model.parameters(),
+                            world,
+                            device,
+                            calibration_grad_buckets,
+                        )
                     optimizer.step()
                     torch.cuda.synchronize(device)
                     if iteration >= 2:
@@ -550,7 +630,7 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                 else:
                     raise
             finally:
-                model.zero_grad(set_to_none=True)
+                probe_model.zero_grad(set_to_none=True)
                 # Restore both parameters and optimizer moments before the next
                 # candidate.  This is required because GramNS/AdamATan2 state
                 # and master copies otherwise make later measurements depend on
@@ -909,10 +989,6 @@ def main():
                 static_graph=CANONICAL_CUDA_GRAPHS,
             )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
-    # Calibrate after DDP and optimizer construction so the measured step
-    # includes gradient synchronization and the real AnchorMuon update. The
-    # canonical trainer has no partial/manual-batch execution path.
-    args.batch = calibrate_batch_to_power(model, optimizer, args, device, rank, world)
     start_step = 0
     resume_state = None
     if args.resume:
@@ -927,7 +1003,25 @@ def main():
             resume_state = torch.load(
                 resume_path, map_location="cpu", weights_only=True
             )
+        saved_batch = resume_state.get("batch")
+        if saved_batch is None or int(saved_batch) < 1:
+            raise ValueError("resume checkpoint is missing a valid calibrated batch")
+        # A resume must replay the exact static shape selected by its original
+        # power calibration.  Re-running the sweep here is both expensive and
+        # unsafe: power noise could choose a different batch, causing the
+        # subsequent provenance check (and the data order) to disagree with
+        # the checkpoint.
+        args.batch = int(saved_batch)
+        args._auto_batch_calibration = []
+        args._auto_batch_selection_policy = "checkpoint_batch"
         _validate_resume(resume_state, cfg, args, n_params, world, runtime)
+    else:
+        # Calibrate after DDP and optimizer construction so the measured step
+        # includes gradient synchronization and the real AnchorMuon update.
+        # The canonical trainer has no partial/manual-batch execution path.
+        args.batch = calibrate_batch_to_power(model, optimizer, args, device, rank, world)
+
+    if resume_state is not None:
         target_model = model.module if world > 1 else model
         unsafe_key = "NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE"
         previous_unsafe = os.environ.get(unsafe_key)
@@ -1061,15 +1155,34 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize()
         elapsed = (time.perf_counter() - t0) * 1e3
-        reduced = loss.detach().float()
-        reduced_metrics = {name: value.detach().float() for name, value in metrics.items()}
+        # Aggregate all diagnostics in one NCCL operation.  The previous loop
+        # launched one all-reduce for the objective and one for every metric,
+        # then converted each scalar independently on the host.  Keep the
+        # metric order explicit so the graph replay and the JSON schema remain
+        # unchanged while reducing the synchronization/launch count to one.
+        metric_names = (
+            "objective",
+            "standard_ce",
+            "feedback_ce",
+            "router_loss",
+            "moe_aux",
+            "routing_ratio",
+            "ratio_target_error",
+        )
+        metric_vector = torch.stack(
+            [loss.detach().float()]
+            + [metrics[name].detach().float() for name in metric_names[1:]]
+        )
         if world > 1:
-            dist.all_reduce(reduced)
-            reduced /= world
-            for value in reduced_metrics.values():
-                dist.all_reduce(value)
-                value /= world
-        standard_ce_value = float(reduced_metrics["standard_ce"])
+            dist.all_reduce(metric_vector)
+            metric_vector.div_(float(world))
+        # One device-to-host copy replaces a scalar .item()/float conversion
+        # per metric.  It also makes the logging path independent of whether
+        # graph replay returned aliases into captured storage.
+        metric_values = metric_vector.cpu().tolist()
+        reduced = metric_values[0]
+        reduced_metrics = dict(zip(metric_names, metric_values))
+        standard_ce_value = reduced_metrics["standard_ce"]
         log["loss"].append(standard_ce_value)
         for name, value in reduced_metrics.items():
             log[name].append(float(value))
@@ -1079,7 +1192,7 @@ def main():
         if rank == 0 and args.power_every > 0 and (
             step == start_step or step % args.power_every == 0
         ):
-            latest_power = read_power_watts()
+            latest_power = read_power_watts(device.index)
         if rank == 0:
             log["power_w"].append(list(latest_power))
             if latest_power:
