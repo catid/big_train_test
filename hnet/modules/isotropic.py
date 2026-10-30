@@ -715,7 +715,13 @@ class Isotropic(nn.Module):
                     if block_residual is not None:
                         raw_state = raw_state + block_residual[:, 0]
                     scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
-                    state = layer_input + scale * (raw_state - layer_input)
+                    # Training casts the MSAR retrieval to the block's
+                    # parameter dtype before applying the gated residual. Use
+                    # that same rounded value in decode; retaining the FP32
+                    # pre-cast retrieval here makes cached generation follow
+                    # a subtly different recurrence from prefill/training.
+                    block_input_state = block_input[:, 0]
+                    state = block_input_state + scale * (raw_state - block_input_state)
                     layer_outputs.append(state)
                     if (layer_idx + 1) % self.msar_block_size == 0:
                         boundary_currents.append(state)
