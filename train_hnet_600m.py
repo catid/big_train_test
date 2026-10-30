@@ -582,19 +582,25 @@ def ce(logits, target):
 
 def loss_for_output(out, target, args):
     """Compute the FBT objective and retain every component for diagnostics."""
-    standard_ce = ce(out.logits, target)
+    final_ce = ce(out.logits, target)
     feedback_values = [ce(x, target) for x in (out.feedback_logits or [])]
     if feedback_values:
-        feedback_ce = torch.stack(feedback_values).mean()
+        # ``feedback_logits`` contains the earlier plain pass; ``out.logits``
+        # is the final feedback-conditioned pass. Keep the public metric names
+        # aligned with that meaning so ``loss``/target-ce always refer to the
+        # ordinary (plain) byte CE documented for the trainer.
+        standard_ce = feedback_values[0]
+        feedback_ce = final_ce
         # With two FBT passes, the first-pass logits are retained separately
-        # and the final pass is ``standard_ce``. This is algebraically the
-        # previous two-pass objective while avoiding a duplicate final head.
-        objective = feedback_values[0] + args.fbt_lambda * standard_ce
+        # and the final pass is already available as ``out.logits``. This
+        # avoids a duplicate final-head evaluation.
+        objective = standard_ce + args.fbt_lambda * feedback_ce
         if len(feedback_values) > 1:
             objective = objective + args.fbt_lambda * torch.stack(feedback_values[1:]).mean()
     else:
-        feedback_ce = standard_ce.new_zeros(())
-        objective = standard_ce
+        standard_ce = final_ce
+        feedback_ce = final_ce.new_zeros(())
+        objective = final_ce
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     boundary_ratios = []
     soft_boundary_ratios = []
