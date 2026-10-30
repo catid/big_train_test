@@ -132,7 +132,11 @@ def _wsqd_scale(step: int, args) -> float:
     if step < warmup:
         return (step + 1) / max(1, warmup)
     t = max(1, int(step) - warmup + 1)
-    horizon = max(1, int(args.steps) - warmup)
+    # A resumed run may request more total steps than the checkpoint's
+    # original horizon. Keep the original cooldown boundary so extending a
+    # run cannot jump its learning rate back into the high-LR stable region.
+    schedule_steps = int(getattr(args, "_lr_horizon_steps", args.steps))
+    horizon = max(1, schedule_steps - warmup)
     alpha = float(args.lr_decay_fraction)
     shift = float(args.lr_shift)
     stable_horizon = max(1, int(math.floor((1.0 - alpha) * horizon)))
@@ -496,7 +500,7 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
             "warmup_steps": int(args.warmup),
             "decay_fraction": float(args.lr_decay_fraction),
             "shift": float(args.lr_shift),
-            "horizon_steps": int(args.steps),
+            "horizon_steps": int(getattr(args, "_lr_horizon_steps", args.steps)),
         }
         saved_base = dict(saved_schedule)
         saved_horizon = int(saved_base.pop("horizon_steps", expected_schedule["horizon_steps"]))
@@ -507,6 +511,10 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
                 "resume learning-rate schedule mismatch: "
                 f"checkpoint={saved_schedule!r}, current={expected_schedule!r}"
             )
+        # Preserve the checkpoint's original WSqD horizon when a caller asks
+        # to continue for additional steps. This keeps cooldown monotonic and
+        # avoids a learning-rate jump at the resume boundary.
+        args._lr_horizon_steps = saved_horizon
     saved_cfg = checkpoint.get("config_signature")
     if saved_cfg is None:
         # Older checkpoints stored ``vars(cfg)``.  It is still useful to
@@ -1293,6 +1301,7 @@ class CUDAGraphStep:
 def main():
     args = parse_args()
     _validate_schedule_args(args)
+    args._lr_horizon_steps = int(args.steps)
     # Select the graph-safe TE grouped-tensor dispatch before constructing the
     # model.  The capture helper temporarily disables it for eager warmup and
     # restores it for the graph itself.
@@ -1468,7 +1477,7 @@ def main():
             "warmup_steps": int(args.warmup),
             "decay_fraction": float(args.lr_decay_fraction),
             "shift": float(args.lr_shift),
-            "horizon_steps": int(args.steps),
+            "horizon_steps": int(args._lr_horizon_steps),
         },
         "learning_rate_scale": [],
         "target_reached_step": None,
@@ -1620,7 +1629,7 @@ def main():
                         "warmup_steps": int(args.warmup),
                         "decay_fraction": float(args.lr_decay_fraction),
                         "shift": float(args.lr_shift),
-                        "horizon_steps": int(args.steps),
+                        "horizon_steps": int(args._lr_horizon_steps),
                     },
                     "params": n_params,
                     "world_size": world,
