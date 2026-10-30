@@ -52,8 +52,9 @@ document-local shift-right, the shifted state is the GLU value pathway, the
 RMS-normalized current input is the gate pathway, and the same RMSNorm is
 applied to the fused input before the shared inner stack. The current pass is
 not added back to the fused state. The two-pass objective sums the plain
-first-pass next-byte CE and the feedback-pass CE; the logged `loss` remains
-the final plain byte CE.
+first-pass next-byte CE and the feedback-pass CE; the logged `loss` and
+`standard_ce` fields report the plain first-pass byte CE, while `feedback_ce`
+reports the final feedback-conditioned pass.
 
 Example launch (artifacts stay outside this repository):
 
