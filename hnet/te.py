@@ -356,13 +356,18 @@ def assert_fused_attention_selected() -> None:
             dot_product_attention as dpa_impl,
         )
         backends = dpa_impl._attention_backends
+        from transformer_engine.pytorch.cpp_extensions.fused_attn import FusedAttnBackend
+        selected_fused_backend = backends.get("fused_attention_backend")
+        fp8_backend = FusedAttnBackend["FP8"]
         if (
             not backends.get("use_fused_attention")
             or backends.get("use_flash_attention")
             or backends.get("use_unfused_attention")
+            or selected_fused_backend != fp8_backend
         ):
             raise RuntimeError(
                 "Transformer Engine did not select the fused FP8 CroissAttn backend; "
+                f"selected_fused_backend={selected_fused_backend!r} expected={fp8_backend!r} "
                 f"backends={backends}"
             )
     except RuntimeError:
