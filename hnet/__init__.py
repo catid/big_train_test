@@ -7,5 +7,12 @@ from .te import TEGroupedLinear, TELinear, assert_fp8_runtime, fp8_context, make
 
 from .models.config_hnet import HNetConfig
 from .models.mixer_seq import HNetForByteCausalLM
+from .modules.mlp import FusedTokenRouter
 
-__all__ = ["HNetConfig", "HNetForByteCausalLM", "TEGroupedLinear", "TELinear"]
+__all__ = [
+    "HNetConfig",
+    "HNetForByteCausalLM",
+    "FusedTokenRouter",
+    "TEGroupedLinear",
+    "TELinear",
+]

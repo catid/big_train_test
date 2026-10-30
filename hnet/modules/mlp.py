@@ -29,6 +29,16 @@ class FusedTokenRouter(nn.Module):
     def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not logits.is_cuda:
             raise RuntimeError("FusedTokenRouter requires CUDA logits")
+        if logits.ndim != 2:
+            raise ValueError(
+                "FusedTokenRouter expects flattened [tokens, experts] logits; "
+                f"got shape {tuple(logits.shape)}"
+            )
+        if logits.shape[-1] != self.num_experts:
+            raise ValueError(
+                "FusedTokenRouter logits have the wrong expert dimension: "
+                f"expected {self.num_experts}, got {logits.shape[-1]}"
+            )
         if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise TypeError(f"unsupported fused-router logits dtype: {logits.dtype}")
         # TE's fused score kernel requires a contiguous [tokens, experts]
@@ -39,6 +49,10 @@ class FusedTokenRouter(nn.Module):
             logits,
             topk=self.top_k,
             score_function="softmax",
+            # Keep the dense boolean map required by the graph-safe TE
+            # permutation below.  Do not inherit a future TE default (for
+            # example BITMAP_U8), which would silently change the map shape.
+            routing_map_format="bytemap",
         )
         if routing_map.shape != logits.shape or routing_map.shape[-1] != self.num_experts:
             raise RuntimeError(
@@ -50,7 +64,10 @@ class FusedTokenRouter(nn.Module):
                 "Transformer Engine fused router returned unexpected score output: "
                 f"scores={tuple(probs.shape)} dtype={probs.dtype} logits={tuple(logits.shape)}"
             )
-        return probs, routing_map
+        # The pinned TE kernel currently returns bool for BYTEMAP.  Normalize
+        # the contract here so a compatible TE rebuild cannot leak uint8 into
+        # the int32 map consumed by ``permute_mask_map_fwd``.
+        return probs.contiguous(), routing_map.to(dtype=torch.bool).contiguous()
 
 
 class SparseMoESwiGLU(nn.Module):
