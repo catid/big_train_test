@@ -197,6 +197,11 @@ def _hash_installed_distribution(distribution) -> dict:
         if any(part == "__pycache__" for part in pure.parts) or pure.suffix == ".pyc":
             continue
         path = Path(distribution.locate_file(package_path))
+        if path.is_symlink():
+            raise RuntimeError(
+                f"installed manifest entry is a symlink for "
+                f"{distribution.metadata.get('Name')!r}: {relative}"
+            )
         resolved_path = path.resolve()
         try:
             resolved_path.relative_to(install_root)
