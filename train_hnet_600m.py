@@ -451,6 +451,11 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state(device=device)
     measurements = []
+    # Calibration performs real eager updates so delayed-scaling histories and
+    # power readings match the non-captured kernel path. CUDA graph capture is
+    # enabled again before the selected shape is handed to CUDAGraphStep.
+    graph_was_enabled = hnet_te.graph_capture_enabled()
+    hnet_te.set_graph_capture(False)
     try:
         for candidate in candidates:
             if world > 1:
@@ -566,6 +571,7 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
             group["k"] = 0
         torch.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device=device)
+        hnet_te.set_graph_capture(graph_was_enabled)
 
     if not measurements:
         raise RuntimeError("--auto-batch could not complete a full FP8 calibration step")
