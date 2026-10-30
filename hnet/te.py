@@ -415,17 +415,40 @@ def assert_fp8_runtime() -> None:
             f"expected {_EXPECTED_TE_COMMIT}, found {te_commit}"
         )
     try:
-        tracked_diff = subprocess.check_output(
-            ["git", "diff", "--quiet"], cwd=expected_root,
+        # ``git diff --quiet`` misses staged edits, while a blanket status
+        # check rejects the build tree's generated source copies.  Compare the
+        # complete tracked tree against HEAD, then inspect only untracked files
+        # in the checked-out source roots (build/ and nccl_ep/ are generated).
+        subprocess.check_output(
+            ["git", "diff", "HEAD", "--quiet"],
+            cwd=expected_root,
+            stderr=subprocess.DEVNULL,
+        )
+        source_status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=expected_root,
+            text=True,
             stderr=subprocess.DEVNULL,
         )
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(
-            "Transformer Engine checkout has tracked source modifications; "
+            "Transformer Engine checkout has staged or unstaged tracked source modifications; "
             "refusing an unreviewed FP8 kernel"
         ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError("Unable to verify Transformer Engine source cleanliness") from exc
+    untracked_source = []
+    for line in source_status.splitlines():
+        if not line.startswith("?? "):
+            continue
+        path = line[3:]
+        if path.startswith(("transformer_engine/", "transformer_engine_torch", "common/")):
+            untracked_source.append(path)
+    if untracked_source:
+        raise RuntimeError(
+            "Transformer Engine checkout has untracked source files; refusing an "
+            f"unreviewed FP8 kernel: {untracked_source[:3]}"
+        )
     if os.environ.get("NVTE_FP8_DPA_BWD") != "1":
         raise RuntimeError(
             "The canonical H-Net requires NVTE_FP8_DPA_BWD=1 for FP8 attention backward"

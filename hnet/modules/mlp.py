@@ -202,9 +202,16 @@ class SparseMoESwiGLU(nn.Module):
         )
         self.shared_fc1 = make_linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
         self.shared_fc2 = make_linear(shared_intermediate, d_model, bias=bias, **factory_kwargs)
-        self.router = make_linear(d_model, self.num_experts, bias=False, **factory_kwargs)
+        # Router decisions are discrete and feed the auxiliary loss. Keep the
+        # projection in BF16/FP32 even inside an enclosing FP8 expert region so
+        # quantization noise cannot flip near-tied top-1 assignments.
+        self.router = make_linear(
+            d_model, self.num_experts, bias=False, fp8=False, **factory_kwargs
+        )
         self.fused_router = FusedTokenRouter(self.num_experts, self.top_k)
-        self.shared_gate = make_linear(d_model, 1, bias=True, **factory_kwargs)
+        self.shared_gate = make_linear(
+            d_model, 1, bias=True, fp8=False, **factory_kwargs
+        )
         self._aux_loss = None
         self._aux_loss_count = 0
         self.reset_parameters()
@@ -403,7 +410,14 @@ class SparseMoESwiGLU(nn.Module):
                 starts[1:] = sequence_ids_flat[1:] != sequence_ids_flat[:-1]
             start_idx = starts.nonzero(as_tuple=True)[0]
             start_ids = sequence_ids_flat.index_select(0, start_idx)
-            start_values = global_positions.index_select(0, start_idx).to(torch.int32)
+            # ``global_positions`` is an inclusive count minus one.  Store the
+            # exclusive prefix at each document start so every expert's local
+            # rank restarts at zero, including experts that did not receive the
+            # first token of the document.
+            exclusive_positions = (
+                global_positions + 1 - active_one_hot.to(torch.int32)
+            )
+            start_values = exclusive_positions.index_select(0, start_idx).to(torch.int32)
             offsets = torch.zeros(
                 (num_sequences, self.num_experts),
                 device=flat.device,

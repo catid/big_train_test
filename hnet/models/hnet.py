@@ -165,29 +165,59 @@ class HNet(nn.Module):
 
     def _init_weights(self, initializer_range: float = 0.02, parent_residuals: int = 0) -> None:
         n_residuals = parent_residuals
+
+        def is_reinitializable_projection(module: nn.Module) -> bool:
+            # Transformer Engine's GroupedLinear is not an nn.Linear, but its
+            # stacked expert weights are still projections on the residual
+            # path.  Include both TE class spellings so routed experts receive
+            # the same depth scaling as dense/shared fc2 projections.
+            return isinstance(module, nn.Linear) or module.__class__.__name__ in (
+                "Linear",
+                "AlignedTELinear",
+                "GroupedLinear",
+                "TEGroupedLinear",
+            )
+
+        def init_projection(name: str, module: nn.Module) -> None:
+            if module.__class__.__name__ in ("GroupedLinear", "TEGroupedLinear"):
+                # TE stores one parameter per expert (weight0, weight1, ...)
+                # rather than exposing a single ``weight`` attribute.
+                for parameter_name, weight in module.named_parameters(recurse=False):
+                    if not parameter_name.startswith("weight") or getattr(
+                        weight, "_no_reinit", False
+                    ):
+                        continue
+                    std = (
+                        initializer_range / (n_residuals ** 0.5)
+                        if "out_proj" in name or "fc2" in name
+                        else initializer_range
+                    )
+                    nn.init.normal_(weight, mean=0.0, std=std)
+                return
+            weight = getattr(module, "weight", None)
+            if weight is None or getattr(weight, "_no_reinit", False):
+                return
+            if "out_proj" in name or "fc2" in name:
+                nn.init.normal_(
+                    weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5)
+                )
+            else:
+                nn.init.normal_(weight, mean=0.0, std=initializer_range)
+
         if self.is_innermost:
             n_residuals += self.main_network.height
             for name, m in self.main_network.named_modules():
-                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+                if is_reinitializable_projection(m):
+                    init_projection(name, m)
 
         else:
             n_residuals += self.encoder.height + self.decoder.height
             for name, m in self.encoder.named_modules():
-                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+                if is_reinitializable_projection(m):
+                    init_projection(name, m)
             for name, m in self.decoder.named_modules():
-                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+                if is_reinitializable_projection(m):
+                    init_projection(name, m)
                     
             self.main_network._init_weights(initializer_range, n_residuals)
     

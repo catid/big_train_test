@@ -56,10 +56,27 @@ def parse_args():
     p.add_argument("--steps", type=int, default=100000)
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1.2e-3)
+    p.add_argument(
+        "--lr-decay-fraction",
+        type=float,
+        default=0.20,
+        help="final linear WSqD cooldown fraction of the post-warmup horizon",
+    )
+    p.add_argument(
+        "--lr-shift",
+        type=float,
+        default=5000.0,
+        help="T0 shift used by the horizon-free inverse-square-root WSqD base",
+    )
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--fbt-lambda", type=float, default=1.0)
     p.add_argument("--ratio-weight", type=float, default=0.03)
-    p.add_argument("--ratio-target", type=float, default=6.0)
+    p.add_argument(
+        "--ratio-target",
+        type=float,
+        default=8.0,
+        help="target byte-to-latent ratio; 8 matches 4096 tokens and 512 latent capacity",
+    )
     p.add_argument(
         "--target-ce",
         type=float,
@@ -88,6 +105,46 @@ def parse_args():
         help="checkpoint to resume (model, optimizer, and step); defaults to a fresh run",
     )
     return p.parse_args()
+
+
+def _validate_schedule_args(args):
+    """Validate the canonical warmup + WSqD schedule parameters."""
+    if int(args.warmup) < 0:
+        raise ValueError("warmup must be non-negative")
+    if not (0.0 < float(args.lr_decay_fraction) < 1.0):
+        raise ValueError("lr-decay-fraction must be strictly between zero and one")
+    if float(args.lr_shift) < 0.0:
+        raise ValueError("lr-shift must be non-negative")
+    if float(args.lr) <= 0.0:
+        raise ValueError("lr must be positive")
+
+
+def _wsqd_scale(step: int, args) -> float:
+    """Return the scalar for WSqD after linear warmup.
+
+    The post-warmup base follows the paper's shifted inverse-square-root
+    schedule, ``c0 / sqrt(t + T0)``, and its final ``alpha`` fraction is a
+    linear cooldown to zero.  ``c0`` is chosen so the first post-warmup step
+    equals the requested peak ``args.lr``.  The horizon only selects the
+    cooldown start; changing ``args.steps`` leaves the base trajectory intact.
+    """
+    warmup = int(args.warmup)
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    t = max(1, int(step) - warmup + 1)
+    horizon = max(1, int(args.steps) - warmup)
+    alpha = float(args.lr_decay_fraction)
+    shift = float(args.lr_shift)
+    stable_horizon = max(1, int(math.floor((1.0 - alpha) * horizon)))
+    base = math.sqrt((1.0 + shift) / (t + shift))
+    if t <= stable_horizon:
+        return base
+    cooldown = max(1, horizon - stable_horizon)
+    # WSqD freezes the base value at the stable/cooldown boundary, then
+    # linearly decays that value. Do not continue the inverse-square-root
+    # decrease during cooldown.
+    stable_base = math.sqrt((1.0 + shift) / (stable_horizon + shift))
+    return stable_base * max(0.0, (horizon - t) / cooldown)
 
 
 class ByteStream:
@@ -417,6 +474,24 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         raise ValueError(
             f"resume data-seed mismatch: checkpoint={saved_data_seed}, current={args.data_seed}"
         )
+    saved_schedule = checkpoint.get("lr_schedule")
+    if saved_schedule is not None:
+        expected_schedule = {
+            "name": "WSqD",
+            "warmup_steps": int(args.warmup),
+            "decay_fraction": float(args.lr_decay_fraction),
+            "shift": float(args.lr_shift),
+            "horizon_steps": int(args.steps),
+        }
+        saved_base = dict(saved_schedule)
+        saved_horizon = int(saved_base.pop("horizon_steps", expected_schedule["horizon_steps"]))
+        expected_base = dict(expected_schedule)
+        expected_base.pop("horizon_steps")
+        if saved_base != expected_base or int(args.steps) < saved_horizon:
+            raise ValueError(
+                "resume learning-rate schedule mismatch: "
+                f"checkpoint={saved_schedule!r}, current={expected_schedule!r}"
+            )
     saved_cfg = checkpoint.get("config_signature")
     if saved_cfg is None:
         # Older checkpoints stored ``vars(cfg)``.  It is still useful to
@@ -1196,6 +1271,7 @@ class CUDAGraphStep:
 
 def main():
     args = parse_args()
+    _validate_schedule_args(args)
     # Select the graph-safe TE grouped-tensor dispatch before constructing the
     # model.  The capture helper temporarily disables it for eager warmup and
     # restores it for the graph itself.
@@ -1217,6 +1293,13 @@ def main():
     # diverge.
     cfg.moe_capacity_tokens = min(args.seq, cfg.chunk_capacity_tokens)
     cfg.validate_canonical()
+    minimum_ratio_target = float(args.seq) / float(cfg.chunk_capacity_tokens)
+    if float(args.ratio_target) < minimum_ratio_target:
+        raise ValueError(
+            "ratio-target is incompatible with the canonical latent capacity: "
+            f"need at least {minimum_ratio_target:g} for seq={args.seq} and "
+            f"capacity={cfg.chunk_capacity_tokens}, got {args.ratio_target:g}"
+        )
     runtime = _runtime_provenance()
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1359,6 +1442,14 @@ def main():
         "power_target_w": float(args.target_power_w),
         "power_gap_w": [],
         "target_ce": float(args.target_ce),
+        "lr_schedule": {
+            "name": "WSqD",
+            "warmup_steps": int(args.warmup),
+            "decay_fraction": float(args.lr_decay_fraction),
+            "shift": float(args.lr_shift),
+            "horizon_steps": int(args.steps),
+        },
+        "learning_rate_scale": [],
         "target_reached_step": None,
         "auto_batch_calibration": getattr(args, "_auto_batch_calibration", []),
         "auto_batch_selection_policy": getattr(
@@ -1378,7 +1469,8 @@ def main():
     latest_power = []
     for step in range(start_step, args.steps):
         x, y = stream.get(step, device)
-        lr_scale = min(1.0, (step + 1) / max(1, args.warmup))
+        lr_scale = _wsqd_scale(step, args)
+        log["learning_rate_scale"].append(float(lr_scale))
         for group in optimizer.param_groups:
             # AnchorMuon splits matrix and AdamATan2 fallback tensors into
             # separate groups; preserve the requested fallback rate.
@@ -1502,6 +1594,13 @@ def main():
                     "seq": args.seq,
                     "batch": args.batch,
                     "data_seed": args.data_seed,
+                    "lr_schedule": {
+                        "name": "WSqD",
+                        "warmup_steps": int(args.warmup),
+                        "decay_fraction": float(args.lr_decay_fraction),
+                        "shift": float(args.lr_shift),
+                        "horizon_steps": int(args.steps),
+                    },
                     "params": n_params,
                     "world_size": world,
                     "runtime": runtime,

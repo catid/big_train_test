@@ -454,17 +454,20 @@ class GramNewtonSchulz:
                 gram = x @ x.mT
                 q = None
 
-            z = torch.baddbmm(gram, gram, gram, alpha=c, beta=b)
+            # Avoid cuBLASLt's failing nonzero-beta BF16/FP16 baddbmm path on
+            # B300.  Keep every operation as an explicit product plus scale;
+            # this is algebraically identical and matches the square path.
+            z = b * gram + c * (gram @ gram)
             if i == 0 or i in self.reset_iterations:
                 q = z + a * eye
             else:
                 if q is None:
                     raise RuntimeError("GramNS inverse estimate was not initialized")
-                q = torch.baddbmm(q, q, z, beta=a)
+                q = a * q + q @ z
 
             if i < len(self.coefficients) - 1 and i + 1 not in self.reset_iterations:
-                rz = torch.baddbmm(gram, gram, z, beta=a)
-                gram = torch.baddbmm(rz, z, rz, beta=a)
+                rz = a * gram + gram @ z
+                gram = a * rz + rz @ z
 
         if q is None:
             raise RuntimeError("GramNS finished without an inverse estimate")
