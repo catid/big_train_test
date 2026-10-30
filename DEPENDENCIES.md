@@ -33,4 +33,10 @@ and CUDA cuBLAS libraries. `assert_fp8_runtime()` verifies those exact files
 before model construction; generated TE build directories are permitted only
 when the loaded binaries still match this manifest. The installed
 FlashAttention, Mamba-SSM, and causal-conv1d distributions do not expose
-source commit metadata, so their loaded extension hashes are recorded instead.
+authoritative source commit metadata. The trainer therefore records each
+distribution's normalized installed-file manifest (per-file SHA-256, size, and
+relative path) plus a tree SHA-256 in checkpoint provenance. Python bytecode
+caches are excluded because imports may create or rewrite them; loaded CUDA
+extension hashes remain recorded separately in `runtime_binaries`. A missing
+manifest entry or a distribution without an immutable file list fails startup
+rather than allowing an unreviewed package tree to run.

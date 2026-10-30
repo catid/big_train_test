@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 # Import hnet first: it loads the pinned Transformer Engine before torch can
 # select a conflicting CUDA library set.
@@ -155,6 +155,91 @@ def _config_dict(cfg):
     return cfg
 
 
+def _sha256_file(path: Path) -> str:
+    """Hash a provenance file in bounded chunks without loading it in RAM."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(16 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _hash_installed_distribution(distribution) -> dict:
+    """Hash the immutable files recorded by an installed distribution.
+
+    Source-built CUDA packages often do not publish a source commit through
+    ``importlib.metadata``.  Their installed ``RECORD`` is still an
+    auditable source/build artifact, however: hash every file listed by that
+    record and include the path, size, and content digest in a stable manifest.
+    Python bytecode caches are not part of a wheel's immutable install and are
+    deliberately excluded so importing a module cannot change resume
+    provenance.  Missing manifest entries fail closed instead of allowing an
+    incomplete package install to masquerade as the reviewed dependency.
+    """
+    files = distribution.files
+    if files is None:
+        raise RuntimeError(
+            f"installed distribution {distribution.metadata.get('Name')!r} "
+            "does not expose a file manifest; cannot record source provenance"
+        )
+    install_root = Path(distribution.locate_file("")).resolve()
+    records = []
+    for package_path in files:
+        relative = str(package_path).replace("\\", "/")
+        pure = PurePosixPath(relative)
+        # A RECORD entry with traversal or an absolute path is malformed.  Do
+        # not resolve it outside the installed distribution root implicitly.
+        if pure.is_absolute() or ".." in pure.parts:
+            raise RuntimeError(
+                f"invalid installed-file path for {distribution.metadata.get('Name')!r}: "
+                f"{relative!r}"
+            )
+        if any(part == "__pycache__" for part in pure.parts) or pure.suffix == ".pyc":
+            continue
+        path = Path(distribution.locate_file(package_path))
+        resolved_path = path.resolve()
+        try:
+            resolved_path.relative_to(install_root)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"installed manifest entry escapes its package root for "
+                f"{distribution.metadata.get('Name')!r}: {relative}"
+            ) from exc
+        try:
+            stat = resolved_path.stat()
+        except OSError as exc:
+            raise RuntimeError(
+                f"installed file is missing for {distribution.metadata.get('Name')!r}: "
+                f"{relative}"
+            ) from exc
+        if not resolved_path.is_file():
+            raise RuntimeError(
+                f"installed manifest entry is not a regular file for "
+                f"{distribution.metadata.get('Name')!r}: {relative}"
+            )
+        records.append(
+            {
+                "path": relative,
+                "size": int(stat.st_size),
+                "sha256": _sha256_file(resolved_path),
+            }
+        )
+    if not records:
+        raise RuntimeError(
+            f"installed distribution {distribution.metadata.get('Name')!r} "
+            "has no immutable files to hash"
+        )
+    records.sort(key=lambda item: item["path"])
+    manifest = json.dumps(records, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
+    return {
+        "file_count": len(records),
+        "tree_sha256": hashlib.sha256(manifest).hexdigest(),
+        "files": records,
+    }
+
+
 def _dependency_provenance() -> dict:
     """Record the installed Python environment used by a checkpoint.
 
@@ -164,7 +249,8 @@ def _dependency_provenance() -> dict:
     leaving the extension filename unchanged.  Keep the complete normalized
     ``pip freeze`` text and a digest of each required distribution's METADATA.
     The source-built packages do not expose authoritative source commits in
-    this environment, so this records only metadata that is actually present.
+    this environment, so this records an immutable installed-tree manifest in
+    addition to metadata that is actually present.
     """
     try:
         freeze = subprocess.check_output(
@@ -198,6 +284,7 @@ def _dependency_provenance() -> dict:
                 if direct_url_text
                 else None
             ),
+            "installed_tree": _hash_installed_distribution(distribution),
         }
     return {
         "pip_freeze": freeze,
