@@ -317,8 +317,15 @@ class CausalMHA(nn.Module):
             # tensor. VHA has eight physical Q heads but only two KV heads,
             # so rotate Q and K with the varlen kernel separately.
             if cu_seqlens is None:
+                if isinstance(seqlen_offset, int):
+                    rotary_len = q_phys.shape[1] + seqlen_offset
+                else:
+                    # Tensor offsets are used only by variable-length decode;
+                    # the cache API already performs this host read when it
+                    # selects per-sample cache lengths.
+                    rotary_len = q_phys.shape[1] + int(seqlen_offset.max().item())
                 self.rotary_emb._update_cos_sin_cache(
-                    q_phys.shape[1], device=q_phys.device, dtype=q_phys.dtype
+                    rotary_len, device=q_phys.device, dtype=q_phys.dtype
                 )
                 q_phys = apply_rotary_emb_func(
                     q_phys, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached,
