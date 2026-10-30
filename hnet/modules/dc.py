@@ -212,9 +212,47 @@ class ChunkLayer(nn.Module):
             boundary_prob = torch.cat((1 - boundary_prob, boundary_prob), dim=-1)
 
         if cu_seqlens is not None:
-            next_hidden_states = hidden_states[boundary_mask]
+            # Packed callers use exact per-document cumulative lengths.  Apply
+            # the same latent capacity as the padded graph path before
+            # gathering rows; otherwise a packed prefill could silently feed
+            # more than the trained 512 latent rows into the inner stack.
+            effective_boundary_mask = boundary_mask
+            if self.static_max_seqlen is not None:
+                capacity = int(self.static_max_seqlen)
+                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                doc_idx = torch.repeat_interleave(
+                    torch.arange(lengths.numel(), device=boundary_mask.device),
+                    lengths.to(device=boundary_mask.device, dtype=torch.long),
+                )
+                counts = torch.zeros(
+                    lengths.numel(), device=boundary_mask.device, dtype=torch.int32
+                ).scatter_add_(0, doc_idx, boundary_mask.to(torch.int32))
+                if bool((counts > capacity).any()):
+                    # Packed execution is already a dynamic varlen path, so
+                    # using host section offsets here does not affect CUDA
+                    # graph capture.  Keep the selection per document and
+                    # force each structural first token to survive ties.
+                    effective_boundary_mask = boundary_mask.clone()
+                    sections = cu_seqlens.detach().cpu().tolist()
+                    for start, end in zip(sections[:-1], sections[1:], strict=True):
+                        local_mask = boundary_mask[start:end]
+                        if int(local_mask.sum().item()) <= capacity:
+                            continue
+                        local_scores = boundary_prob[start:end, -1].float().masked_fill(
+                            ~local_mask, float("-inf")
+                        )
+                        if bool(local_mask[0]):
+                            local_scores[0] = float("inf")
+                        selected = torch.topk(
+                            local_scores, k=capacity, sorted=False
+                        ).indices
+                        keep = torch.zeros_like(local_mask)
+                        keep[selected] = True
+                        effective_boundary_mask[start:end] = local_mask & keep
+
+            next_hidden_states = hidden_states[effective_boundary_mask]
             next_cu_seqlens = F.pad(
-                boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0)
+                effective_boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0)
             )
             if self.static_max_seqlen is not None:
                 # A configured upper bound is valid for FlashAttention's
@@ -227,7 +265,6 @@ class ChunkLayer(nn.Module):
                     (next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max()
                 )
             next_mask = None
-            effective_boundary_mask = boundary_mask
         else:
             next_cu_seqlens = None
             L = hidden_states.shape[1]
