@@ -17,16 +17,36 @@ class Mamba2Wrapper(Mamba2):
     Mamba2 wrapper class that has the same inference interface as the CausalMHA class.
     """
 
-    def step(self, hidden_states, inference_params):
-        # Don't use _get_states_from_cache because we want to assert that they exist
-        conv_state, ssm_state = inference_params.key_value_memory_dict[
-            self.layer_idx
-        ] # init class of Mamba2 accepts layer_idx
+    def step(self, hidden_states, conv_state_or_inference, ssm_state=None):
+        """Support Mamba's native cache call and H-Net's cache interface.
+
+        ``Mamba2.forward`` calls ``self.step(u, conv_state, ssm_state)`` once
+        its cache offset is nonzero, while :class:`Block` calls the mixer as
+        ``step(x, inference_params)``.  The old two-argument override treated
+        the former convolution tensor as an H-Net cache object and raised a
+        ``TypeError`` during outer-stack decode.
+        """
+        if ssm_state is not None:
+            return super().step(
+                hidden_states, conv_state_or_inference, ssm_state
+            )
+
+        inference_params = conv_state_or_inference
+        try:
+            conv_state, ssm_state = inference_params.key_value_memory_dict[
+                self.layer_idx
+            ]
+        except (AttributeError, KeyError) as exc:
+            raise RuntimeError(
+                f"missing Mamba cache for layer {self.layer_idx}; "
+                "allocate the complete canonical inference cache"
+            ) from exc
         result, conv_state, ssm_state = super().step(
             hidden_states, conv_state, ssm_state
         )
 
-        # Update the state cache in-place
+        # Update the state cache in-place so repeated H-Net decode calls
+        # observe the same state objects allocated during prefill.
         inference_params.key_value_memory_dict[self.layer_idx][0].copy_(conv_state)
         inference_params.key_value_memory_dict[self.layer_idx][1].copy_(ssm_state)
         return result
