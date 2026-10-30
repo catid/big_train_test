@@ -1421,7 +1421,12 @@ def main():
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(log, indent=2))
     if world > 1:
-        dist.destroy_process_group()
+        # CUDA-graph replay plus the explicit post-replay NCCL bucket
+        # reductions can leave communicator teardown waiting forever in
+        # ``destroy_process_group`` after the run record is written.  This is
+        # a one-shot trainer; let normal process exit reclaim the communicator
+        # instead of hanging a completed training job.
+        pass
 
 
 if __name__ == "__main__":
