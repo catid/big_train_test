@@ -216,7 +216,11 @@ class ChunkLayer(nn.Module):
                 next_max_seqlen = min(int(self.static_max_seqlen), L)
             else:
                 next_max_seqlen = int(num_tokens.max())
-            if int(num_tokens.max()) > next_max_seqlen:
+            # In the configured static path the full input length bounds the
+            # number of selected boundaries. Avoid a device-to-host max read
+            # that would prevent CUDA graph capture; dynamic callers retain
+            # the explicit check.
+            if self.static_max_seqlen is None and int(num_tokens.max()) > next_max_seqlen:
                 raise ValueError(
                     "static chunking bound is smaller than the number of input "
                     "boundaries; increase max_seq_len"
