@@ -8,6 +8,12 @@ class AttnConfig:
     num_heads: List = field(default_factory=list)
     rotary_emb_dim: List = field(default_factory=list)
     window_size: List = field(default_factory=list)
+    # Virtual Head Attention (VHA) uses a smaller physical Q/KV projection
+    # during training and folds to standard GQA-2 for decode.  The value is
+    # stage-specific so the single canonical config can describe every stack.
+    num_kv_heads: List = field(default_factory=list)
+    vha_enabled: bool = False
+    vha_rank: int = 0
     # Opt-in CroissAttn FP8 backward correction.  This keeps the auxiliary
     # unrounded O'=P@V_f used by the softmax derivative; see ~/fp8.
     croissattn_aux: bool = False
@@ -72,3 +78,7 @@ class HNetConfig:
             raise ValueError("the canonical model requires MSAR, two-pass FBT, and static chunking")
         if not (self.moe_enabled and self.moe_num_experts == 8 and self.moe_top_k == 1):
             raise ValueError("the canonical model requires top-1 8-way sparse MoE")
+        if not self.attn_cfg.vha_enabled or self.attn_cfg.num_kv_heads != [2, 2]:
+            raise ValueError("the canonical model requires VHA with two KV heads per attention stage")
+        if int(self.attn_cfg.vha_rank) != 4:
+            raise ValueError("the canonical model requires VHA postmix rank 4")

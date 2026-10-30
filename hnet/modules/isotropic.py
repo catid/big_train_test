@@ -93,6 +93,10 @@ class Isotropic(nn.Module):
             if arch in ("s", "S"):
                 block_attn_cfg["window_size"] = int(getattr(config, "swa_window_size", 128))
                 block_attn_cfg["croissattn_aux"] = False
+                # VHA is the requested FA KV-cache compression.  SWA keeps
+                # its ordinary same-head local attention path and is not part
+                # of the compressed global-cache budget.
+                block_attn_cfg["vha_enabled"] = False
             layers += [
                 create_block(
                     arch,
@@ -154,18 +158,21 @@ class Isotropic(nn.Module):
                 groups=self.d_model,
             ).transpose(1, 2)
             return y.squeeze(0) if original_2d else y
-        # Packed streams need causal resets at each document boundary.
-        pieces = []
-        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
-            seg = x[:, start:end]
-            pieces.append(
-                F.conv1d(
-                    F.pad(seg.transpose(1, 2), (kernel - 1, 0)),
-                    weight.to(dtype=x.dtype).unsqueeze(1),
-                    groups=self.d_model,
-                ).transpose(1, 2)
+        # Packed streams need causal resets at document boundaries. Express
+        # the depthwise convolution as tensor shifts masked by document IDs;
+        # this removes the Python ``tolist``/per-document launch loop and keeps
+        # the packed MSAR path graph-safe for a fixed token bound.
+        from hnet.modules.utils import get_seq_idx
+        seq_idx = get_seq_idx(cu_seqlens, device=x.device)
+        y = x * weight[:, kernel - 1].to(dtype=x.dtype)
+        for lag in range(1, kernel):
+            shifted = torch.cat((torch.zeros_like(x[:, :lag]), x[:, :-lag]), dim=1)
+            same_doc = torch.cat(
+                (torch.zeros_like(seq_idx[:, :lag], dtype=torch.bool),
+                 seq_idx[:, lag:] == seq_idx[:, :-lag]),
+                dim=1,
             )
-        y = torch.cat(pieces, dim=1)
+            y = y + shifted * same_doc.unsqueeze(-1).to(dtype=x.dtype) * weight[:, kernel - 1 - lag].to(dtype=x.dtype)
         return y.squeeze(0) if original_2d else y
 
     def _msar_mix(self, sources, layer_idx, cu_seqlens=None):

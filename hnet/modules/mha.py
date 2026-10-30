@@ -5,12 +5,14 @@ import torch.nn as nn
 from einops import rearrange
 
 from flash_attn import (
+    flash_attn_func,
+    flash_attn_varlen_func,
     flash_attn_qkvpacked_func,
     flash_attn_varlen_qkvpacked_func,
     flash_attn_with_kvcache,
 )
 
-from .rotary import RotaryEmbedding
+from .rotary import RotaryEmbedding, apply_rotary_emb_func, apply_rotary_emb_kv_
 from hnet.te import TEDotProductAttention, assert_fused_attention_selected, make_linear
 
 
@@ -84,6 +86,19 @@ class FlashCausalSelfAttention(nn.Module):
                 window_size=self._window(),
             )
 
+    def forward_vha(self, q, k, v, cu_seqlens=None, max_seqlen=None):
+        """FlashAttention path for VHA's virtual-Q/GQA-KV layout."""
+        if cu_seqlens is not None:
+            return flash_attn_varlen_func(
+                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+                softmax_scale=self.softmax_scale, causal=True,
+                window_size=self._window(),
+            )
+        return flash_attn_func(
+            q, k, v, softmax_scale=self.softmax_scale, causal=True,
+            window_size=self._window(),
+        )
+
 
 class CausalMHA(nn.Module):
     def __init__(
@@ -99,6 +114,9 @@ class CausalMHA(nn.Module):
         rotary_emb_base=10000.0,
         rotary_emb_interleaved=False,
         croissattn_aux=False,
+        num_kv_heads=None,
+        vha_enabled=False,
+        vha_rank=0,
         device=None,
         dtype=None,
     ) -> None:
@@ -115,16 +133,50 @@ class CausalMHA(nn.Module):
         self.rotary_emb_dim = rotary_emb_dim
         self.window_size = window_size
         self.croissattn_aux = bool(croissattn_aux)
+        self.vha_enabled = bool(vha_enabled)
         if flash_attn_with_kvcache is None:
             raise RuntimeError(
                 "H-Net requires FlashAttention's fused KV-cache kernel; "
                 "portable decode fallbacks are unsupported"
             )
 
-        self.num_heads = num_heads
+        self.num_heads = int(num_heads)
         assert self.d_model % num_heads == 0, "d_model must be divisible by num_heads"
         self.head_dim = self.d_model // num_heads
-        qkv_dim = self.head_dim * (3 * self.num_heads)
+        if self.vha_enabled:
+            self.num_kv_heads = int(num_kv_heads or 2)
+            if self.num_heads % (2 * self.num_kv_heads) != 0:
+                raise ValueError(
+                    "VHA requires num_heads divisible by 2*num_kv_heads "
+                    f"(got {self.num_heads}, {self.num_kv_heads})"
+                )
+            # VHA has Hq/2 physical query heads.  Each physical head is
+            # premixed independently for each of the two KV groups, yielding
+            # Hq virtual query heads for the attention kernel.
+            self.physical_q_heads = self.num_heads // 2
+            if self.physical_q_heads != self.num_kv_heads * (self.num_heads // (2 * self.num_kv_heads)):
+                raise ValueError("VHA physical query/group layout is not integral")
+            qkv_dim = self.head_dim * (self.physical_q_heads + 2 * self.num_kv_heads)
+            rank = int(vha_rank or max(1, self.physical_q_heads // 2))
+            if rank <= 0 or rank > self.num_heads:
+                raise ValueError("VHA postmix rank must be in [1, num_heads]")
+            self.vha_rank = rank
+            eye = torch.eye(self.head_dim, device=device, dtype=dtype)
+            self.vha_premix = nn.Parameter(
+                eye.unsqueeze(0).repeat(self.num_kv_heads, 1, 1)
+            )
+            self.vha_postmix_a = nn.Parameter(
+                torch.empty(self.num_heads, rank, device=device, dtype=dtype)
+            )
+            self.vha_postmix_b = nn.Parameter(
+                torch.zeros(self.num_heads, rank, device=device, dtype=dtype)
+            )
+            nn.init.normal_(self.vha_postmix_a, mean=0.0, std=0.02)
+            self.vha_postmix_b._no_reinit = True
+        else:
+            self.num_kv_heads = self.num_heads
+            self.physical_q_heads = self.num_heads
+            qkv_dim = self.head_dim * (3 * self.num_heads)
 
         if self.rotary_emb_dim > 0:
             self.rotary_emb = RotaryEmbedding(
@@ -145,6 +197,7 @@ class CausalMHA(nn.Module):
             self.te_attn = TEDotProductAttention(
                 num_attention_heads=num_heads,
                 kv_channels=self.head_dim,
+                num_gqa_groups=self.num_kv_heads,
                 qkv_format="bshd",
                 # Use the ordinary causal policy for padded ``bshd`` calls;
                 # packed ``thd`` calls override it with ``padding_causal``.
@@ -160,7 +213,7 @@ class CausalMHA(nn.Module):
             batch_size,
             max_seqlen,
             2,
-            self.num_heads,
+            self.num_kv_heads,
             self.head_dim,
             dtype=dtype,
             device=device,
@@ -239,6 +292,68 @@ class CausalMHA(nn.Module):
             window_size=self.inner_attn._window()
         )
 
+    def _vha_postmix(self, context):
+        """Apply low-rank identity-residual mixing on the virtual-head axis."""
+        # M = I + B A^T.  Forming M explicitly is unnecessary and would add a
+        # large [H,H] intermediate to every token; two contractions preserve
+        # the factorization used by VHA during training.
+        flattened = context.shape[-1] == self.num_heads * self.head_dim
+        if flattened:
+            context = context.reshape(*context.shape[:-1], self.num_heads, self.head_dim)
+        low_rank = torch.einsum("...hd,hr->...rd", context, self.vha_postmix_a)
+        mixed = torch.einsum("...rd,hr->...hd", low_rank, self.vha_postmix_b)
+        mixed = context + mixed
+        return mixed.reshape(*mixed.shape[:-2], -1) if flattened else mixed
+
+    def _project_vha(self, x, cu_seqlens=None, max_seqlen=None, seqlen_offset=0):
+        raw = self.Wqkv(x)
+        raw = rearrange(raw, "... (h d) -> ... h d", d=self.head_dim)
+        q_phys = raw[..., : self.physical_q_heads, :]
+        kv = raw[..., self.physical_q_heads :, :].reshape(
+            *raw.shape[:-2], 2, self.num_kv_heads, self.head_dim
+        )
+        if self.rotary_emb_dim > 0:
+            # RotaryEmbedding's packed QKV kernel expects a single 3-way
+            # tensor. VHA has eight physical Q heads but only two KV heads,
+            # so rotate Q and K with the varlen kernel separately.
+            if cu_seqlens is None:
+                self.rotary_emb._update_cos_sin_cache(
+                    q_phys.shape[1], device=q_phys.device, dtype=q_phys.dtype
+                )
+                q_phys = apply_rotary_emb_func(
+                    q_phys, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached,
+                    interleaved=self.rotary_emb.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+                kv = apply_rotary_emb_kv_(
+                    kv, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached,
+                    interleaved=self.rotary_emb.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+            else:
+                self.rotary_emb._update_cos_sin_cache(
+                    max_seqlen, device=q_phys.device, dtype=q_phys.dtype
+                )
+                q_phys = apply_rotary_emb_func(
+                    q_phys, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached,
+                    interleaved=self.rotary_emb.interleaved,
+                    seqlen_offsets=0, cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                k = kv[:, 0]
+                k = apply_rotary_emb_func(
+                    k, self.rotary_emb._cos_cached, self.rotary_emb._sin_cached,
+                    interleaved=self.rotary_emb.interleaved,
+                    seqlen_offsets=0, cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+                kv = torch.stack((k, kv[:, 1]), dim=1)
+        # Each KV group receives all physical Q heads after its own learned
+        # near-identity premix, producing Hq virtual query heads.
+        q = torch.einsum("...id,gde->...gie", q_phys, self.vha_premix)
+        q = q.reshape(*q.shape[:-3], self.num_heads, self.head_dim)
+        return q, kv[..., 0, :, :], kv[..., 1, :, :]
+
     def forward(
         self,
         x,
@@ -284,6 +399,44 @@ class CausalMHA(nn.Module):
         rotary_max_seqlen = (
             inference_params.max_seqlen if inference_params is not None else None
         )
+
+        if self.vha_enabled:
+            q, k, v = self._project_vha(
+                x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
+                seqlen_offset=seqlen_offset,
+            )
+            if inference_params is None and self.te_attn is not None:
+                context = self.te_attn(
+                    query_layer=q, key_layer=k, value_layer=v,
+                    qkv_format="bshd" if cu_seqlens is None else "thd",
+                    **({} if cu_seqlens is None else {
+                        "attn_mask_type": "padding_causal",
+                        "cu_seqlens_q": cu_seqlens,
+                        "cu_seqlens_kv": cu_seqlens,
+                        "max_seqlen_q": max_seqlen,
+                        "max_seqlen_kv": max_seqlen,
+                    }),
+                )
+                assert_fused_attention_selected()
+            elif inference_params is None:
+                context = self.inner_attn.forward_vha(
+                    q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                )
+            else:
+                context = self._update_kvcache_attention(
+                    q, torch.stack((k, v), dim=2), inference_params,
+                    cache_layer_idx=cache_layer_idx,
+                )
+            # TE's DPA returns a flattened final dimension for both BSHD and
+            # THD calls, while FlashAttention keeps an explicit head axis.
+            # Postmix is defined on that head axis, so restore it before the
+            # low-rank contraction and flatten again for the output projection.
+            context_was_flat = context.shape[-1] == self.d_model
+            if context_was_flat:
+                context = context.reshape(*context.shape[:-1], self.num_heads, self.head_dim)
+            context = self._vha_postmix(context)
+            context_flat = rearrange(context, "... h d -> ... (h d)")
+            return self.out_proj(context_flat)
 
         qkv = self.Wqkv(x)
         qkv = rearrange(
