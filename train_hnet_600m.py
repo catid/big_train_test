@@ -57,8 +57,8 @@ def parse_args():
     p.add_argument(
         "--auto-batch-max",
         type=int,
-        default=32,
-        help="upper bound for power-calibration candidates (powers of two)",
+        default=96,
+        help="upper bound for power-calibration candidates",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
@@ -418,15 +418,16 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     """
     if device.type != "cuda":
         raise RuntimeError("--auto-batch requires CUDA")
-    total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
     # Keep a generous memory reserve for the real optimizer, DDP buckets, and
     # checkpointing. B300's 275 GiB permits candidates through eight for this
     # model; smaller devices receive a proportionally lower bound.
     if int(args.auto_batch_max) < 1:
         raise ValueError("--auto-batch-max must be positive")
-    # Leave room for the optimizer master/state tensors, DDP buckets, and
-    # checkpoint allocations that are absent during this pre-optimizer sweep.
-    max_batch = max(1, min(int(args.auto_batch_max), int(total_gib // 16)))
+    # The full model has explicit activation checkpointing and the calibration
+    # catches a synchronized OOM before any collective that would deadlock a
+    # DDP rank. Use the requested bound directly; a conservative memory
+    # heuristic would reject the larger validated graph batches on B300.
+    max_batch = max(1, int(args.auto_batch_max))
     available_batches = (os.path.getsize(args.data) - 1) // (args.seq * max(1, world))
     if available_batches < 1:
         raise ValueError("byte stream is shorter than one distributed batch")
@@ -439,6 +440,8 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     while candidate <= max_batch:
         candidates.append(candidate)
         candidate *= 2
+    if candidates[-1] != max_batch:
+        candidates.append(max_batch)
 
     target_model = model.module if isinstance(model, DDP) else model
     # The snapshot is intentionally CPU-resident so candidate tensors and
@@ -481,12 +484,45 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                     # The first two updates warm kernels and allocator state;
                     # the latter two are the steady-state power samples.
                     model.zero_grad(set_to_none=True)
-                    out = model(x, mask=mask, fbt_passes=FBT_PASSES)
-                    loss, metrics = loss_for_output(out, y, args)
-                    loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), 1.0
+                    iteration_oom = False
+                    try:
+                        # Probe the complete local forward/backward without
+                        # entering DDP reducer collectives.  If one rank
+                        # OOMs, healthy ranks can still reach the OOM gate
+                        # below and report it collectively.
+                        sync_context = (
+                            model.no_sync()
+                            if isinstance(model, DDP)
+                            else contextlib.nullcontext()
+                        )
+                        with sync_context:
+                            out = model(x, mask=mask, fbt_passes=FBT_PASSES)
+                            loss, metrics = loss_for_output(out, y, args)
+                            loss.backward()
+                            grad_norm = torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), 1.0
+                            )
+                    except RuntimeError as exc:
+                        if "out of memory" not in str(exc).lower():
+                            raise
+                        iteration_oom = True
+                        # Release the failed candidate's allocator blocks
+                        # before entering the shared OOM gate.  Other ranks
+                        # remain in ``no_sync`` and can therefore reach the
+                        # same collective without waiting in DDP's reducer.
+                        torch.cuda.empty_cache()
+                    # Every rank reports allocation failure before any rank
+                    # enters the finite-gradient collective. This prevents a
+                    # single-rank OOM from leaving the other DDP ranks parked
+                    # in NCCL until the launcher timeout.
+                    oom_tensor = torch.tensor(
+                        [int(iteration_oom)], device=device, dtype=torch.int32
                     )
+                    if world > 1:
+                        dist.all_reduce(oom_tensor, op=dist.ReduceOp.MAX)
+                    if bool(oom_tensor.item()):
+                        oom = True
+                        break
                     finite_flag = (torch.isfinite(loss) & torch.isfinite(grad_norm)).to(
                         dtype=torch.int32
                     )
@@ -496,6 +532,25 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                         raise FloatingPointError(
                             f"non-finite calibration update at candidate batch {candidate}"
                         )
+                    if world > 1:
+                        # ``no_sync`` avoided the reducer during the probe;
+                        # after every rank passes the OOM gate, explicitly
+                        # average gradients so this remains a complete DDP
+                        # optimizer step for power measurement.
+                        for parameter in model.parameters():
+                            if not parameter.requires_grad:
+                                continue
+                            # All ranks must enter the same sequence of
+                            # collectives even when a parameter is unused on
+                            # one rank.  Materialize a zero gradient for that
+                            # rank rather than skipping its collective.
+                            gradient = parameter.grad
+                            if gradient is None:
+                                gradient = torch.zeros_like(parameter)
+                            dist.all_reduce(gradient, op=dist.ReduceOp.SUM)
+                            gradient.div_(float(world))
+                            if parameter.grad is None:
+                                parameter.grad = gradient
                     optimizer.step()
                     torch.cuda.synchronize(device)
                     if iteration >= 2:
@@ -522,8 +577,14 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                 optimizer.state.clear()
                 for group in optimizer.param_groups:
                     group["k"] = 0
+                hnet_te.reset_fp8_scaling_state(target_model)
                 del x, y, mask, out, loss, metrics
                 if oom:
+                    torch.cuda.empty_cache()
+                else:
+                    # Release allocator slabs between shapes so a larger
+                    # candidate is tested against actual free memory rather
+                    # than fragmentation from the previous candidate.
                     torch.cuda.empty_cache()
 
             oom_flag = torch.tensor([int(oom)], device=device, dtype=torch.int32)
@@ -555,20 +616,28 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                 device=device, dtype=torch.float32,
             )
             if world > 1:
-                dist.all_reduce(power_tensor, op=dist.ReduceOp.SUM)
-                power_tensor /= world
-            mean_power = float(power_tensor.item())
-            measurements.append({"batch": candidate, "power_w": mean_power})
+                # A per-GPU power limit is a worst-rank constraint. Selecting
+                # from the mean could push one rank past the target while the
+                # aggregate still appears safe.
+                dist.all_reduce(power_tensor, op=dist.ReduceOp.MAX)
+            peak_power = float(power_tensor.item())
+            measurements.append({"batch": candidate, "power_w": peak_power})
             if rank == 0:
                 print(
-                    f"auto_batch candidate={candidate} mean_power_w={mean_power:.1f}",
+                    f"auto_batch candidate={candidate} peak_power_w={peak_power:.1f}",
                     flush=True,
                 )
+            if peak_power >= float(args.target_power_w):
+                # Power is monotonic enough across the geometric batch sweep;
+                # do not spend more full updates on candidates that are
+                # already above the per-GPU safety target.
+                break
     finally:
         target_model.load_state_dict(initial_state, strict=True)
         optimizer.state.clear()
         for group in optimizer.param_groups:
             group["k"] = 0
+        hnet_te.reset_fp8_scaling_state(target_model)
         torch.set_rng_state(cpu_rng)
         torch.cuda.set_rng_state(cuda_rng, device=device)
         hnet_te.set_graph_capture(graph_was_enabled)
@@ -576,26 +645,19 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     if not measurements:
         raise RuntimeError("--auto-batch could not complete a full FP8 calibration step")
     target = float(args.target_power_w)
-    max_power = max(item["power_w"] for item in measurements)
-    min_power = min(item["power_w"] for item in measurements)
-    if max_power < target:
+    below_target = [item for item in measurements if item["power_w"] <= target]
+    if below_target:
         # If the whole sweep is below the requested draw, the closest point is
-        # the wrong policy: a small noisy difference can select batch 1 and
-        # leave available GPU capacity unused.  Use the largest fully
-        # validated candidate and record the remaining gap explicitly.
-        selected = max(measurements, key=lambda item: item["batch"])
+        # the wrong policy: use the largest safe candidate and record any
+        # remaining gap explicitly. This is also safe when the sweep brackets
+        # the target because no known rank exceeds it.
+        selected = max(below_target, key=lambda item: item["batch"])
         selection_policy = "largest_below_target"
-    elif min_power > target:
+    else:
         # If even batch 1 exceeds the target, preserve the smallest validated
         # shape so the trainer does not knowingly overdraw the GPU.
         selected = min(measurements, key=lambda item: item["batch"])
         selection_policy = "smallest_above_target"
-    else:
-        selected = min(
-            measurements,
-            key=lambda item: (abs(item["power_w"] - target), -item["batch"]),
-        )
-        selection_policy = "closest_target"
     selected_tensor = torch.tensor([selected["batch"]], device=device, dtype=torch.int64)
     if world > 1:
         dist.broadcast(selected_tensor, src=0)
@@ -636,7 +698,14 @@ class CUDAGraphStep:
         self.world = int(world)
         self.capture_stream = capture_stream
         self.ddp = world > 1 and isinstance(model, DDP)
-        self._ddp_params = list(model.parameters()) if self.ddp else []
+        # DDP's reducer only tracks trainable parameters.  Filtering here keeps
+        # the flat post-capture collective aligned with the reducer and avoids
+        # presence bookkeeping for the frozen byte-code buffer.
+        self._ddp_params = (
+            [param for param in model.parameters() if param.requires_grad]
+            if self.ddp
+            else []
+        )
         self._ddp_grad_flat = None
         # Materialize scalar diagnostics before capture.  Constructing a new
         # tensor from a Python float inside a CUDA capture is rejected by the
@@ -759,29 +828,22 @@ class CUDAGraphStep:
                 (total,), device=self.device, dtype=torch.float32
             )
         flat = self._ddp_grad_flat
-        presence = torch.zeros(
-            (len(self._ddp_params),), device=self.device, dtype=torch.int32
-        )
         offset = 0
-        for index, param in enumerate(self._ddp_params):
+        for param in self._ddp_params:
             count = param.numel()
             view = flat[offset : offset + count]
             if param.grad is None:
                 view.zero_()
             else:
-                presence[index] = 1
                 view.copy_(param.grad.detach().reshape(-1).float())
             offset += count
         dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        dist.all_reduce(presence, op=dist.ReduceOp.MAX)
         flat.div_(float(self.world))
         offset = 0
-        for index, param in enumerate(self._ddp_params):
+        for param in self._ddp_params:
             count = param.numel()
             view = flat[offset : offset + count].view_as(param)
-            if not bool(presence[index].item()):
-                param.grad = None
-            elif param.grad is None:
+            if param.grad is None:
                 param.grad = view.to(dtype=param.dtype)
             else:
                 param.grad.copy_(view.to(dtype=param.grad.dtype))
@@ -805,6 +867,12 @@ def main():
     torch.manual_seed(1729)
     cfg = load_config()
     cfg.max_seq_len = args.seq
+    # The fixed-capacity MoE contract follows the actual static graph bound.
+    # Keep short diagnostic sequences shape-consistent without changing the
+    # canonical architecture or allowing eager/graph routing semantics to
+    # diverge.
+    cfg.moe_capacity_tokens = min(args.seq, cfg.chunk_capacity_tokens)
+    cfg.validate_canonical()
     runtime = _runtime_provenance()
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

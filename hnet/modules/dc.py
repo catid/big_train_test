@@ -47,6 +47,11 @@ class RoutingModuleState:
 
     has_seen_tokens: torch.Tensor  # (batch_size,)
     last_hidden_state: torch.Tensor  # (batch_size, d_model)
+    # Number of effective latent boundaries retained by the outer chunker.
+    # This is separate from ``has_seen_tokens`` because the static training
+    # path applies a fixed latent capacity and decode must enforce the same
+    # bound online.
+    boundary_count: torch.Tensor | None = None
 
 
 @dataclass
@@ -81,6 +86,7 @@ class RoutingModule(nn.Module):
             last_hidden_state=torch.zeros(
                 batch_size, self.d_model, device=device, dtype=dtype
             ),
+            boundary_count=torch.zeros(batch_size, device=device, dtype=torch.int32),
         )
 
     def forward(self, hidden_states, cu_seqlens=None, mask=None, inference_params=None):
@@ -189,10 +195,21 @@ class ChunkLayer(nn.Module):
         super().__init__()
         self.static_max_seqlen = static_max_seqlen
 
-    def forward(self, hidden_states, boundary_mask, cu_seqlens=None, mask=None):
+    def forward(
+        self,
+        hidden_states,
+        boundary_mask,
+        cu_seqlens=None,
+        mask=None,
+        boundary_prob=None,
+    ):
         assert (mask is not None) or (
             cu_seqlens is not None
         ), "Either mask or cu_seqlens must be provided"
+
+        if boundary_prob is None:
+            boundary_prob = boundary_mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
+            boundary_prob = torch.cat((1 - boundary_prob, boundary_prob), dim=-1)
 
         if cu_seqlens is not None:
             next_hidden_states = hidden_states[boundary_mask]
@@ -210,9 +227,11 @@ class ChunkLayer(nn.Module):
                     (next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max()
                 )
             next_mask = None
+            effective_boundary_mask = boundary_mask
         else:
             next_cu_seqlens = None
             L = hidden_states.shape[1]
+            effective_boundary_mask = boundary_mask
             num_tokens = boundary_mask.sum(dim=-1)
             # CUDA graph capture cannot depend on a host read of a
             # data-dependent max. A configured static bound keeps all inner
@@ -229,6 +248,28 @@ class ChunkLayer(nn.Module):
             # number of selected boundaries. Avoid a device-to-host max read
             # that would prevent CUDA graph capture; dynamic callers retain
             # the explicit check.
+            capacity = min(int(next_max_seqlen), int(L))
+            if self.static_max_seqlen is not None and capacity < L:
+                # Keep a fixed latent tensor for graph replay while retaining
+                # the learned routing decision: if too many boundaries are
+                # emitted, retain the highest boundary probabilities.  The
+                # first position is always a boundary and therefore survives
+                # the top-k selection.
+                scores = boundary_prob[..., -1].float().masked_fill(
+                    ~boundary_mask, float("-inf")
+                )
+                # Position zero is structural.  Force it into the retained
+                # set even when several router probabilities tie.
+                scores[:, 0] = torch.where(
+                    boundary_mask[:, 0],
+                    torch.full_like(scores[:, 0], float("inf")),
+                    scores[:, 0],
+                )
+                _, top_indices = torch.topk(scores, k=capacity, dim=1, sorted=False)
+                keep = torch.zeros_like(boundary_mask)
+                keep.scatter_(1, top_indices, True)
+                effective_boundary_mask = boundary_mask & keep
+                num_tokens = effective_boundary_mask.sum(dim=-1)
             if self.static_max_seqlen is None and int(num_tokens.max()) > next_max_seqlen:
                 raise ValueError(
                     "static chunking bound is smaller than the number of input "
@@ -237,7 +278,8 @@ class ChunkLayer(nn.Module):
 
             device = hidden_states.device
             token_idx = (
-                torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
+                torch.arange(L, device=device)[None, :]
+                + (~effective_boundary_mask).long() * L
             )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
 
@@ -252,7 +294,13 @@ class ChunkLayer(nn.Module):
             next_mask = torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None]
             next_max_seqlen = None
 
-        return next_hidden_states, next_cu_seqlens, next_max_seqlen, next_mask
+        return (
+            next_hidden_states,
+            next_cu_seqlens,
+            next_max_seqlen,
+            next_mask,
+            effective_boundary_mask,
+        )
 
     def step(self, hidden_states, boundary_mask):
         return hidden_states[boundary_mask]

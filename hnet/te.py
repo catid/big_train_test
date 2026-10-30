@@ -296,6 +296,26 @@ def update_fp8_scaling(*, forward: bool) -> None:
     FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=bool(forward))
 
 
+def reset_fp8_scaling_state(model: torch.nn.Module) -> None:
+    """Reset module-local delayed-scaling tensors between calibration trials.
+
+    Transformer Engine's global amax buffers contain references to the module
+    ``amax_history`` and ``scale`` tensors.  Calling
+    ``FP8GlobalStateManager.reset()`` alone discards those buffers but leaves
+    each module's ``buffer_index_and_autocast_key`` registration marker in
+    place; the next autocast therefore refuses to register the module again
+    and its scales stop updating.  Reset the referenced tensors in place and
+    keep the registration intact.  This gives each calibration candidate the
+    same unit-scale/zero-history starting state without invalidating TE's
+    process-global bookkeeping.
+    """
+
+    for module in model.modules():
+        reset = getattr(module, "reset_fp8_meta_tensors", None)
+        if reset is not None:
+            reset()
+
+
 def assert_fp8_attention_backend() -> None:
     """Reject TE's quadratic unfused attention selection.
 

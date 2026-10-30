@@ -1014,17 +1014,29 @@ class AnchorMuon(torch.optim.Optimizer):
         soda_weight = self._soda_weight(t)
         matrix_count = 0
         for bucket_entries in buckets.values():
-            updates = self._transform_matrix_bucket(bucket_entries, group)
-            for (p, anchor, _source, _grad), update in zip(bucket_entries, updates.unbind(0), strict=True):
-                master = self._master_param(p)
-                master.lerp_(end=anchor, weight=soda_weight)
-                matrix_decay = 0.0 if getattr(p, "_no_weight_decay", False) else self.matrix_weight_decay
-                if matrix_decay:
-                    master.mul_(1.0 - lr * matrix_decay)
-                master.add_(update.reshape_as(master), alpha=-lr)
-                if master is not p:
-                    p.copy_(master.to(dtype=p.dtype))
-                matrix_count += 1
+            # GramNS forms several square intermediates whose size is the
+            # reduced matrix dimension. Process a bounded number of same-shape
+            # banks at a time so optimizer work cannot consume the last few
+            # GiB after a large CUDA-graph private pool has been captured.
+            for start in range(0, len(bucket_entries), 8):
+                chunk_entries = bucket_entries[start : start + 8]
+                updates = self._transform_matrix_bucket(chunk_entries, group)
+                for (p, anchor, _source, _grad), update in zip(
+                    chunk_entries, updates.unbind(0), strict=True
+                ):
+                    master = self._master_param(p)
+                    master.lerp_(end=anchor, weight=soda_weight)
+                    matrix_decay = (
+                        0.0
+                        if getattr(p, "_no_weight_decay", False)
+                        else self.matrix_weight_decay
+                    )
+                    if matrix_decay:
+                        master.mul_(1.0 - lr * matrix_decay)
+                    master.add_(update.reshape_as(master), alpha=-lr)
+                    if master is not p:
+                        p.copy_(master.to(dtype=p.dtype))
+                    matrix_count += 1
 
         return {
             "matrix_count": float(matrix_count),

@@ -32,6 +32,7 @@ class SparseMoESwiGLU(nn.Module):
         expert_intermediate=0,
         shared_intermediate=0,
         capacity_factor=1.25,
+        capacity_tokens=0,
         aux_loss_weight=0.01,
         bias=False,
         multiple_of=128,
@@ -58,6 +59,9 @@ class SparseMoESwiGLU(nn.Module):
         self.expert_intermediate = expert_intermediate
         self.shared_intermediate = shared_intermediate
         self.capacity_factor = float(capacity_factor)
+        self.capacity_tokens = int(capacity_tokens)
+        if self.capacity_tokens < 0:
+            raise ValueError("capacity_tokens must be non-negative")
         self.aux_loss_weight = float(aux_loss_weight)
 
         # [E, 2I, D] and [E, D, I] are consumed as one grouped GEMM via
@@ -170,7 +174,10 @@ class SparseMoESwiGLU(nn.Module):
         # device-dependent capacity from ``active_count`` would change tensor
         # shapes and make CUDA graph capture unsafe; the bounded allocation is
         # the same fixed-capacity contract used by the TE grouped router.
-        capacity = max(1, int(math.ceil(self.capacity_factor * n_tokens / self.num_experts)))
+        capacity_tokens = max(n_tokens, self.capacity_tokens)
+        capacity = max(
+            1, int(math.ceil(self.capacity_factor * capacity_tokens / self.num_experts))
+        )
         # Keep the same fixed capacity in training and evaluation.  Using a
         # larger inference-only capacity changes which tokens overflow, the
         # amount of expert compute, and the decoded function being evaluated.

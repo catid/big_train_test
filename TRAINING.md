@@ -27,6 +27,16 @@ still performs a host shape read. DDP capture uses a dedicated stream and
 averages a flat gradient buffer after replay because DDP's runtime logger is not
 capture-safe.
 
+The graph contract retains at most 512 learned latent rows per outer sequence.
+If routing emits more boundaries, the highest boundary probabilities are kept;
+the same effective boundary set is passed to the inner stack and dechunker.
+MSAR and Mamba activations are recomputed during backward so larger B300
+microbatches fit without changing the forward equations. MoE capacity uses the
+same latent bound in eager, prefill, and graph execution. Streaming decode
+enforces the bound monotonically: once the prefill or decode count reaches 512,
+later boundary predictions are suppressed because a stream cannot
+retroactively replace an earlier boundary with a higher-scoring one.
+
 The looped attention executions share the layer KV slot and rewrite it on each
 refinement; weights are shared across both executions. FBT training uses fresh
 caches and fixed chunk boundaries, as required by its multipass objective. The
@@ -56,10 +66,13 @@ selects a measured draw against the approximately 1000 W per-B300 target. If
 every candidate remains below target, it selects the largest fully validated
 candidate and records that gap rather than pretending the target was reached;
 if every candidate is above target, it selects the smallest. Candidates are
-powers of two up to `--auto-batch-max` (default 32), bounded by a memory
-reserve for optimizer and DDP state. Calibration includes DDP synchronization,
+powers of two plus the explicit upper bound up to `--auto-batch-max` (default
+96). Calibration catches and synchronizes candidate OOMs across DDP ranks,
+includes DDP synchronization,
 gradient clipping, and the real AnchorMuon update, then restores model and
-optimizer state before measuring the next candidate.
+optimizer and module-local FP8 scaling tensors before measuring the next
+candidate; TE's global registration state remains intact. Power is aggregated
+by the maximum rank draw, so the selected batch is safe for every GPU.
 
 The run's `loss` field is the plain byte cross-entropy. The combined FBT,
 router, and MoE objective is logged separately as `objective`; `--target-ce`

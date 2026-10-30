@@ -106,7 +106,14 @@ class HNet(nn.Module):
         if not self.is_innermost:
             self.routing_module = RoutingModule(self.d_model, **factory_kwargs)
             self.chunk_layer = ChunkLayer(
-                static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None)
+                static_max_seqlen=(
+                    min(
+                        int(getattr(config, "max_seq_len", 4096)),
+                        int(getattr(config, "chunk_capacity_tokens", 1024)),
+                    )
+                    if getattr(config, "static_chunking", False)
+                    else None
+                )
             )
             self.dechunk_layer = DeChunkLayer(self.d_model)
 
@@ -342,8 +349,25 @@ class HNet(nn.Module):
             mask=mask,
             inference_params=inference_params.routing_module_state,
         )
-        hidden_states, next_cu_seqlens, next_max_seqlen, next_mask = self.chunk_layer(
-            hidden_states, bpred_output.boundary_mask, cu_seqlens, mask=mask
+        (
+            hidden_states,
+            next_cu_seqlens,
+            next_max_seqlen,
+            next_mask,
+            effective_boundary_mask,
+        ) = self.chunk_layer(
+            hidden_states,
+            bpred_output.boundary_mask,
+            cu_seqlens,
+            mask=mask,
+            boundary_prob=bpred_output.boundary_prob,
+        )
+        # Dechunking must use the same capacity-trimmed boundary set that was
+        # gathered for the inner stack.  Keep the router's original mask in
+        # ``bpred_output`` so the routing loss and diagnostics measure the
+        # learned decision rather than the static capacity overflow policy.
+        effective_selected_probs = bpred_output.boundary_prob.gather(
+            -1, effective_boundary_mask.unsqueeze(-1).to(dtype=torch.long)
         )
 
         # ChunkLayer's static path returns a left-aligned padded latent tensor
@@ -365,6 +389,10 @@ class HNet(nn.Module):
                 (1, latent_count), device=hidden_states.device, dtype=torch.bool
             )
             next_max_seqlen = None
+            if inference_params.routing_module_state.boundary_count is not None:
+                inference_params.routing_module_state.boundary_count.copy_(
+                    effective_boundary_mask.sum(dim=-1).to(dtype=torch.int32)
+                )
 
         n_passes = max(1, int(fbt_passes)) if self.fbt_enabled else 1
         # A normal one-pass prefill must populate the allocated recurrent/KV
@@ -491,14 +519,14 @@ class HNet(nn.Module):
 
             decoded = self.dechunk_layer(
                 inner_out,
-                bpred_output.boundary_mask,
+                effective_boundary_mask,
                 bpred_output.boundary_prob,
                 next_cu_seqlens,
                 mask=mask,
                 inference_params=cached_dechunk_state,
             )
             decoded = self.residual_func(
-                decoded.to(dtype=residual.dtype), residual, bpred_output.selected_probs
+                decoded.to(dtype=residual.dtype), residual, effective_selected_probs
             ).to(decoded.dtype)
             decoded = self.decoder(
                 decoded,
@@ -561,8 +589,24 @@ class HNet(nn.Module):
         bpred_output = self.routing_module.step(
             hidden_states, inference_params.routing_module_state
         )
+        # Decode must obey the same bounded latent contract as static
+        # chunking.  Once the prefill has retained the configured maximum,
+        # additional router boundaries are treated as ordinary bytes; this
+        # keeps the online function within the capacity used for training.
+        effective_boundary_mask = bpred_output.boundary_mask
+        boundary_count = inference_params.routing_module_state.boundary_count
+        if boundary_count is not None:
+            capacity = int(getattr(self.config, "chunk_capacity_tokens", 0))
+            if capacity > 0:
+                effective_boundary_mask = effective_boundary_mask & (
+                    boundary_count < capacity
+                )
+                boundary_count.add_(effective_boundary_mask.to(dtype=boundary_count.dtype))
+        effective_selected_probs = bpred_output.boundary_prob.gather(
+            -1, effective_boundary_mask.unsqueeze(-1).to(dtype=torch.long)
+        )
         hidden_states_inner = self.chunk_layer.step(
-            hidden_states, bpred_output.boundary_mask
+            hidden_states, effective_boundary_mask
         )
 
         if hidden_states_inner.shape[0] > 0:
@@ -578,7 +622,7 @@ class HNet(nn.Module):
                 # routing selects a latent boundary.  Keeping this at the
                 # chunk level is essential: the training pass does not feed
                 # the decoded byte stream back into the encoder/router.
-                active_rows = bpred_output.boundary_mask.nonzero(as_tuple=True)[0]
+                active_rows = effective_boundary_mask.nonzero(as_tuple=True)[0]
                 previous = inference_params.feedback_hidden_state.index_select(
                     0, active_rows
                 ).unsqueeze(1)
@@ -617,13 +661,13 @@ class HNet(nn.Module):
 
         hidden_states = self.dechunk_layer.step(
             hidden_states_inner,
-            bpred_output.boundary_mask,
+            effective_boundary_mask,
             bpred_output.boundary_prob,
             inference_params.dechunk_state,
         )
 
         hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, bpred_output.selected_probs
+            hidden_states.to(dtype=residual.dtype), residual, effective_selected_probs
         ).to(hidden_states.dtype)
 
         hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)

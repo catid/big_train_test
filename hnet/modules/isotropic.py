@@ -9,6 +9,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 
 from flash_attn.ops.triton.layer_norm import RMSNorm
 
@@ -81,6 +82,12 @@ class Isotropic(nn.Module):
         self.msar_enabled = bool(
             getattr(config, "msar", False)
             and stage_idx == len(config.d_model) - 1
+        )
+        self.msar_checkpointing = bool(
+            getattr(config, "msar_activation_checkpointing", False)
+        )
+        self.mamba_checkpointing = bool(
+            getattr(config, "mamba_activation_checkpointing", False)
         )
         self.msar_kernels = tuple(getattr(config, "msar_stream_kernels", [1, 4, 8, 12]))
         self.msar_block_size = int(getattr(config, "msar_block_size", 4))
@@ -188,65 +195,127 @@ class Isotropic(nn.Module):
                  seq_idx[:, lag:] == seq_idx[:, :-lag]),
                 dim=1,
             )
-            y = y + shifted * same_doc.unsqueeze(-1).to(dtype=x.dtype) * weight[:, kernel - 1 - lag].to(dtype=x.dtype)
+            # Accumulate in-place after masking and scaling the temporary
+            # shift.  The previous expression materialized two additional
+            # [tokens, d_model] tensors per lag; at the full 16-sample batch
+            # that transient peak was enough to exhaust a 275-GiB B300.
+            shifted.mul_(same_doc.unsqueeze(-1).to(dtype=x.dtype))
+            shifted.mul_(weight[:, kernel - 1 - lag].to(dtype=x.dtype))
+            y.add_(shifted)
         return y.squeeze(0) if original_2d else y
 
     def _msar_mix(self, sources, layer_idx, cu_seqlens=None):
-        # For the regular padded path, fold the source dimension into the
-        # channel dimension and run one grouped depthwise convolution per
-        # kernel.  The prior source-by-source loop launched N*M convolutions
-        # for every layer; this keeps the exact causal padding while reducing
-        # launch overhead and remains static-shape friendly.  Packed streams
-        # retain the per-document reset path below because each cu_seqlens
-        # segment must be padded independently.
-        if cu_seqlens is None and sources and sources[0].dim() == 3:
-            base = torch.stack(sources, dim=0)  # [N,B,L,D]
-            n_sources, batch, seqlen, d_model = base.shape
-            # Fold sources into the convolution batch, rather than channels;
-            # the existing [D,1,K] depthwise weights can then be reused with
-            # no expanded/copy-on-write N*D kernel bank.
-            grouped_input = base.permute(0, 1, 3, 2).reshape(
-                n_sources * batch, d_model, seqlen
-            )
-            streams = [base]
-            for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
-                weight = self.msar_conv[kernel_idx].to(dtype=grouped_input.dtype).unsqueeze(1)
-                expanded = F.conv1d(
-                    F.pad(grouped_input, (kernel - 1, 0)),
-                    weight,
-                    groups=d_model,
-                )
-                expanded = expanded.transpose(1, 2).reshape(
-                    n_sources, batch, seqlen, d_model
-                )
-                streams.append(expanded)
-            stream_sources = torch.stack(streams, dim=1)  # [N,m,B,L,D]
-        else:
-            expanded = []
-            for source in sources:
-                streams = [source]
-                for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
-                    streams.append(
-                        self._msar_expand(
-                            source, kernel, self.msar_conv[kernel_idx], cu_seqlens
-                        )
-                    )
-                expanded.append(torch.stack(streams, dim=0))
-            stream_sources = torch.stack(expanded, dim=0)  # [N,m,...,D]
-        normed = stream_sources.float() * torch.rsqrt(
-            stream_sources.float().square().mean(dim=-1, keepdim=True).add(1e-6)
-        )
+        # Build and reduce one source at a time.  The former implementation
+        # stacked every source and every kernel stream before normalization,
+        # which briefly kept both BF16 and FP32 copies of a full [sources,
+        # streams, batch, length, width] activation bank.  Keeping per-source
+        # stream lists preserves the exact MSAR equations while removing that
+        # peak allocation and making larger microbatches feasible.
+        source_streams = []
+        source_scores = []
         query = self.msar_queries[layer_idx].float()
-        scores = torch.einsum("sm...d,md->sm...", normed, query) / (self.d_model**0.5)
-        weights = torch.softmax(scores, dim=0)
-        retrieved = (weights.unsqueeze(-1) * stream_sources).sum(dim=0)
-        retrieved_last = retrieved.movedim(0, -2)
-        flat = retrieved_last.reshape(*retrieved.shape[1:-1], -1)
-        mix = torch.sigmoid(
-            flat.float() @ self.msar_pre[layer_idx].float() + self.msar_bias[layer_idx].float()
+        for source in sources:
+            streams = [source]
+            for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                streams.append(
+                    self._msar_expand(
+                        source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+                    )
+                )
+            scores = []
+            for stream, stream_query in zip(streams, query, strict=True):
+                stream_f = stream.float()
+                normed = stream_f * torch.rsqrt(
+                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
+                )
+                scores.append(
+                    torch.einsum("...d,d->...", normed, stream_query)
+                    / (self.d_model**0.5)
+                )
+            source_streams.append(streams)
+            source_scores.append(torch.stack(scores, dim=0))
+        weights = torch.softmax(torch.stack(source_scores, dim=0), dim=0)
+        retrieved_streams = []
+        for stream_index in range(len(self.msar_kernels)):
+            retrieved_streams.append(
+                sum(
+                    weights[source_index, stream_index].unsqueeze(-1)
+                    * source_streams[source_index][stream_index]
+                    for source_index in range(len(source_streams))
+                )
+            )
+        # Apply the MSAR pre-projection one stream at a time. Concatenating
+        # all streams into [batch, length, streams*width] creates a large
+        # transient copy; splitting the learned matrix gives the identical
+        # result without that allocation.
+        pre = self.msar_pre[layer_idx].float().view(
+            len(self.msar_kernels), self.d_model, len(self.msar_kernels)
         )
-        fused = (mix.unsqueeze(-1) * retrieved_last).sum(dim=-2)
+        mix_logits = self.msar_bias[layer_idx].float()
+        for stream_index, stream in enumerate(retrieved_streams):
+            mix_logits = mix_logits + stream.float() @ pre[stream_index]
+        mix = torch.sigmoid(mix_logits)
+        # Accumulate each MSAR stream in-place.  Materializing the full
+        # ``mix[..., None] * retrieved_last`` product doubles the largest
+        # [batch, length, streams, width] activation and was the final memory
+        # cliff for the high-throughput graph batch.
+        fused = torch.zeros_like(retrieved_streams[0])
+        for stream_index, stream in enumerate(retrieved_streams):
+            fused.addcmul_(
+                mix[..., stream_index].unsqueeze(-1),
+                stream,
+            )
         return fused.to(sources[-1].dtype)
+
+    def _msar_mix_recompute(self, sources, layer_idx, cu_seqlens=None):
+        """Run MSAR with backward recomputation to bound activation memory."""
+        if not self.training or not self.msar_checkpointing:
+            return self._msar_mix(sources, layer_idx, cu_seqlens=cu_seqlens)
+
+        def run(*source_tensors):
+            return self._msar_mix(
+                list(source_tensors), layer_idx, cu_seqlens=cu_seqlens
+            )
+
+        return activation_checkpoint(
+            run, *sources, use_reentrant=False, preserve_rng_state=False
+        )
+
+    def _run_mamba_block(
+        self,
+        layer,
+        hidden_states,
+        residual,
+        *,
+        inference_params,
+        mixer_kwargs,
+        active_mask,
+    ):
+        def run(h, r=None):
+            return layer(
+                h,
+                r,
+                inference_params=inference_params,
+                mixer_kwargs=mixer_kwargs,
+                active_mask=active_mask,
+            )
+
+        if self.training and self.mamba_checkpointing and inference_params is None:
+            if residual is None:
+                return activation_checkpoint(
+                    lambda h: run(h, None),
+                    hidden_states,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            return activation_checkpoint(
+                run,
+                hidden_states,
+                residual,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        return run(hidden_states, residual)
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         """
@@ -482,7 +551,7 @@ class Isotropic(nn.Module):
                     msar_sources = [hidden_states]
                     msar_stream_outputs = [hidden_states]
                     for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
-                        layer_input = self._msar_mix(
+                        layer_input = self._msar_mix_recompute(
                             msar_sources + [msar_state], layer_idx,
                             cu_seqlens=cu_seqlens if packed else None,
                         )
@@ -494,16 +563,23 @@ class Isotropic(nn.Module):
                         # restore the block's parameter dtype before its fused
                         # mixer projection.
                         layer_input = layer_input.to(dtype=layer.norm1.weight.dtype)
-                        msar_out, msar_residual = layer(
-                            layer_input,
-                            None,
-                            inference_params=inference_params,
-                            mixer_kwargs=(
-                                ssm_mixer_kwargs if arch in ("m", "M")
-                                else attn_mixer_kwargs
-                            ),
-                            active_mask=mask,
-                        )
+                        if arch in ("m", "M"):
+                            msar_out, msar_residual = self._run_mamba_block(
+                                layer,
+                                layer_input,
+                                None,
+                                inference_params=inference_params,
+                                mixer_kwargs=ssm_mixer_kwargs,
+                                active_mask=mask,
+                            )
+                        else:
+                            msar_out, msar_residual = layer(
+                                layer_input,
+                                None,
+                                inference_params=inference_params,
+                                mixer_kwargs=attn_mixer_kwargs,
+                                active_mask=mask,
+                            )
                         if mask is not None:
                             active_dtype = active.to(msar_out.dtype)
                             msar_out = msar_out * active_dtype
@@ -553,13 +629,23 @@ class Isotropic(nn.Module):
                     else:
                         # Currently supporting only Mamba2 and MHA
                         raise NotImplementedError
-                    hidden_states, residual = layer(
-                        hidden_states,
-                        residual,
-                        inference_params=inference_params,
-                        mixer_kwargs=layer_mixer_kwargs,
-                        active_mask=mask,
-                    )
+                    if arch in ("m", "M"):
+                        hidden_states, residual = self._run_mamba_block(
+                            layer,
+                            hidden_states,
+                            residual,
+                            inference_params=inference_params,
+                            mixer_kwargs=layer_mixer_kwargs,
+                            active_mask=mask,
+                        )
+                    else:
+                        hidden_states, residual = layer(
+                            hidden_states,
+                            residual,
+                            inference_params=inference_params,
+                            mixer_kwargs=layer_mixer_kwargs,
+                            active_mask=mask,
+                        )
                     if mask is not None:
                         active_dtype = active.to(hidden_states.dtype)
                         hidden_states = hidden_states * active_dtype
@@ -612,7 +698,10 @@ class Isotropic(nn.Module):
                     layer_input = self._msar_mix_step(
                         source_currents, history, layer_idx, history_indices
                     )
-                    block_input = layer_input.unsqueeze(1)
+                    # MSAR retrieval performs its normalization and mixing in
+                    # FP32.  Restore the block's parameter dtype before the
+                    # TE projection, matching the training/prefill path.
+                    block_input = layer_input.to(dtype=layer.norm1.weight.dtype).unsqueeze(1)
                     # Decode must use the same TE FP8 projection path as
                     # cached prefill; otherwise generation silently switches
                     # to BF16 while training/prefill use delayed-scaling FP8.

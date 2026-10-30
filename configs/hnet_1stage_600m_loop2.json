@@ -27,11 +27,15 @@
     "fbt_jitter": 0.02,
     "max_seq_len": 4096,
     "static_chunking": true,
+    "chunk_capacity_tokens": 512,
+    "msar_activation_checkpointing": true,
+    "mamba_activation_checkpointing": true,
     "moe_enabled": true,
     "moe_num_experts": 8,
     "moe_top_k": 1,
     "moe_expert_intermediate": 512,
     "moe_shared_intermediate": 256,
     "moe_capacity_factor": 1.25,
+    "moe_capacity_tokens": 512,
     "moe_aux_loss_weight": 0.01
 }

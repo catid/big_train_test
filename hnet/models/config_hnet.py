@@ -52,6 +52,15 @@ class HNetConfig:
     fbt_prefix_mixin: bool = True
     max_seq_len: int = 4096
     static_chunking: bool = True
+    # Maximum number of learned latent boundaries retained by one chunking
+    # stage.  The tensor remains statically sized for CUDA graphs; when the
+    # router emits more boundaries, its highest-probability boundaries win.
+    chunk_capacity_tokens: int = 512
+    # Recompute MSAR retrieval during backward. MSAR is the largest retained
+    # activation bank in the 600M model; this bounds memory without changing
+    # its forward function.
+    msar_activation_checkpointing: bool = True
+    mamba_activation_checkpointing: bool = True
     # Required DeepSeek/Mixtral-style sparse FFN. Eight routed experts with
     # top-1 dispatch give the requested 1:8 active expert sparsity. The shared
     # expert is always evaluated; a disabled dense FFN path is unsupported.
@@ -61,6 +70,10 @@ class HNetConfig:
     moe_expert_intermediate: int = 0
     moe_shared_intermediate: int = 0
     moe_capacity_factor: float = 1.25
+    # Fixed token bound used to size routed expert capacity.  Keeping this
+    # independent of the currently packed token count makes eager, cached
+    # prefill, and CUDA-graph execution use identical overflow semantics.
+    moe_capacity_tokens: int = 0
     moe_aux_loss_weight: float = 0.01
 
     def validate_canonical(self) -> None:
@@ -76,6 +89,12 @@ class HNetConfig:
             raise ValueError("the canonical model requires a 128-token SWA window and two inner loops")
         if not (self.msar and self.fbt and self.static_chunking and self.fbt_passes == 2):
             raise ValueError("the canonical model requires MSAR, two-pass FBT, and static chunking")
+        if int(self.chunk_capacity_tokens) != 512:
+            raise ValueError("the canonical model requires a 512-token latent chunk capacity")
+        if not self.msar_activation_checkpointing:
+            raise ValueError("the canonical model requires MSAR activation checkpointing")
+        if not self.mamba_activation_checkpointing:
+            raise ValueError("the canonical model requires Mamba activation checkpointing")
         if not (self.moe_enabled and self.moe_num_experts == 8 and self.moe_top_k == 1):
             raise ValueError("the canonical model requires top-1 8-way sparse MoE")
         if not self.attn_cfg.vha_enabled or self.attn_cfg.num_kv_heads != [2, 2]:
@@ -92,8 +111,10 @@ class HNetConfig:
             int(self.moe_expert_intermediate) != 512
             or int(self.moe_shared_intermediate) != 256
             or float(self.moe_capacity_factor) != 1.25
+            or int(self.moe_capacity_tokens)
+            != min(int(self.max_seq_len), int(self.chunk_capacity_tokens))
         ):
             raise ValueError(
                 "the canonical model requires 512-wide routed experts, a 256-wide shared "
-                "expert, and capacity_factor=1.25"
+                "expert, capacity_factor=1.25, and capacity sized to the latent chunk bound"
             )
