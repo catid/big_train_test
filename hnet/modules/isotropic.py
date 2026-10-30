@@ -36,6 +36,10 @@ class IsotropicInferenceParams:
     # ``max_kernel - 1`` states; the current token is supplied separately to
     # the MSAR mixer and appended after the layer boundary is produced.
     msar_history: Optional[list[list[torch.Tensor]]] = None
+    # Accepted top-1 routed-token counts, indexed by recurrent loop, layer,
+    # cached batch row, and expert. Decode continues these counts so overflow
+    # decisions match the prefill/training capacity contract.
+    moe_route_counts: Optional[torch.Tensor] = None
 
     def reset(self, max_seqlen, max_batch_size):
         self.max_seqlen = max_seqlen
@@ -43,6 +47,8 @@ class IsotropicInferenceParams:
         self.seqlen_offset = 0
         if self.lengths_per_sample is not None:
             self.lengths_per_sample.zero_()
+        if self.moe_route_counts is not None:
+            self.moe_route_counts.zero_()
 
         optree.tree_map(
             lambda x: x.zero_() if isinstance(x, torch.Tensor) else x,
@@ -92,6 +98,9 @@ class Isotropic(nn.Module):
         self.msar_kernels = tuple(getattr(config, "msar_stream_kernels", [1, 4, 8, 12]))
         self.msar_block_size = int(getattr(config, "msar_block_size", 4))
         self.d_model = config.d_model[self.stage_idx]
+        self.moe_num_experts = int(getattr(config, "moe_num_experts", 0)) if bool(
+            getattr(config, "moe_enabled", False)
+        ) else 0
         self.ssm_cfg = get_stage_cfg(config.ssm_cfg, stage_idx)
         self.attn_cfg = get_stage_cfg(config.attn_cfg, stage_idx)
 
@@ -355,11 +364,22 @@ class Isotropic(nn.Module):
                 ]
                 for _ in range(self.loop_count)
             ]
+        moe_route_counts = None
+        if self.moe_num_experts > 0:
+            moe_route_counts = torch.zeros(
+                self.loop_count,
+                len(self.layers),
+                batch_size,
+                self.moe_num_experts,
+                device=cache_device,
+                dtype=torch.int32,
+            )
         return IsotropicInferenceParams(
             key_value_memory_dict=key_value_memory_dict,
             max_seqlen=max_seqlen,
             max_batch_size=batch_size,
             msar_history=msar_history,
+            moe_route_counts=moe_route_counts,
         )
 
     @staticmethod
@@ -533,6 +553,33 @@ class Isotropic(nn.Module):
             )
             packed = True
 
+        # Sparse MoE capacity is enforced independently for each packed
+        # document.  Padded graph execution derives sequence rows directly
+        # from the rank-3 activation shape; packed execution carries the
+        # document id alongside the flattened latent stream.
+        moe_sequence_ids = None
+        if packed:
+            moe_sequence_ids = get_seq_idx(
+                cu_seqlens,
+                device=hidden_states.device,
+                total_length=(
+                    hidden_states.shape[0]
+                    if hidden_states.dim() == 2
+                    else hidden_states.shape[1]
+                ),
+            )[0]
+        moe_route_counts = (
+            inference_params.moe_route_counts
+            if inference_params is not None
+            else None
+        )
+        if inference_params is not None and inference_params.seqlen_offset == 0:
+            # Prefill owns the initial routed-token history. Reset once before
+            # the recurrent loop so every layer/loop records its own accepted
+            # routes; decode then continues these counters.
+            if moe_route_counts is not None:
+                moe_route_counts.zero_()
+
         if self.loop_count > 1 and inference_params is not None and any(
             arch in ("m", "M") for arch in self.arch_full
         ):
@@ -579,6 +626,10 @@ class Isotropic(nn.Module):
                                 inference_params=inference_params,
                                 mixer_kwargs=attn_mixer_kwargs,
                                 active_mask=mask,
+                                moe_sequence_ids=moe_sequence_ids,
+                                moe_route_counts=moe_route_counts,
+                                moe_loop_idx=_loop_idx,
+                                moe_layer_idx=layer_idx,
                             )
                         if mask is not None:
                             active_dtype = active.to(msar_out.dtype)
@@ -611,7 +662,7 @@ class Isotropic(nn.Module):
                 # loop-indexed cache slot so each recurrent depth has exact
                 # autoregressive context; rotary offsets advance once per token,
                 # after all loops finish.
-                for layer, arch in zip(self.layers, self.arch_full):
+                for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
                     # Dechunk/residual paths may promote activations to FP32;
                     # fused Mamba/FlashAttention projections are BF16 in the
                     # production model.
@@ -645,6 +696,10 @@ class Isotropic(nn.Module):
                             inference_params=inference_params,
                             mixer_kwargs=layer_mixer_kwargs,
                             active_mask=mask,
+                            moe_sequence_ids=moe_sequence_ids,
+                            moe_route_counts=moe_route_counts,
+                            moe_loop_idx=_loop_idx,
+                            moe_layer_idx=layer_idx,
                         )
                     if mask is not None:
                         active_dtype = active.to(hidden_states.dtype)
@@ -675,7 +730,7 @@ class Isotropic(nn.Module):
 
         return hidden_states
 
-    def step(self, hidden_states, inference_params):
+    def step(self, hidden_states, inference_params, moe_sequence_ids=None):
         """
         Assumes hidden_states is (B, 1, D). Steps each of the layers in order, and then steps the main model.
         """
@@ -710,6 +765,10 @@ class Isotropic(nn.Module):
                             block_input,
                             inference_params,
                             residual=None,
+                            moe_sequence_ids=moe_sequence_ids,
+                            moe_route_counts=inference_params.moe_route_counts,
+                            moe_loop_idx=loop_idx,
+                            moe_layer_idx=layer_idx,
                         )
                     raw_state = block_out[:, 0]
                     if block_residual is not None:
@@ -750,11 +809,17 @@ class Isotropic(nn.Module):
             )
         for _loop_idx in range(self.loop_count):
             residual = None
-            for layer in self.layers:
+            for layer_idx, layer in enumerate(self.layers):
                 hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
                 with fp8_context():
                     hidden_states, residual = layer.step(
-                        hidden_states, inference_params, residual=residual
+                        hidden_states,
+                        inference_params,
+                        residual=residual,
+                        moe_sequence_ids=moe_sequence_ids,
+                        moe_route_counts=inference_params.moe_route_counts,
+                        moe_loop_idx=_loop_idx,
+                        moe_layer_idx=layer_idx,
                     )
             hidden_states = self.rmsnorm(
                 hidden_states, residual=residual, prenorm=False, residual_in_fp32=True

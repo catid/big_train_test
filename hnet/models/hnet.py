@@ -562,8 +562,19 @@ class HNet(nn.Module):
             return hidden_states, result, feedback_logits
         return hidden_states, result
 
-    def step(self, hidden_states, inference_params):
+    def step(self, hidden_states, inference_params, moe_sequence_ids=None):
         D = hidden_states.shape[-1]
+
+        if moe_sequence_ids is None:
+            moe_sequence_ids = torch.arange(
+                hidden_states.shape[0], device=hidden_states.device, dtype=torch.long
+            )
+        else:
+            moe_sequence_ids = moe_sequence_ids.reshape(-1).to(
+                device=hidden_states.device, dtype=torch.long
+            )
+            if moe_sequence_ids.numel() != hidden_states.shape[0]:
+                raise ValueError("MoE sequence ids must match H-Net step batch rows")
 
         if self.pad_dimension is not None:
             hidden_states = torch.cat(
@@ -576,7 +587,9 @@ class HNet(nn.Module):
 
         if self.is_innermost:
             hidden_states = self.main_network.step(
-                hidden_states, inference_params.main_network_state
+                hidden_states,
+                inference_params.main_network_state,
+                moe_sequence_ids=moe_sequence_ids,
             )
             hidden_states = hidden_states[..., :D]
             return hidden_states, []
@@ -611,6 +624,8 @@ class HNet(nn.Module):
         )
 
         if hidden_states_inner.shape[0] > 0:
+            active_rows = effective_boundary_mask.nonzero(as_tuple=True)[0]
+            inner_sequence_ids = moe_sequence_ids.index_select(0, active_rows)
             if self.fbt_enabled:
                 if (
                     inference_params.feedback_hidden_state is None
@@ -645,7 +660,9 @@ class HNet(nn.Module):
                     initialized, fused, hidden_states_inner
                 )
             hidden_states_inner, prev_boundary_predictions = self.main_network.step(
-                hidden_states_inner, inference_params.main_network_state
+                hidden_states_inner,
+                inference_params.main_network_state,
+                moe_sequence_ids=inner_sequence_ids,
             )
             if self.fbt_enabled:
                 # Store the new top-layer latent only for streams that emitted

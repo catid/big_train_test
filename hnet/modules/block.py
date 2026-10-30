@@ -124,6 +124,10 @@ class Block(nn.Module):
         inference_params=None,
         mixer_kwargs=None,
         active_mask=None,
+        moe_sequence_ids=None,
+        moe_route_counts=None,
+        moe_loop_idx=0,
+        moe_layer_idx=0,
     ):
         hidden_states, residual = self.norm1(
             hidden_states,
@@ -145,7 +149,14 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
             )
-            hidden_states = self.mlp(hidden_states, active_mask=active_mask)
+            hidden_states = self.mlp(
+                hidden_states,
+                active_mask=active_mask,
+                sequence_ids=moe_sequence_ids,
+                route_counts=moe_route_counts,
+                loop_idx=moe_loop_idx,
+                layer_idx=moe_layer_idx,
+            )
 
         return hidden_states, residual
 
@@ -154,7 +165,16 @@ class Block(nn.Module):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def step(self, hidden_states, inference_params, residual=None):
+    def step(
+        self,
+        hidden_states,
+        inference_params,
+        residual=None,
+        moe_sequence_ids=None,
+        moe_route_counts=None,
+        moe_loop_idx=0,
+        moe_layer_idx=0,
+    ):
         hidden_states, residual = self.norm1(
             hidden_states,
             residual=residual,
@@ -169,6 +189,13 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(
+                hidden_states,
+                sequence_ids=moe_sequence_ids,
+                route_counts=moe_route_counts,
+                loop_idx=moe_loop_idx,
+                layer_idx=moe_layer_idx,
+                decode=True,
+            )
 
         return hidden_states, residual

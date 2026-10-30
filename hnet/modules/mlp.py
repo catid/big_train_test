@@ -126,7 +126,16 @@ class SparseMoESwiGLU(nn.Module):
         y = self.shared_fc2(y)
         return y * torch.sigmoid(self.shared_gate(x).float()).to(y.dtype)
 
-    def forward(self, x, active_mask=None):
+    def forward(
+        self,
+        x,
+        active_mask=None,
+        sequence_ids=None,
+        route_counts=None,
+        loop_idx=0,
+        layer_idx=0,
+        decode=False,
+    ):
         shape = x.shape
         flat = x.reshape(-1, self.d_model)
         if active_mask is None:
@@ -138,6 +147,20 @@ class SparseMoESwiGLU(nn.Module):
                     f"FFN input {tuple(x.shape[:-1])}"
                 )
             active = active_mask.reshape(-1).to(dtype=torch.bool)
+        if decode and route_counts is None:
+            raise ValueError("MoE decode requires persistent route counters")
+        if decode and sequence_ids is None:
+            raise ValueError("MoE decode requires one source sequence id per token")
+        if route_counts is not None:
+            if route_counts.ndim != 4 or route_counts.shape[-1] != self.num_experts:
+                raise ValueError(
+                    "MoE route counters must have shape "
+                    f"(loops, layers, batch, {self.num_experts})"
+                )
+            if not (0 <= int(loop_idx) < route_counts.shape[0]):
+                raise IndexError(f"MoE loop index {loop_idx} is outside route counter state")
+            if not (0 <= int(layer_idx) < route_counts.shape[1]):
+                raise IndexError(f"MoE layer index {layer_idx} is outside route counter state")
         logits = self.router(flat)
         probs = torch.softmax(logits.float(), dim=-1)
         _, expert_idx = probs.max(dim=-1)
@@ -168,16 +191,49 @@ class SparseMoESwiGLU(nn.Module):
         # synchronize the host and make CUDA graph replay unsafe. Here the
         # output row count is the static Python value E * capacity.
         n_tokens = flat.shape[0]
-        # Keep the capacity derived from the static graph bound.  The active
-        # mask still removes padding from the cumsum below, so inactive rows
-        # cannot consume slots or displace real tokens.  Computing a smaller
-        # device-dependent capacity from ``active_count`` would change tensor
-        # shapes and make CUDA graph capture unsafe; the bounded allocation is
-        # the same fixed-capacity contract used by the TE grouped router.
-        capacity_tokens = max(n_tokens, self.capacity_tokens)
-        capacity = max(
+        # Capacity is per sequence, rather than one cumsum over a flattened
+        # microbatch.  A global cumsum makes row 0 consume all expert slots
+        # before row 1 is considered and changes the function with batch size.
+        # The canonical latent bound is static, so each sequence receives the
+        # same fixed number of slots and grouped GEMM keeps one static block per
+        # (expert, sequence) while remaining CUDA-graph safe.
+        if x.dim() >= 3 and not decode:
+            num_sequences = x.shape[0]
+            tokens_per_sequence = x.shape[1]
+            sequence_ids_flat = torch.arange(
+                num_sequences, device=flat.device, dtype=torch.long
+            ).repeat_interleave(tokens_per_sequence)
+        elif sequence_ids is None:
+            num_sequences = 1
+            tokens_per_sequence = n_tokens
+            sequence_ids_flat = torch.zeros(
+                n_tokens, device=flat.device, dtype=torch.long
+            )
+        else:
+            sequence_ids_flat = sequence_ids.reshape(-1).to(
+                device=flat.device, dtype=torch.long
+            )
+            if sequence_ids_flat.numel() != n_tokens:
+                raise ValueError(
+                    "MoE sequence_ids must contain one id per flattened token"
+                )
+            # Packed sequence ids are contiguous and sorted by construction.
+            # This host read is restricted to eager varlen paths; graph replay
+            # always uses the rank-3 padded path above.
+            if decode:
+                # Decode receives only rows that emitted a boundary. Keep the
+                # grouped-GEMM capacity based on the full cached batch so its
+                # shape is invariant when a different subset emits a boundary
+                # on the next token.
+                num_sequences = int(route_counts.shape[-2])
+            else:
+                num_sequences = int(sequence_ids_flat[-1].item()) + 1 if n_tokens else 1
+            tokens_per_sequence = None
+        capacity_tokens = max(1, self.capacity_tokens)
+        row_capacity = max(
             1, int(math.ceil(self.capacity_factor * capacity_tokens / self.num_experts))
         )
+        capacity = row_capacity * num_sequences
         # Keep the same fixed capacity in training and evaluation.  Using a
         # larger inference-only capacity changes which tokens overflow, the
         # amount of expert compute, and the decoded function being evaluated.
@@ -185,12 +241,66 @@ class SparseMoESwiGLU(nn.Module):
         # checkpointed model semantics identical across train/eval.
         # Count only active rows. Inactive static-chunk padding receives a
         # zero route and is omitted from the fused map.
-        positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
-        token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
-        valid = (token_pos < capacity) & active
+        if decode:
+            # Decode starts at the count accumulated by prefill and previous
+            # decode calls. The selected rows map back to original cache rows
+            # through ``sequence_ids_flat``.
+            route_state = route_counts[loop_idx, layer_idx]
+            if sequence_ids_flat.numel():
+                # IDs are produced by HNet's boundary mask and are therefore
+                # within the allocated cache batch. Avoid data-dependent host
+                # checks here so CUDA graph replay remains capture-safe.
+                prior_positions = route_state.index_select(0, sequence_ids_flat)
+            else:
+                prior_positions = route_state.new_empty((0, self.num_experts))
+            token_pos = prior_positions.gather(1, expert_idx[:, None]).squeeze(1)
+            valid = (token_pos < row_capacity) & active
+        elif tokens_per_sequence is not None:
+            positions = torch.cumsum(
+                active_one_hot.reshape(num_sequences, tokens_per_sequence, self.num_experts),
+                dim=1,
+            ).reshape(-1, self.num_experts) - 1
+            token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
+            valid = (token_pos < row_capacity) & active
+        else:
+            # Packed rows are grouped by sequence. Compute each sequence's
+            # local expert rank without a Python loop; sequence_ids are sorted,
+            # so subtracting the global count at each document start resets the
+            # cumsum for every document.
+            global_positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
+            starts = torch.ones(n_tokens, device=flat.device, dtype=torch.bool)
+            if n_tokens > 1:
+                starts[1:] = sequence_ids_flat[1:] != sequence_ids_flat[:-1]
+            start_idx = starts.nonzero(as_tuple=True)[0]
+            start_ids = sequence_ids_flat.index_select(0, start_idx)
+            start_values = global_positions.index_select(0, start_idx).to(torch.int32)
+            offsets = torch.zeros(
+                (num_sequences, self.num_experts),
+                device=flat.device,
+                dtype=torch.int32,
+            )
+            offsets.index_copy_(0, start_ids, start_values)
+            positions = global_positions - offsets.index_select(0, sequence_ids_flat)
+            token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
+            valid = (token_pos < row_capacity) & active
         routing_map = F.one_hot(expert_idx, self.num_experts).to(torch.int32)
         routing_map = routing_map * valid[:, None].to(torch.int32)
         routing_probs = probs * routing_map.to(probs.dtype)
+        if route_counts is not None:
+            route_state = route_counts[loop_idx, layer_idx]
+            if decode:
+                # Count only accepted top-1 routes. Overflow and inactive
+                # rows remain on the shared path and consume no future slot.
+                route_state.index_add_(0, sequence_ids_flat, routing_map)
+            elif tokens_per_sequence is not None:
+                accepted_counts = routing_map.reshape(
+                    num_sequences, tokens_per_sequence, self.num_experts
+                ).sum(dim=1)
+                route_state[:num_sequences].copy_(accepted_counts)
+            else:
+                accepted_counts = route_state.new_zeros((num_sequences, self.num_experts))
+                accepted_counts.index_add_(0, sequence_ids_flat, routing_map)
+                route_state[:num_sequences].copy_(accepted_counts)
         # ``permute_mask_map_fwd`` first packs routed rows by their actual
         # expert counts.  GroupedLinear, however, receives fixed ``capacity``
         # rows per expert.  Shift each expert's packed segment into its own

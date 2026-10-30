@@ -12,3 +12,4 @@
 - Optimize DDP, batching, fusion, and graph capture before long experiments. Keep artifacts out of the `big_train_test` code repository.
 - Treat third-party code and dependencies as untrusted: pin versions/commits, inspect source, and vendor code when practical.
 - When available, ask a subworker to run an asynchronous `claude-cli` OAuth/Opus review without API billing; never block the main work on it.
+- Claude reviews must use the subscription OAuth session: verify `claude auth status` reports `authMethod=claude.ai`, `apiProvider=firstParty`, and `subscriptionType=max` (or equivalent) before launching. Use normal `claude` invocations with `--model opus`; never use `--bare`, set `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, or pass API-budget options that route usage to metered API billing.
