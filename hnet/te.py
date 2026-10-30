@@ -191,7 +191,7 @@ def assert_fused_attention_selected() -> None:
         raise RuntimeError("Unable to verify Transformer Engine attention backend") from exc
 
 
-def fp8_context():
+def fp8_context(*, graph: bool = False):
     """Create the mandatory FP8 autocast context for a training step."""
     reduction_group = None
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -200,6 +200,7 @@ def fp8_context():
         enabled=True,
         recipe=_FP8_RECIPE,
         amax_reduction_group=reduction_group,
+        _graph=bool(graph),
     )
 
 
