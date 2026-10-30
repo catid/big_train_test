@@ -13,10 +13,12 @@ import argparse
 import contextlib
 import dataclasses
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -153,6 +155,57 @@ def _config_dict(cfg):
     return cfg
 
 
+def _dependency_provenance() -> dict:
+    """Record the installed Python environment used by a checkpoint.
+
+    Binary hashes below identify the loaded CUDA extensions, but the Python
+    distribution metadata also matters: a different FlashAttention, Mamba, or
+    causal-conv wrapper can select a different ABI or call convention while
+    leaving the extension filename unchanged.  Keep the complete normalized
+    ``pip freeze`` text and a digest of each required distribution's METADATA.
+    The source-built packages do not expose authoritative source commits in
+    this environment, so this records only metadata that is actually present.
+    """
+    try:
+        freeze = subprocess.check_output(
+            [sys.executable, "-m", "pip", "freeze", "--all", "--disable-pip-version-check"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).replace("\r\n", "\n")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("unable to capture complete pip freeze provenance") from exc
+    if not freeze.strip():
+        raise RuntimeError("pip freeze returned an empty dependency manifest")
+
+    distributions = {}
+    for requested_name in ("flash-attn", "mamba-ssm", "causal-conv1d"):
+        try:
+            distribution = importlib.metadata.distribution(requested_name)
+        except importlib.metadata.PackageNotFoundError as exc:
+            raise RuntimeError(
+                f"required installed distribution is missing: {requested_name}"
+            ) from exc
+        metadata_text = distribution.read_text("METADATA") or ""
+        direct_url_text = distribution.read_text("direct_url.json") or ""
+        distributions[requested_name] = {
+            "name": distribution.metadata.get("Name"),
+            "version": distribution.version,
+            "metadata_sha256": hashlib.sha256(
+                metadata_text.encode("utf-8")
+            ).hexdigest(),
+            "direct_url_sha256": (
+                hashlib.sha256(direct_url_text.encode("utf-8")).hexdigest()
+                if direct_url_text
+                else None
+            ),
+        }
+    return {
+        "pip_freeze": freeze,
+        "pip_freeze_sha256": hashlib.sha256(freeze.encode("utf-8")).hexdigest(),
+        "distributions": distributions,
+    }
+
+
 def _runtime_provenance():
     """Capture the runtime identity that produced a checkpoint.
 
@@ -184,6 +237,7 @@ def _runtime_provenance():
     except (AttributeError, OSError):
         te_path = None
     recipe = getattr(hnet_te, "_FP8_RECIPE", None)
+    dependencies = _dependency_provenance()
     return {
         "git_sha": git_sha,
         "git_dirty": git_dirty,
@@ -205,6 +259,7 @@ def _runtime_provenance():
         },
         "nvte_fp8_dpa_bwd": os.environ.get("NVTE_FP8_DPA_BWD"),
         "nvte_croissattn_aux": os.environ.get("NVTE_DPA_CROISSATTN_AUX"),
+        "dependencies": dependencies,
     }
 
 
@@ -235,6 +290,7 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         "fp8_recipe",
         "nvte_fp8_dpa_bwd",
         "nvte_croissattn_aux",
+        "dependencies",
     ):
         if saved_runtime.get(key) != runtime.get(key):
             raise ValueError(
