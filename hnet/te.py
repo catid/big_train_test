@@ -62,7 +62,7 @@ def _preload_pinned_cuda_blas() -> None:
     # expert weights.  A later 13.8.x patch is required for this contract.
     resolved_lt = os.path.realpath(os.path.join(root, "libcublasLt.so.13"))
     match = re.search(r"\.so\.(\d+)\.(\d+)\.(\d+)\.(\d+)$", resolved_lt)
-    if match and tuple(map(int, match.groups())) < (13, 8, 1, 0):
+    if match is None or tuple(map(int, match.groups())) < (13, 8, 1, 0):
         raise RuntimeError(
             "The canonical FP8 MoE path requires libcublasLt >= 13.8.1; "
             f"found {resolved_lt}. Install the reviewed CUDA patch before training."
