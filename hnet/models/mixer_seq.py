@@ -147,7 +147,12 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             feedback_hidden = []
         hidden_states = hidden_states.view(B, L, D)
         logits = self.lm_head(hidden_states.float())
-        feedback_logits = [self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden]
+        # The final feedback pass is identical to ``hidden_states`` and its
+        # logits are already available as ``logits``.  Keep only earlier pass
+        # logits here so the LM head is evaluated once per distinct state.
+        feedback_logits = [
+            self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden[:-1]
+        ]
         moe_losses = [m.aux_loss for m in self.backbone.modules()
                       if getattr(m, "aux_loss", None) is not None]
         moe_aux_loss = torch.stack(moe_losses).mean() if moe_losses else None
