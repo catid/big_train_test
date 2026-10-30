@@ -568,9 +568,6 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                         out = probe_model(x, mask=mask, fbt_passes=FBT_PASSES)
                         loss, metrics = loss_for_output(out, y, args)
                         loss.backward()
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            probe_model.parameters(), 1.0
-                        )
                     except RuntimeError as exc:
                         if "out of memory" not in str(exc).lower():
                             raise
@@ -592,9 +589,11 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                     if bool(oom_tensor.item()):
                         oom = True
                         break
-                    finite_flag = (torch.isfinite(loss) & torch.isfinite(grad_norm)).to(
-                        dtype=torch.int32
-                    )
+                    # Reject a non-finite local objective before reducing its
+                    # gradients. This keeps the collective safe while making
+                    # the subsequent calibration update match production's
+                    # averaged-gradient ordering.
+                    finite_flag = torch.isfinite(loss).to(dtype=torch.int32)
                     if world > 1:
                         dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
                     if not bool(finite_flag.item()):
@@ -612,6 +611,16 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                             world,
                             device,
                             calibration_grad_buckets,
+                        )
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        probe_model.parameters(), 1.0
+                    )
+                    finite_grad_flag = torch.isfinite(grad_norm).to(dtype=torch.int32)
+                    if world > 1:
+                        dist.all_reduce(finite_grad_flag, op=dist.ReduceOp.MIN)
+                    if not bool(finite_grad_flag.item()):
+                        raise FloatingPointError(
+                            f"non-finite calibration gradient at candidate batch {candidate}"
                         )
                     optimizer.step()
                     torch.cuda.synchronize(device)
