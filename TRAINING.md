@@ -46,10 +46,13 @@ inner layer, and decode advances those histories after both shared-weight loops.
 The VHA cache is allocated per FA layer with two physical KV heads and rank-4
 postmix compression.
 
-FBT follows arXiv:2608.08888 Fig. 10: jitter is applied before document-local
-shift-right, the shifted state is fused through a gated GLU with normalized
-token input, and the fused input receives a second RMSNorm before the shared
-inner stack. The current pass is not added back to the fused state.
+FBT follows arXiv:2608.08888 Fig. 9: jitter is applied before the
+document-local shift-right, the shifted state is the GLU value pathway, the
+RMS-normalized current input is the gate pathway, and the same RMSNorm is
+applied to the fused input before the shared inner stack. The current pass is
+not added back to the fused state. The two-pass objective sums the plain
+first-pass next-byte CE and the feedback-pass CE; the logged `loss` remains
+the final plain byte CE.
 
 Example launch (artifacts stay outside this repository):
 
