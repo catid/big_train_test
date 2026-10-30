@@ -349,9 +349,11 @@ def loss_for_output(out, target, args):
         objective = standard_ce
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     boundary_ratios = []
+    soft_boundary_ratios = []
     for router in out.bpred_output:
         ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
         boundary_ratios.append(router.boundary_mask.float().mean())
+        soft_boundary_ratios.append(router.boundary_prob[..., -1].float().mean())
     moe_aux_value = getattr(out, "moe_aux_loss", None)
     moe_aux = (moe_aux_value.float() if moe_aux_value is not None
                else out.logits.new_zeros((), dtype=torch.float32))
@@ -359,6 +361,11 @@ def loss_for_output(out, target, args):
     routing_ratio = (
         torch.stack(boundary_ratios).mean()
         if boundary_ratios
+        else standard_ce.new_zeros((), dtype=torch.float32)
+    )
+    soft_routing_ratio = (
+        torch.stack(soft_boundary_ratios).mean()
+        if soft_boundary_ratios
         else standard_ce.new_zeros((), dtype=torch.float32)
     )
     target_ratio = getattr(args, "_target_ratio_tensor", None)
@@ -371,6 +378,7 @@ def loss_for_output(out, target, args):
         "router_loss": ratio,
         "moe_aux": moe_aux,
         "routing_ratio": routing_ratio,
+        "soft_routing_ratio": soft_routing_ratio,
         "ratio_target_error": (routing_ratio - target_ratio).abs(),
     }
     return objective, metrics
@@ -1186,6 +1194,7 @@ def main():
         "router_loss": [],
         "moe_aux": [],
         "routing_ratio": [],
+        "soft_routing_ratio": [],
         "ratio_target_error": [],
         "time_ms": [],
         "power_w": [],
@@ -1270,6 +1279,7 @@ def main():
             "router_loss",
             "moe_aux",
             "routing_ratio",
+            "soft_routing_ratio",
             "ratio_target_error",
         )
         metric_vector = torch.stack(
