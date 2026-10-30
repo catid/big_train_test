@@ -166,6 +166,11 @@ def _validate_resume(checkpoint, cfg, args, n_params):
         raise ValueError(
             f"resume batch mismatch: checkpoint={saved_batch}, current={args.batch}"
         )
+    saved_data_seed = checkpoint.get("data_seed")
+    if saved_data_seed is not None and int(saved_data_seed) != int(args.data_seed):
+        raise ValueError(
+            f"resume data-seed mismatch: checkpoint={saved_data_seed}, current={args.data_seed}"
+        )
     saved_cfg = checkpoint.get("config_signature")
     if saved_cfg is None:
         # Older checkpoints stored ``vars(cfg)``.  It is still useful to
@@ -457,6 +462,7 @@ def main():
                     "step": step,
                     "seq": args.seq,
                     "batch": args.batch,
+                    "data_seed": args.data_seed,
                     "params": n_params,
                     "config_signature": _config_dict(cfg),
                     "model": (model.module if world > 1 else model).state_dict(),
