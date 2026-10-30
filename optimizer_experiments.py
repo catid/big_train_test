@@ -429,18 +429,42 @@ class GramNewtonSchulz:
         return x
 
     def _gram_recurrence(self, x: torch.Tensor) -> torch.Tensor:
-        # The inverse-estimate recurrence used by the upstream research
-        # implementation diverges for this B300 workload with rectangular
-        # BF16/FP16 matrices.  The direct Gram polynomial is algebraically
-        # equivalent to the standard Newton-Schulz update and remains finite;
-        # matmul plus scalar operations also avoids cuBLASLt's nonzero-beta
-        # addmm failure.  The smaller Gram dimension is used after the caller's
-        # transpose, so this remains practical for Transformer matrices.
-        for a, b, c in self.coefficients:
-            gram = x @ x.mT
-            poly = c * (gram @ gram) + b * gram
-            x = a * x + poly @ x
-        return x
+        """Run the rectangular Gram-NS inverse-estimate recurrence.
+
+        The Gram path keeps a small inverse estimate ``q`` in the reduced
+        dimension and refreshes it at the configured reset iterations. This is
+        materially different from the square polynomial recurrence and avoids
+        paying a second full-size matrix product for rectangular expert and
+        projection banks.
+        """
+        gram = x @ x.mT
+        eye = torch.eye(
+            gram.size(-1), device=x.device, dtype=x.dtype
+        ).expand(gram.size(0), -1, -1).contiguous()
+        q = None
+        for i, (a, b, c) in enumerate(self.coefficients):
+            if i in self.reset_iterations and i != 0:
+                if q is None:
+                    raise RuntimeError("GramNS reset reached without inverse estimate")
+                x = q @ x
+                gram = x @ x.mT
+                q = None
+
+            z = torch.baddbmm(gram, gram, gram, alpha=c, beta=b)
+            if i == 0 or i in self.reset_iterations:
+                q = z + a * eye
+            else:
+                if q is None:
+                    raise RuntimeError("GramNS inverse estimate was not initialized")
+                q = torch.baddbmm(q, q, z, beta=a)
+
+            if i < len(self.coefficients) - 1 and i + 1 not in self.reset_iterations:
+                rz = torch.baddbmm(gram, gram, z, beta=a)
+                gram = torch.baddbmm(rz, z, rz, beta=a)
+
+        if q is None:
+            raise RuntimeError("GramNS finished without an inverse estimate")
+        return q @ x
 
 
 class AnchorMuon(torch.optim.Optimizer):

@@ -82,3 +82,18 @@ class HNetConfig:
             raise ValueError("the canonical model requires VHA with two KV heads per attention stage")
         if int(self.attn_cfg.vha_rank) != 4:
             raise ValueError("the canonical model requires VHA postmix rank 4")
+        if self.attn_cfg.window_size != [128, -1]:
+            raise ValueError("the canonical model requires 128-token SWA and global FA")
+        if self.attn_cfg.croissattn_aux != [False, True]:
+            raise ValueError(
+                "the canonical model enables patched CroissAttn only on the global FA stage"
+            )
+        if (
+            int(self.moe_expert_intermediate) != 512
+            or int(self.moe_shared_intermediate) != 256
+            or float(self.moe_capacity_factor) != 1.25
+        ):
+            raise ValueError(
+                "the canonical model requires 512-wide routed experts, a 256-wide shared "
+                "expert, and capacity_factor=1.25"
+            )

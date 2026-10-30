@@ -171,14 +171,11 @@ class SparseMoESwiGLU(nn.Module):
         # shapes and make CUDA graph capture unsafe; the bounded allocation is
         # the same fixed-capacity contract used by the TE grouped router.
         capacity = max(1, int(math.ceil(self.capacity_factor * n_tokens / self.num_experts)))
-        # Generation batches are tiny and may legitimately route several
-        # sequences to one expert. Avoid dropping tokens at inference; the
-        # training graph keeps the fixed capacity above for bounded memory.
-        if not self.training:
-            # Generation batches are tiny; use the static token bound instead
-            # of a device-to-host bincount/max read. This keeps decode capture
-            # free of synchronization and guarantees no token is dropped.
-            capacity = max(1, n_tokens)
+        # Keep the same fixed capacity in training and evaluation.  Using a
+        # larger inference-only capacity changes which tokens overflow, the
+        # amount of expert compute, and the decoded function being evaluated.
+        # A single capacity contract also keeps the grouped GEMM shapes and
+        # checkpointed model semantics identical across train/eval.
         # Count only active rows. Inactive static-chunk padding receives a
         # zero route and is omitted from the fused map.
         positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
@@ -190,12 +187,27 @@ class SparseMoESwiGLU(nn.Module):
         # ``permute_mask_map_fwd`` is the graph-safe primitive behind TE's
         # padding helper.  It accepts a fixed output count and returns exactly
         # E*capacity rows, with zero rows and -1 row ids for unused slots.
+        # Passing a zero pad-offset vector is deliberate: TE's Triton wrapper
+        # uses ``empty`` when pad_offsets is None, leaving unused fixed-capacity
+        # rows uninitialized.  Those rows then enter FP8 GroupedLinear and can
+        # poison its delayed-scaling amax/wgrad state with NaNs.  Zero offsets
+        # preserve the unpadded layout while selecting the wrapper's zero-fill
+        # allocation path.
+        pad_key = (flat.device.type, flat.device.index)
+        pad_offsets = getattr(self, "_pad_offsets_cache", {}).get(pad_key)
+        if pad_offsets is None:
+            if not hasattr(self, "_pad_offsets_cache"):
+                self._pad_offsets_cache = {}
+            pad_offsets = torch.zeros(
+                (self.num_experts,), dtype=torch.int64, device=flat.device
+            )
+            self._pad_offsets_cache[pad_key] = pad_offsets
         dispatched, row_id_map, permuted_probs = torch.ops.te_moe.permute_mask_map_fwd(
             flat,
             routing_map,
             self.num_experts * capacity,
             routing_probs,
-            None,
+            pad_offsets,
         )
         split_key = (flat.device.type, flat.device.index, capacity)
         m_splits = getattr(self, "_m_splits_cache", {}).get(split_key)
@@ -205,7 +217,14 @@ class SparseMoESwiGLU(nn.Module):
             m_splits = torch.full(
                 (self.num_experts,), capacity, dtype=torch.int64, device=flat.device
             )
+            # Delayed-scaling TE lacks a native grouped quantizer and normally
+            # converts this tensor with ``tolist()``.  Preserve a Python tuple
+            # alongside the fixed-capacity device tensor so graph capture can
+            # use TE's split-quantize grouped GEMM without a host sync.
+            m_splits._hnet_static_splits = (capacity,) * self.num_experts
             self._m_splits_cache[split_key] = m_splits
+        elif getattr(m_splits, "_hnet_static_splits", None) is None:
+            m_splits._hnet_static_splits = (capacity,) * self.num_experts
         expert_hidden = self.experts_fc1(dispatched, m_splits)
         value, gate = expert_hidden.chunk(2, dim=-1)
         expert_hidden = F.silu(gate) * value
@@ -218,7 +237,7 @@ class SparseMoESwiGLU(nn.Module):
             expert_out,
             row_id_map,
             restore_shape=flat.shape,
-            pad_offsets=None,
+            pad_offsets=pad_offsets,
         )
         out = routed + self._shared(flat)
         return out.view(shape)

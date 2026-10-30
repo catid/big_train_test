@@ -2,19 +2,38 @@
 
 The production model has no precision fallback.  Importing :mod:`hnet` therefore
 requires the reviewed Transformer Engine checkout to be installed and loadable
-against the active PyTorch/CUDA runtime.  Keeping this check at package import
-time prevents a BF16 run from being misreported as FP8 training.
+against the active PyTorch/CUDA runtime.  The trainer performs the capability
+and provenance check after selecting each DDP rank's CUDA device, preventing a
+BF16 run from being misreported as FP8 training without touching the wrong GPU.
 """
 
 from __future__ import annotations
 
 import os
 import ctypes
+import subprocess
+from pathlib import Path
 
 # The environment contains CUDA 13 PyTorch plus a CUDA 12 FlashAttention
 # wheel.  cuDNN frontend otherwise chooses libcudart.so.12 by load order,
 # which can select the wrong ABI for the fused FP8 DPA kernels.
 os.environ.setdefault("CUDNN_FRONTEND_CUDART_LIB_NAME", "libcudart.so.13")
+# The canonical run requires the patched delayed-scaling DPA backward.  Set
+# the required switch before importing Transformer Engine so its backend reads
+# the same value during module initialization, then validate it below rather
+# than silently falling back to an FP8-forward/BF16-backward path.
+os.environ.setdefault("NVTE_FP8_DPA_BWD", "1")
+# The reviewed Transformer Engine build gates CroissAttn's unrounded-output
+# backward correction with this process-wide switch.  The canonical config
+# enables CroissAttn on its FA/T layers (SWA uses FlashAttention directly), so
+# silently leaving the switch at its default would train a different backward.
+os.environ.setdefault("NVTE_DPA_CROISSATTN_AUX", "1")
+
+_GRAPH_CAPTURE = False
+_GROUPED_LINEAR_ORIGINAL = None
+_MODULE_GROUPED_LINEAR_ORIGINAL = None
+_GROUPED_LINEAR_EAGER_ORIGINAL = None
+_EXPECTED_TE_COMMIT = "9646c3ef22455b6948cbe870f1aaf20fc8238d69"
 
 
 def _preload_pinned_cuda_blas() -> None:
@@ -57,12 +76,6 @@ except Exception as exc:  # pragma: no cover - the error is environment-specific
 
 import torch
 
-if not te.is_fp8_available():
-    raise RuntimeError(
-        "Transformer Engine imported, but its FP8 kernels are unavailable on this "
-        "GPU/runtime; refusing a silent BF16 training run."
-    )
-
 TELinear = te.Linear
 TEGroupedLinear = te.GroupedLinear
 TEDotProductAttention = te.DotProductAttention
@@ -81,10 +94,20 @@ class AlignedTELinear(torch.nn.Module):
     tensor-only and remains replay-safe for a fixed graph bound.
     """
 
-    def __init__(self, in_features, out_features, *, bias=True, device=None, dtype=None):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        *,
+        bias=True,
+        device=None,
+        dtype=None,
+        fp8=True,
+    ):
         super().__init__()
         self.in_features = int(in_features)
         self.out_features = int(out_features)
+        self.fp8 = bool(fp8)
         self.padded_out_features = (self.out_features + 15) // 16 * 16
         self.linear = TELinear(
             self.in_features,
@@ -113,19 +136,39 @@ class AlignedTELinear(torch.nn.Module):
         padded_rows = (rows + 7) // 8 * 8
         if padded_rows != rows:
             flat = torch.cat((flat, flat.new_zeros((padded_rows - rows, self.in_features))), dim=0)
-        out = self.linear(flat)
+        # Some fixed numerical boundaries (the FP32 residual path and LM head)
+        # intentionally remain outside FP8 even when an enclosing H-Net stack
+        # has an active autocast region.  Keep this explicit at the module
+        # boundary so a caller cannot accidentally quantize those projections.
+        if self.fp8:
+            out = self.linear(flat)
+        else:
+            with te_autocast(enabled=False):
+                out = self.linear(flat)
         out = out[:rows, :self.out_features]
         return out.reshape(*original_shape, self.out_features)
 
 
-def make_linear(in_features: int, out_features: int, *, bias: bool = True,
-                device=None, dtype=None):
+def make_linear(
+    in_features: int,
+    out_features: int,
+    *,
+    bias: bool = True,
+    device=None,
+    dtype=None,
+    fp8: bool = True,
+):
     """Construct a Transformer Engine Linear with the model's parameter dtype."""
 
     if dtype is None:
         dtype = torch.get_default_dtype()
     return AlignedTELinear(
-        in_features, out_features, bias=bias, device=device, dtype=dtype
+        in_features,
+        out_features,
+        bias=bias,
+        device=device,
+        dtype=dtype,
+        fp8=fp8,
     )
 
 
@@ -148,6 +191,79 @@ def fp8_recipe():
 
 
 _FP8_RECIPE = fp8_recipe()
+
+
+def set_graph_capture(enabled: bool) -> None:
+    """Select graph-safe fixed-split dispatch for CUDA graph capture.
+
+    Delayed scaling has no native grouped quantizer in the pinned TE build, so
+    graph mode keeps its split-quantize GEMM but supplies a fixed Python split
+    tuple from the router. Eager delayed-scaling dispatch is unchanged.
+    """
+    global _GRAPH_CAPTURE, _GROUPED_LINEAR_ORIGINAL, _MODULE_GROUPED_LINEAR_ORIGINAL
+    global _GROUPED_LINEAR_EAGER_ORIGINAL
+    _GRAPH_CAPTURE = bool(enabled)
+    import transformer_engine.pytorch.ops.basic.grouped_linear as grouped_linear
+    import transformer_engine.pytorch.module.grouped_linear as grouped_linear_module
+
+    if _GROUPED_LINEAR_ORIGINAL is None:
+        _GROUPED_LINEAR_ORIGINAL = grouped_linear.is_op_fuser_grouped_tensor_path_supported
+    if _MODULE_GROUPED_LINEAR_ORIGINAL is None:
+        _MODULE_GROUPED_LINEAR_ORIGINAL = grouped_linear_module.is_module_grouped_tensor_path_supported
+    if _GROUPED_LINEAR_EAGER_ORIGINAL is None:
+        _GROUPED_LINEAR_EAGER_ORIGINAL = grouped_linear_module._grouped_linear_eager
+
+    if _GRAPH_CAPTURE:
+        original = _GROUPED_LINEAR_ORIGINAL
+        def graph_safe(recipe, dtype, split_alignment=128):
+            if recipe is not None and recipe.delayed():
+                return True
+            return original(recipe, dtype, split_alignment)
+
+        grouped_linear.is_op_fuser_grouped_tensor_path_supported = graph_safe
+
+        # Delayed scaling is intentionally left on TE's split-quantize path:
+        # this pinned build has no delayed native grouped quantizer.  Replace
+        # only its host ``m_splits.tolist()`` conversion with a tuple supplied
+        # by H-Net's fixed-capacity router (see SparseMoESwiGLU).  The GEMM
+        # itself remains TE's fused grouped operation and no device-to-host
+        # read occurs during capture.
+        def graph_safe_eager(inp, m_splits, fwd_args, weights_and_biases, is_grad_enabled):
+            if fwd_args.m_splits is None and not fwd_args.use_grouped_tensor_path:
+                static_splits = getattr(m_splits, "_hnet_static_splits", None)
+                if static_splits is None:
+                    raise RuntimeError(
+                        "graph-safe delayed GroupedLinear requires H-Net static m_splits"
+                    )
+                fwd_args.m_splits = static_splits
+            return _GROUPED_LINEAR_EAGER_ORIGINAL(
+                inp, m_splits, fwd_args, weights_and_biases, is_grad_enabled
+            )
+
+        grouped_linear_module._grouped_linear_eager = graph_safe_eager
+    else:
+        grouped_linear.is_op_fuser_grouped_tensor_path_supported = _GROUPED_LINEAR_ORIGINAL
+        grouped_linear_module.is_module_grouped_tensor_path_supported = _MODULE_GROUPED_LINEAR_ORIGINAL
+        grouped_linear_module._grouped_linear_eager = _GROUPED_LINEAR_EAGER_ORIGINAL
+
+
+def graph_capture_enabled() -> bool:
+    """Return whether model code should avoid host reads during capture."""
+
+    return bool(_GRAPH_CAPTURE)
+
+
+def update_fp8_scaling(*, forward: bool) -> None:
+    """Commit delayed-scaling amax history after a captured replay.
+
+    TE intentionally skips these updates while ``_graph=True``.  Captured
+    training therefore performs the same reductions on the host side between
+    replays, using the static amax buffers populated by the preceding graph.
+    """
+
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+    FP8GlobalStateManager.reduce_and_update_fp8_tensors(forward=bool(forward))
 
 
 def assert_fp8_attention_backend() -> None:
@@ -191,11 +307,13 @@ def assert_fused_attention_selected() -> None:
         raise RuntimeError("Unable to verify Transformer Engine attention backend") from exc
 
 
-def fp8_context(*, graph: bool = False):
+def fp8_context(*, graph: bool | None = None):
     """Create the mandatory FP8 autocast context for a training step."""
     reduction_group = None
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         reduction_group = torch.distributed.group.WORLD
+    if graph is None:
+        graph = _GRAPH_CAPTURE
     return te_autocast(
         enabled=True,
         recipe=_FP8_RECIPE,
@@ -210,5 +328,60 @@ def assert_fp8_runtime() -> None:
     if os.environ.get("NVTE_FRAMEWORK") not in (None, "", "pytorch", "all"):
         raise RuntimeError("NVTE_FRAMEWORK must include pytorch for H-Net training")
     if not te.is_fp8_available():
-        raise RuntimeError("Transformer Engine FP8 support is unavailable")
+        reason = None
+        try:
+            available = te.is_fp8_available(return_reason=True)
+            if isinstance(available, tuple):
+                reason = available[1]
+        except TypeError:
+            pass
+        suffix = f": {reason}" if reason else ""
+        raise RuntimeError(f"Transformer Engine FP8 support is unavailable{suffix}")
+    expected_root = Path("/home/catid/fp8/TransformerEngine").resolve()
+    te_path = Path(te.__file__).resolve()
+    if expected_root not in te_path.parents:
+        raise RuntimeError(
+            "Transformer Engine was imported from an unreviewed location: "
+            f"{te_path}; expected a build under {expected_root}"
+        )
+    te_commit = transformer_engine_git_commit()
+    if te_commit != _EXPECTED_TE_COMMIT:
+        raise RuntimeError(
+            "Transformer Engine checkout is not the reviewed CroissAttn commit: "
+            f"expected {_EXPECTED_TE_COMMIT}, found {te_commit}"
+        )
+    try:
+        tracked_diff = subprocess.check_output(
+            ["git", "diff", "--quiet"], cwd=expected_root,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            "Transformer Engine checkout has tracked source modifications; "
+            "refusing an unreviewed FP8 kernel"
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("Unable to verify Transformer Engine source cleanliness") from exc
+    if os.environ.get("NVTE_FP8_DPA_BWD") != "1":
+        raise RuntimeError(
+            "The canonical H-Net requires NVTE_FP8_DPA_BWD=1 for FP8 attention backward"
+        )
+    if os.environ.get("NVTE_DPA_CROISSATTN_AUX") != "1":
+        raise RuntimeError(
+            "The canonical H-Net requires NVTE_DPA_CROISSATTN_AUX=1 for the "
+            "patched CroissAttn FP8 backward correction"
+        )
     assert_fp8_attention_backend()
+
+
+def transformer_engine_git_commit() -> str | None:
+    """Return the reviewed TE checkout commit for checkpoint provenance."""
+
+    root = Path("/home/catid/fp8/TransformerEngine")
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None

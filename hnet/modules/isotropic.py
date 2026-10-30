@@ -16,6 +16,7 @@ from hnet.modules.block import create_block
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
+from hnet.te import fp8_context, graph_capture_enabled
 
 
 @dataclass
@@ -29,6 +30,11 @@ class IsotropicInferenceParams:
     batch_size_offset: int = 0
     key_value_memory_dict: dict = field(default_factory=dict)
     lengths_per_sample: Optional[torch.Tensor] = None
+    # For the innermost MSAR stack, each recurrent loop keeps one bounded
+    # history per source stream.  The history stores only the previous
+    # ``max_kernel - 1`` states; the current token is supplied separately to
+    # the MSAR mixer and appended after the layer boundary is produced.
+    msar_history: Optional[list[list[torch.Tensor]]] = None
 
     def reset(self, max_seqlen, max_batch_size):
         self.max_seqlen = max_seqlen
@@ -163,7 +169,9 @@ class Isotropic(nn.Module):
         # this removes the Python ``tolist``/per-document launch loop and keeps
         # the packed MSAR path graph-safe for a fixed token bound.
         from hnet.modules.utils import get_seq_idx
-        seq_idx = get_seq_idx(cu_seqlens, device=x.device)
+        seq_idx = get_seq_idx(
+            cu_seqlens, device=x.device, total_length=x.shape[1]
+        )
         y = x * weight[:, kernel - 1].to(dtype=x.dtype)
         for lag in range(1, kernel):
             shifted = torch.cat((torch.zeros_like(x[:, :lag]), x[:, :-lag]), dim=1)
@@ -244,15 +252,80 @@ class Isotropic(nn.Module):
         The inference cache contains a list of inference caches, one for each block.
         """
         key_value_memory_dict = {}
+        cache_device = self.rmsnorm.weight.device
         for i, layer in enumerate(self.layers):
             key_value_memory_dict[i] = layer.allocate_inference_cache(
                 batch_size, max_seqlen, dtype=dtype
             )
+        msar_history = None
+        if self.msar_enabled:
+            # Keep one recurrent stream for the input and for the output of
+            # every layer.  A layer's current state is itself an MSAR source
+            # on the following layer, so boundary-only storage would lose the
+            # causal history of transient (non-boundary) states at decode.
+            source_count = len(self.layers) + 1
+            history_len = max(self.msar_kernels) - 1
+            msar_history = [
+                [
+                    torch.zeros(
+                        batch_size,
+                        history_len,
+                        self.d_model,
+                        device=cache_device,
+                        dtype=dtype,
+                    )
+                    for _ in range(source_count)
+                ]
+                for _ in range(self.loop_count)
+            ]
         return IsotropicInferenceParams(
             key_value_memory_dict=key_value_memory_dict,
             max_seqlen=max_seqlen,
             max_batch_size=batch_size,
+            msar_history=msar_history,
         )
+
+    @staticmethod
+    def _append_msar_history(history, current):
+        """Append one token state to a bounded per-stream history."""
+        if history.shape[1] == 0:
+            return
+        history.copy_(torch.cat((history[:, 1:], current.unsqueeze(1)), dim=1))
+
+    def _msar_mix_step(self, source_currents, history, layer_idx, history_indices):
+        """Compute one MSAR token using recurrent stream histories.
+
+        This is the recurrent equivalent of :meth:`_msar_mix`.  It uses the
+        exact same depthwise causal coefficients and source/query mixing, but
+        never materializes a fake sequence dimension or reads host lengths.
+        """
+        streams = []
+        for source_index, current in enumerate(source_currents):
+            source_history = history[history_indices[source_index]]
+            per_kernel = [current]
+            for kernel_index, kernel in enumerate(self.msar_kernels[1:]):
+                weight = self.msar_conv[kernel_index].to(dtype=current.dtype)
+                value = current * weight[:, kernel - 1]
+                for lag in range(1, kernel):
+                    value = value + source_history[:, -lag] * weight[:, kernel - 1 - lag]
+                per_kernel.append(value)
+            streams.append(torch.stack(per_kernel, dim=0))
+        stream_sources = torch.stack(streams, dim=0)  # [sources, streams, batch, D]
+        normed = stream_sources.float() * torch.rsqrt(
+            stream_sources.float().square().mean(dim=-1, keepdim=True).add(1e-6)
+        )
+        query = self.msar_queries[layer_idx].float()
+        scores = torch.einsum("smbd,md->smb", normed, query) / (self.d_model**0.5)
+        weights = torch.softmax(scores, dim=0)
+        retrieved = (weights.unsqueeze(-1) * stream_sources).sum(dim=0)
+        retrieved_last = retrieved.movedim(0, -2)  # [batch, streams, D]
+        flat = retrieved_last.reshape(retrieved_last.shape[0], -1)
+        mix = torch.sigmoid(
+            flat.float() @ self.msar_pre[layer_idx].float()
+            + self.msar_bias[layer_idx].float()
+        )
+        fused = (mix.unsqueeze(-1) * retrieved_last).sum(dim=-2)
+        return fused.to(source_currents[-1].dtype)
 
     def forward(
         self,
@@ -261,6 +334,7 @@ class Isotropic(nn.Module):
         max_seqlen=None,
         mask=None,
         inference_params=None,
+        graph_dense_mask=False,
         **mixer_kwargs,
     ):
         assert (mask is not None) or (
@@ -279,7 +353,38 @@ class Isotropic(nn.Module):
             # Pack those rows before attention so FlashAttention never
             # normalizes over zero-valued padding keys. The result is scattered
             # back to the fixed outer shape after all inner layers finish.
-            if not bool(mask.all()):
+            # Router chunking left-aligns selected boundaries and leaves all
+            # padding at the end of each row. During graph capture, keep this
+            # fixed padded shape instead of reading ``mask.all()`` on the host:
+            # causal attention never lets a real query attend to the trailing
+            # padding, while the active mask zeros padded residual/MLP rows.
+            if graph_capture_enabled():
+                active = mask.unsqueeze(-1)
+                hidden_states = hidden_states * active.to(hidden_states.dtype)
+            elif hidden_states.shape[1] == 1 and bool(mask.all()):
+                # The pinned TE BSHD CroissAttn kernel requires at least two
+                # query positions.  A learned router can legitimately emit a
+                # single latent boundary for a short/easy prompt; route that
+                # singleton through the equivalent packed THD interface so it
+                # still uses fused TE attention and preserves the outer shape.
+                unpack_mask = mask
+                counts = mask.sum(dim=-1, dtype=torch.int32)
+                cu_seqlens = F.pad(counts.cumsum(0), (1, 0)).to(torch.int32)
+                max_seqlen = 1
+                hidden_states = hidden_states[mask]
+                attn_mixer_kwargs.update(
+                    {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
+                )
+                ssm_mixer_kwargs.update(
+                    {"seq_idx": get_seq_idx(
+                        cu_seqlens,
+                        device=hidden_states.device,
+                        total_length=hidden_states.shape[0],
+                    )}
+                )
+                packed = True
+                mask = None
+            elif not bool(mask.all()):
                 if inference_params is not None:
                     raise ValueError("padded static chunking cannot use an inference cache")
                 unpack_mask = mask
@@ -291,7 +396,17 @@ class Isotropic(nn.Module):
                     {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
                 )
                 ssm_mixer_kwargs.update(
-                    {"seq_idx": get_seq_idx(cu_seqlens, device=hidden_states.device)}
+                    {
+                        "seq_idx": get_seq_idx(
+                            cu_seqlens,
+                            device=hidden_states.device,
+                            total_length=(
+                                hidden_states.shape[0]
+                                if hidden_states.dim() == 2
+                                else hidden_states.shape[1]
+                            ),
+                        )
+                    }
                 )
                 packed = True
                 mask = None
@@ -303,7 +418,17 @@ class Isotropic(nn.Module):
                 {"cu_seqlens": cu_seqlens.int(), "max_seqlen": max_seqlen}
             )
             ssm_mixer_kwargs.update(
-                {"seq_idx": get_seq_idx(cu_seqlens, device=hidden_states.device)}
+                {
+                    "seq_idx": get_seq_idx(
+                        cu_seqlens,
+                        device=hidden_states.device,
+                        total_length=(
+                            hidden_states.shape[0]
+                            if hidden_states.dim() == 2
+                            else hidden_states.shape[1]
+                        ),
+                    )
+                }
             )
             packed = True
 
@@ -313,93 +438,100 @@ class Isotropic(nn.Module):
             raise RuntimeError("inner recurrent loops with Mamba require per-loop SSM state; use attention-only inner blocks")
 
         for _loop_idx in range(self.loop_count):
-            if self.msar_enabled:
-                msar_state = hidden_states
-                msar_sources = [hidden_states]
-                for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
-                    layer_input = self._msar_mix(
-                        msar_sources + [msar_state], layer_idx,
-                        cu_seqlens=cu_seqlens if packed else None,
+            # Transformer Engine delayed-scaling modules keep per-call
+            # quantizer state in the active autocast region.  The canonical
+            # middle stack reuses every layer for two recurrent executions;
+            # give each execution its own region so a layer is invoked once
+            # per region (the TE-supported contract).  This also keeps the
+            # two FBT passes independent when HNet calls us repeatedly.
+            with fp8_context():
+                if self.msar_enabled:
+                    msar_state = hidden_states
+                    msar_sources = [hidden_states]
+                    for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
+                        layer_input = self._msar_mix(
+                            msar_sources + [msar_state], layer_idx,
+                            cu_seqlens=cu_seqlens if packed else None,
+                        )
+                        if arch in ("m", "M") and layer_input.dim() == 2:
+                            layer_input = layer_input.unsqueeze(0)
+                        elif arch in ("s", "S", "t", "T") and packed and layer_input.dim() == 3:
+                            layer_input = layer_input.squeeze(0)
+                        # MSAR retrieves in FP32 for stable cosine/softmax math;
+                        # restore the block's parameter dtype before its fused
+                        # mixer projection.
+                        layer_input = layer_input.to(dtype=layer.norm1.weight.dtype)
+                        msar_out, msar_residual = layer(
+                            layer_input,
+                            None,
+                            inference_params=inference_params,
+                            mixer_kwargs=(
+                                ssm_mixer_kwargs if arch in ("m", "M")
+                                else {**attn_mixer_kwargs, "loop_idx": _loop_idx}
+                            ),
+                            active_mask=mask,
+                        )
+                        if mask is not None:
+                            active_dtype = active.to(msar_out.dtype)
+                            msar_out = msar_out * active_dtype
+                            if msar_residual is not None:
+                                msar_residual = msar_residual * active_dtype
+                        raw_state = msar_out if msar_residual is None else msar_out + msar_residual
+                        # Gate each layer's multi-scale residual independently.
+                        # A single mean scale would force all layers to share one
+                        # scalar gradient and waste the per-layer parameters.
+                        layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
+                        msar_state = layer_input + layer_scale * (raw_state - layer_input)
+                        if packed and msar_state.dim() == 3:
+                            msar_state = msar_state.squeeze(0)
+                        if (layer_idx + 1) % self.msar_block_size == 0:
+                            msar_sources.append(msar_state)
+                    hidden_states = msar_state
+                    hidden_states = self.rmsnorm(
+                        hidden_states, residual=None, prenorm=False, residual_in_fp32=True
                     )
-                    if arch in ("m", "M") and layer_input.dim() == 2:
-                        layer_input = layer_input.unsqueeze(0)
-                    elif arch in ("s", "S", "t", "T") and packed and layer_input.dim() == 3:
-                        layer_input = layer_input.squeeze(0)
-                    # MSAR retrieves in FP32 for stable cosine/softmax math;
-                    # restore the block's parameter dtype before its fused
-                    # mixer projection.
-                    layer_input = layer_input.to(dtype=layer.norm1.weight.dtype)
-                    msar_out, msar_residual = layer(
-                        layer_input,
-                        None,
+                    residual = None
+                    continue
+                residual = None
+                # Reusing the same layer objects shares weights. CausalMHA uses a
+                # loop-indexed cache slot so each recurrent depth has exact
+                # autoregressive context; rotary offsets advance once per token,
+                # after all loops finish.
+                for layer, arch in zip(self.layers, self.arch_full):
+                    # Dechunk/residual paths may promote activations to FP32;
+                    # fused Mamba/FlashAttention projections are BF16 in the
+                    # production model.
+                    hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
+                    if arch in ("m", "M"):
+                        layer_mixer_kwargs = ssm_mixer_kwargs
+                        if hidden_states.dim() == 2:
+                            hidden_states = hidden_states.unsqueeze(0)
+                            residual = None if residual is None else residual.unsqueeze(0)
+                    elif arch in ("s", "S", "t", "T"):
+                        layer_mixer_kwargs = {**attn_mixer_kwargs, "loop_idx": _loop_idx}
+                        if hidden_states.dim() == 3 and packed:
+                            hidden_states = hidden_states.squeeze(0)
+                            residual = None if residual is None else residual.squeeze(0)
+                    else:
+                        # Currently supporting only Mamba2 and MHA
+                        raise NotImplementedError
+                    hidden_states, residual = layer(
+                        hidden_states,
+                        residual,
                         inference_params=inference_params,
-                        mixer_kwargs=(
-                            ssm_mixer_kwargs if arch in ("m", "M")
-                            else {**attn_mixer_kwargs, "loop_idx": _loop_idx}
-                        ),
+                        mixer_kwargs=layer_mixer_kwargs,
                         active_mask=mask,
                     )
                     if mask is not None:
-                        active_dtype = active.to(msar_out.dtype)
-                        msar_out = msar_out * active_dtype
-                        if msar_residual is not None:
-                            msar_residual = msar_residual * active_dtype
-                    raw_state = msar_out if msar_residual is None else msar_out + msar_residual
-                    # Gate each layer's multi-scale residual independently.
-                    # A single mean scale would force all layers to share one
-                    # scalar gradient and waste the per-layer parameters.
-                    layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
-                    msar_state = layer_input + layer_scale * (raw_state - layer_input)
-                    if packed and msar_state.dim() == 3:
-                        msar_state = msar_state.squeeze(0)
-                    if (layer_idx + 1) % self.msar_block_size == 0:
-                        msar_sources.append(msar_state)
-                hidden_states = msar_state
-                hidden_states = self.rmsnorm(
-                    hidden_states, residual=None, prenorm=False, residual_in_fp32=True
-                )
-                residual = None
-                continue
-            residual = None
-            # Reusing the same layer objects shares weights. CausalMHA uses a
-            # loop-indexed cache slot so each recurrent depth has exact
-            # autoregressive context; rotary offsets advance once per token,
-            # after all loops finish.
-            for layer, arch in zip(self.layers, self.arch_full):
-                # Dechunk/residual paths may promote activations to FP32;
-                # fused Mamba/FlashAttention projections are BF16 in the
-                # production model.
-                hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
-                if arch in ("m", "M"):
-                    layer_mixer_kwargs = ssm_mixer_kwargs
-                    if hidden_states.dim() == 2:
-                        hidden_states = hidden_states.unsqueeze(0)
-                        residual = None if residual is None else residual.unsqueeze(0)
-                elif arch in ("s", "S", "t", "T"):
-                    layer_mixer_kwargs = {**attn_mixer_kwargs, "loop_idx": _loop_idx}
-                    if hidden_states.dim() == 3 and packed:
-                        hidden_states = hidden_states.squeeze(0)
-                        residual = None if residual is None else residual.squeeze(0)
-                else:
-                    # Currently supporting only Mamba2 and MHA
-                    raise NotImplementedError
-                hidden_states, residual = layer(
-                    hidden_states,
-                    residual,
-                    inference_params=inference_params,
-                    mixer_kwargs=layer_mixer_kwargs,
-                    active_mask=mask,
-                )
-                if mask is not None:
-                    active_dtype = active.to(hidden_states.dtype)
-                    hidden_states = hidden_states * active_dtype
-                    if residual is not None:
-                        residual = residual * active_dtype
+                        active_dtype = active.to(hidden_states.dtype)
+                        hidden_states = hidden_states * active_dtype
+                        if residual is not None:
+                            residual = residual * active_dtype
 
-        # Setting prenorm=False ignores the residual
-            hidden_states = self.rmsnorm(
-                hidden_states, residual=residual, prenorm=False, residual_in_fp32=True
-            )
+                # Setting prenorm=False ignores the residual.
+                hidden_states = self.rmsnorm(
+                    hidden_states, residual=residual, prenorm=False, residual_in_fp32=True
+                )
 
         if hidden_states.dim() == 3 and packed:
             hidden_states = hidden_states.squeeze(0)
@@ -414,7 +546,7 @@ class Isotropic(nn.Module):
 
         if inference_params is not None:
             # here we also explicitly assume the mask is all True
-            assert mask.shape[0] == 1, "seqlen_offset handling assumes batch size 1"
+            assert hidden_states.shape[0] == 1, "seqlen_offset handling assumes batch size 1"
             inference_params.seqlen_offset += hidden_states.shape[1]
 
         return hidden_states
@@ -424,10 +556,55 @@ class Isotropic(nn.Module):
         Assumes hidden_states is (B, 1, D). Steps each of the layers in order, and then steps the main model.
         """
         if self.msar_enabled:
-            raise RuntimeError(
-                "MSAR autoregressive stepping requires stream state; "
-                "generation with MSAR-enabled training weights is unsupported"
-            )
+            if inference_params.msar_history is None:
+                raise RuntimeError("MSAR inference cache was not allocated for this stack")
+            # The canonical deepest stack is attention-only, so its two loops
+            # can share each layer's KV slot while MSAR keeps a separate
+            # bounded stream history for each recurrent execution.
+            for loop_idx in range(self.loop_count):
+                history = inference_params.msar_history[loop_idx]
+                base_state = hidden_states[:, 0]
+                state = base_state
+                boundary_currents = []
+                boundary_indices = []
+                layer_outputs = []
+                for layer_idx, layer in enumerate(self.layers):
+                    source_currents = [base_state, *boundary_currents, state]
+                    history_indices = [0, *boundary_indices, layer_idx]
+                    layer_input = self._msar_mix_step(
+                        source_currents, history, layer_idx, history_indices
+                    )
+                    block_input = layer_input.unsqueeze(1)
+                    block_out, block_residual = layer.step(
+                        block_input,
+                        inference_params,
+                        residual=None,
+                        loop_idx=loop_idx,
+                    )
+                    raw_state = block_out[:, 0]
+                    if block_residual is not None:
+                        raw_state = raw_state + block_residual[:, 0]
+                    scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
+                    state = layer_input + scale * (raw_state - layer_input)
+                    layer_outputs.append(state)
+                    if (layer_idx + 1) % self.msar_block_size == 0:
+                        boundary_currents.append(state)
+                        boundary_indices.append(layer_idx + 1)
+                # Histories represent source streams from prior tokens. Append
+                # only after the complete current token has traversed the
+                # stack; appending at a boundary would make the next layer's
+                # causal kernel read the current token as lag-1.
+                self._append_msar_history(history[0], base_state)
+                for layer_index, current in enumerate(layer_outputs, start=1):
+                    self._append_msar_history(history[layer_index], current)
+                hidden_states = self.rmsnorm(
+                    state.unsqueeze(1),
+                    residual=None,
+                    prenorm=False,
+                    residual_in_fp32=True,
+                )
+            inference_params.seqlen_offset += 1
+            return hidden_states
         if self.loop_count > 1 and any(arch in ("m", "M") for arch in self.arch_full):
             # Mamba2Wrapper owns one recurrent state per layer; unlike
             # CausalMHA it does not allocate loop-indexed state slots.

@@ -10,7 +10,7 @@ from .hnet import HNet, HNetState
 from .config_hnet import HNetConfig
 
 from hnet.modules.dc import RoutingModuleOutput
-from hnet.te import make_linear
+from hnet.te import make_linear, graph_capture_enabled
 
 
 class FixedByteFeatures(nn.Module):
@@ -82,7 +82,12 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         self.backbone = HNet(config=config, stage_idx=0, device=device, dtype=dtype)
         # Keep the CE output path in FP32, matching the TE model's stable head.
         self.lm_head = make_linear(
-            config.d_model[0], config.vocab_size, bias=False, device=device, dtype=torch.float32
+            config.d_model[0],
+            config.vocab_size,
+            bias=False,
+            device=device,
+            dtype=torch.float32,
+            fp8=False,
         )
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)
         self.backbone._init_weights(0.02)
@@ -97,11 +102,6 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             raise ValueError(f"the canonical model requires fbt_passes={required_passes}")
         if inference_params is not None and int(fbt_passes) != 1:
             raise ValueError("inference-cache prefill uses exactly one pass")
-        if inference_params is not None:
-            raise RuntimeError(
-                "canonical FBT+MSAR training weights do not expose a top-level inference-cache path; "
-                "use CausalMHA's compressed VHA cache for decoder prefill/decode"
-            )
         integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
         if input_ids.dtype not in integer_dtypes:
             raise TypeError("H-Net byte inputs must be integer byte IDs")
@@ -141,6 +141,7 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             inference_params=inference_params,
             fbt_passes=fbt_passes,
             return_feedback=int(fbt_passes) > 1,
+            graph_dense_mask=graph_capture_enabled(),
             **mixer_kwargs,
         )
         if len(result) == 3:
@@ -173,11 +174,6 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         )
 
     def step(self, input_ids, inference_params):
-        if bool(getattr(self.config, "fbt", True)) or bool(getattr(self.config, "msar", True)):
-            raise RuntimeError(
-                "canonical FBT+MSAR training weights do not expose a partial token-step path; "
-                "run full-sequence evaluation"
-            )
         if input_ids.shape[0] != 1:
             raise ValueError("H-Net byte generation currently requires batch size 1")
         hidden_states = self.byte_features(input_ids, self.input_dtype)

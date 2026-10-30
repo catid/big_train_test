@@ -18,19 +18,29 @@ configuration is unspecified. The 128-token SWA width and 3:1 SWA/FA schedule
 here are this project's explicit 600M design choices, rather than claims about
 the unreleased Cartesia model.
 
-The canonical DDP + FBT2 + AnchorMuon update is eager. CUDA graph capture is
-rejected explicitly because DDP gradient-bucket logging performs an operation
-that CUDA forbids during capture; this avoids silently running a different
-partial optimization path.
+The canonical DDP + FBT2 + AnchorMuon update can use `--cuda-graphs` for fixed
+shapes. Router-selected chunks are left-aligned with trailing padding; causal
+attention cannot see that future padding, and active masks clear padded MLP and
+residual rows. The graph path fails during capture if a TE kernel or DDP setup
+still performs a host shape read. DDP capture uses a dedicated stream and
+averages a flat gradient buffer after replay because DDP's runtime logger is not
+capture-safe.
 
-The loop cache is indexed by recurrent depth for exact autoregressive context;
-weights are shared while KV state is kept separate per loop. FBT training uses
-fresh caches and fixed chunk boundaries, as required by its multipass
-objective. The outer encoder, router, chunker, dechunker, and decoder do not
-use MSAR or FBT. MSAR currently has no recurrent stream-state implementation
-for token-by-token decoding; `Isotropic.step` rejects that combination instead
-of silently serving a model with different residual dynamics. Training and
-full-sequence evaluation remain supported.
+The looped attention executions share the layer KV slot and rewrite it on each
+refinement; weights are shared across both executions. FBT training uses fresh
+caches and fixed chunk boundaries, as required by its multipass objective. The
+outer encoder, router, chunker, dechunker, and decoder do not use MSAR or FBT.
+MSAR currently has no recurrent stream-state implementation for token-by-token
+decoding; `Isotropic.step` rejects that combination instead of silently serving
+a model with different residual dynamics. The VHA cache itself is allocated
+per FA layer with two physical KV heads and rank-4 postmix compression, but the
+top-level FBT/MSAR wrapper intentionally exposes training and full-sequence
+evaluation only until an MSAR stream-state implementation is added.
+
+FBT follows arXiv:2608.08888 Fig. 10: jitter is applied before document-local
+shift-right, the shifted state is fused through a gated GLU with normalized
+token input, and the fused input receives a second RMSNorm before the shared
+inner stack. The current pass is not added back to the fused state.
 
 Example launch (artifacts stay outside this repository):
 
@@ -40,8 +50,20 @@ torchrun --nproc_per_node=8 train_hnet_600m.py \
   --seq 4096 --batch 1
 ```
 
-The trainer logs per-GPU power. Adjust `--batch` only after observing the
-steady-state draw; the target is approximately 1000 W per B300.
+The trainer logs per-GPU power. `--auto-batch` runs complete FP8 calibration
+steps at bounded candidate batches, averages readings across DDP ranks, and
+selects a measured draw against the approximately 1000 W per-B300 target. If
+every candidate remains below target, it selects the largest fully validated
+candidate and records that gap rather than pretending the target was reached;
+if every candidate is above target, it selects the smallest. Candidates are
+powers of two up to `--auto-batch-max` (default 32), bounded by a memory
+reserve for optimizer and DDP state. Calibration includes DDP synchronization,
+gradient clipping, and the real AnchorMuon update, then restores model and
+optimizer state before measuring the next candidate.
+
+The run's `loss` field is the plain byte cross-entropy. The combined FBT,
+router, and MoE objective is logged separately as `objective`; `--target-ce`
+(default 4.0) records the first step that reaches the requested CE target.
 
 The selected FFN path uses a Mixtral/DeepSeek-style sparse layer from the
 BioNeMo `mixtral_native_te` design: eight stacked routed experts with top-1
@@ -50,9 +72,10 @@ Each routed expert has intermediate width 512, so the eight routed experts
 have the same aggregate parameter count as the dense width 4096 FFN; the
 shared expert adds a narrow 256-wide common path. This keeps the direct model
 near 600M parameters (the shared path adds about 22M weights across the FA/SWA blocks).
-Dispatch uses fixed per-expert
-capacity and grouped tensor contractions so the token shape remains stable
-for CUDA graphs. The router auxiliary loss is accumulated in FP32.
+Dispatch uses fixed per-expert capacity and grouped tensor contractions. The
+router auxiliary loss is accumulated in FP32. The chunker keeps a fixed padded
+bound during graph replay; selected boundaries are left-aligned and trailing
+padding is masked from residual and MLP outputs.
 
 AnchorMuon applies GramNS/PMuonEq/NorMuon to sufficiently wide matrix banks
 and AdamATan2 to vectors and skinny control projections. BF16 model weights use
@@ -66,3 +89,14 @@ corrected path (`attn_cfg.croissattn_aux=true`) for regular and packed training;
 finite attention windows and generation retain the fused FlashAttention path.
 The TE FP8 trainer keeps the equivalent correction
 enabled through `NVTE_FP8_DPA_BWD=1`/`NVTE_DPA_CROISSATTN_AUX=1`.
+
+Transformer Engine FP8 covers every attention projection, the global FA DPA
+(including the patched CroissAttn backward), sparse MoE GroupedLinear and
+shared/router projection, and the FBT feedback projections. SWA keeps its
+fused FlashAttention product path while its QKV/output projections remain TE
+FP8.
+The fixed byte lift, fused Mamba-2 state-space kernel, causal router's Q/K
+boundary scores, routing boundary residual projection, RMSNorms, and FP32
+language-model head remain explicitly higher precision for their fixed-code or
+numerical-stability contracts; these are deliberate precision boundaries, not
+alternate training implementations.

@@ -199,7 +199,16 @@ class ChunkLayer(nn.Module):
             next_cu_seqlens = F.pad(
                 boundary_mask.cumsum(dim=0)[cu_seqlens[1:] - 1], (1, 0)
             )
-            next_max_seqlen = int((next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max())
+            if self.static_max_seqlen is not None:
+                # A configured upper bound is valid for FlashAttention's
+                # varlen API and avoids converting a data-dependent CUDA max
+                # to a Python integer.  The cumulative lengths still carry
+                # the exact token counts for every document.
+                next_max_seqlen = int(self.static_max_seqlen)
+            else:
+                next_max_seqlen = int(
+                    (next_cu_seqlens[1:] - next_cu_seqlens[:-1]).max()
+                )
             next_mask = None
         else:
             next_cu_seqlens = None
@@ -296,7 +305,11 @@ class DeChunkLayer(nn.Module):
 
         if cu_seqlens is not None:
             p = p[boundary_mask].unsqueeze(0)
-            seq_idx = get_seq_idx(cu_seqlens, device=hidden_states.device)
+            seq_idx = get_seq_idx(
+                cu_seqlens,
+                device=hidden_states.device,
+                total_length=hidden_states.shape[0],
+            )
         else:
             B, L = boundary_mask.shape
             seq_idx = None

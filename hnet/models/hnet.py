@@ -3,6 +3,7 @@ from typing import Union, Optional
 
 import torch
 import torch.nn as nn
+from flash_attn.ops.triton.layer_norm import RMSNorm
 
 from hnet.modules.isotropic import Isotropic, IsotropicInferenceParams
 from hnet.modules.dc import (
@@ -13,7 +14,7 @@ from hnet.modules.dc import (
     DeChunkState,
 )
 from hnet.modules.utils import apply_optimization_params
-from hnet.te import make_linear
+from hnet.te import fp8_context, make_linear
 
 from .config_hnet import HNetConfig
 
@@ -106,7 +107,11 @@ class HNet(nn.Module):
 
             # do the residual in fp32
             self.residual_proj = make_linear(
-                self.d_model, self.d_model, device=device, dtype=torch.float32
+                self.d_model,
+                self.d_model,
+                device=device,
+                dtype=torch.float32,
+                fp8=False,
             )
             nn.init.zeros_(self.residual_proj.weight)
             nn.init.zeros_(self.residual_proj.bias)
@@ -124,6 +129,12 @@ class HNet(nn.Module):
                 # never changes chunk boundaries or inner dimensions.
                 self.fbt_up = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
                 self.fbt_gate = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+                # FBT normalizes both sides of the fusion as in the paper's
+                # full training recipe (Fig. 10): the token path is normalized
+                # before its gate projection and the multiplicative fused
+                # state is normalized before re-entering the stack.
+                self.fbt_input_norm_1 = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
+                self.fbt_input_norm_2 = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
                 nn.init.zeros_(self.fbt_up.weight)
                 nn.init.zeros_(self.fbt_gate.weight)
                 self.fbt_up.weight._no_reinit = True
@@ -241,15 +252,34 @@ class HNet(nn.Module):
         if fbt_passes > 1 and inference_params is not None:
             raise ValueError("FBT multi-pass training requires fresh caches; do not combine it with inference_params")
 
+        # The model creates an empty state container for ordinary training so
+        # nested modules can share one call signature.  Only an object supplied
+        # by the caller represents a requested autoregressive cache; keep that
+        # distinction explicit for the prefill-only trimming below.
+        cache_requested = inference_params is not None
         if inference_params is None:
             inference_params = HNetState(main_network_state=None)
         else:
             assert (
                 mask is not None
             ), "Mask must be provided if inference_params is provided"
+            # The recurrent cache stores one state per real token.  A padded
+            # outer prompt would make the encoder/router offsets ambiguous and
+            # cannot be represented by the scalar ``seqlen_offset`` fields.
+            # Require a contiguous, unpadded prefill instead of silently
+            # caching padding as context.
+            if mask.dtype is not torch.bool or not bool(mask.all()):
+                raise ValueError(
+                    "inference-cache prefill requires a contiguous unpadded mask"
+                )
 
         D = hidden_states.shape[-1]
         EARLY_DIMS = hidden_states.shape[:-1]
+        # The trainer's static byte mask is dense, but masks produced by the
+        # router/chunk layer are data-dependent.  Keep this marker local to
+        # encoder/decoder calls so an inner recurrent H-Net cannot mistake its
+        # padded chunk mask for a dense sequence during graph capture.
+        graph_dense_mask = bool(mixer_kwargs.pop("graph_dense_mask", False))
 
         if self.pad_dimension is not None:
             hidden_states = torch.cat(
@@ -274,14 +304,18 @@ class HNet(nn.Module):
             max_seqlen=max_seqlen,
             mask=mask,
             inference_params=inference_params.encoder_state,
+            graph_dense_mask=graph_dense_mask,
             **mixer_kwargs,
         )
 
         hidden_states_for_residual = hidden_states.to(
             dtype=self.residual_proj.weight.dtype
         )
+        # Residual and boundary controls stay outside FP8 autocast. Their
+        # projections are initialized at zero and feed the chunk mask/identity
+        # path; quantizing them would perturb the hard routing decision and
+        # defeat the FP32 safety contract used by the CE/router fixes.
         residual = self.residual_proj(hidden_states_for_residual)
-
         bpred_output = self.routing_module(
             hidden_states,
             cu_seqlens=cu_seqlens,
@@ -291,6 +325,26 @@ class HNet(nn.Module):
         hidden_states, next_cu_seqlens, next_max_seqlen, next_mask = self.chunk_layer(
             hidden_states, bpred_output.boundary_mask, cu_seqlens, mask=mask
         )
+
+        # ChunkLayer's static path returns a left-aligned padded latent tensor
+        # so the training graph has stable addresses.  Inference caches are
+        # token indexed, therefore remove that padding before the deepest
+        # stack.  This is exact for batch size one (the supported generation
+        # path) because there is a single active latent count and the valid
+        # rows are already left aligned by ChunkLayer.
+        if cache_requested and next_mask is not None:
+            if next_mask.shape[0] != 1:
+                raise ValueError(
+                    "inference-cache H-Net prefill currently requires batch size 1"
+                )
+            latent_count = int(next_mask.sum().item())
+            if latent_count <= 0:
+                raise ValueError("inference-cache prefill produced no latent boundaries")
+            hidden_states = hidden_states[:, :latent_count]
+            next_mask = torch.ones(
+                (1, latent_count), device=hidden_states.device, dtype=torch.bool
+            )
+            next_max_seqlen = None
 
         n_passes = max(1, int(fbt_passes)) if self.fbt_enabled else 1
         # A normal one-pass prefill must populate the allocated recurrent/KV
@@ -307,6 +361,11 @@ class HNet(nn.Module):
         )
         feedback_logits = []
         base_chunk_states = hidden_states
+        feedback_token = (
+            self.fbt_input_norm_1(base_chunk_states)
+            if self.fbt_enabled and n_passes > 1
+            else None
+        )
         previous_inner = None
         final_prev_boundary_predictions = []
         for pass_idx in range(n_passes):
@@ -314,9 +373,20 @@ class HNet(nn.Module):
             if pass_idx > 0:
                 # Shift within each packed document; no cross-document latent
                 # state is allowed to enter a new byte stream.
+                feedback_source = previous_inner
+                if self.training and getattr(self.config, "fbt_jitter", 0.0) > 0:
+                    # The paper perturbs the previous hidden state before the
+                    # causal shift. This keeps every document's first feedback
+                    # token exactly zero instead of injecting noise at a reset.
+                    feedback_source = feedback_source + torch.empty_like(
+                        feedback_source
+                    ).uniform_(
+                        -float(self.config.fbt_jitter),
+                        float(self.config.fbt_jitter),
+                    )
                 if next_cu_seqlens is None:
                     shifted = torch.cat(
-                        (torch.zeros_like(previous_inner[:, :1]), previous_inner[:, :-1]),
+                        (torch.zeros_like(feedback_source[:, :1]), feedback_source[:, :-1]),
                         dim=1,
                     )
                 else:
@@ -326,7 +396,7 @@ class HNet(nn.Module):
                     # writes there detach the previous pass and silently
                     # freeze both FBT projection matrices at zero.
                     shifted = torch.cat(
-                        (torch.zeros_like(previous_inner[:1]), previous_inner[:-1]),
+                        (torch.zeros_like(feedback_source[:1]), feedback_source[:-1]),
                         dim=0,
                     )
                     starts = next_cu_seqlens[:-1]
@@ -335,30 +405,38 @@ class HNet(nn.Module):
                     )
                     is_start.scatter_(0, starts, True)
                     shifted = torch.where(is_start[:, None], torch.zeros_like(shifted), shifted)
-                if self.training and getattr(self.config, "fbt_jitter", 0.0) > 0:
-                    shifted = shifted + torch.empty_like(shifted).uniform_(
-                        -float(self.config.fbt_jitter), float(self.config.fbt_jitter)
-                    )
-                # The projection is kept outside any FP8 region and the gate
-                # is evaluated in FP32 for stable sigmoid gradients.
-                gate = torch.sigmoid(self.fbt_gate(pass_input).float()).to(pass_input.dtype)
+                # Quantize the learned feedback projections with the same FP8
+                # recipe as the main stack, then evaluate the sigmoid in FP32
+                # so the multiplicative gate keeps stable gradients.
+                # FBT's fused input is the gated projection of the previous
+                # pass (Eq. 4 in arXiv:2608.08888).  Do not add the current
+                # pass input here: that shortcut changes the objective's
+                # conditioning path and lets the second pass bypass feedback.
                 shifted = shifted.to(dtype=self.fbt_up.weight.dtype)
-                pass_input = pass_input + self.fbt_up(shifted).to(pass_input.dtype) * gate
+                with fp8_context():
+                    gate_logits = self.fbt_gate(feedback_token)
+                    feedback_value = self.fbt_up(shifted)
+                gate = torch.sigmoid(gate_logits.float()).to(pass_input.dtype)
+                pass_input = feedback_value.to(pass_input.dtype) * gate
                 if getattr(self.config, "fbt_prefix_mixin", False):
                     # Keep a plain prefix so training matches prompt-prefill
                     # followed by feedback-conditioned generation.
                     plain = torch.zeros(pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device)
                     if next_cu_seqlens is None:
                         # ChunkLayer left-aligns real chunks and pads to a
-                        # static bound. Choose the prefix from the real count,
-                        # rather than the padded width; otherwise short
-                        # sequences make every real chunk plain and FBT never
-                        # trains its feedback projections.
+                        # static bound. Draw one prefix length per batch row
+                        # from the real count; a fixed first-half prefix would
+                        # make feedback conditioning correlate with position
+                        # and leave the same rows permanently unconditioned.
                         real_counts = next_mask.sum(dim=-1)
+                        prefixes = (
+                            torch.rand(real_counts.shape, device=pass_input.device)
+                            * (real_counts + 1).to(torch.float32)
+                        ).to(real_counts.dtype)
                         token_idx = torch.arange(
                             pass_input.shape[1], device=pass_input.device
                         )[None, :]
-                        plain = token_idx < (real_counts[:, None] // 2)
+                        plain = token_idx < prefixes[:, None]
                         plain = plain & next_mask
                     else:
                         # Draw one prefix length per packed document on the
@@ -379,6 +457,7 @@ class HNet(nn.Module):
                         doc_idx = torch.bucketize(token_idx, ends[:-1], right=True)
                         plain = (token_idx - starts[doc_idx]) < prefixes[doc_idx]
                     pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
+                pass_input = self.fbt_input_norm_2(pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
                 pass_input,
                 cu_seqlens=next_cu_seqlens,
@@ -407,6 +486,7 @@ class HNet(nn.Module):
                 max_seqlen=max_seqlen,
                 mask=mask,
                 inference_params=cached_decoder_state,
+                graph_dense_mask=graph_dense_mask,
                 **mixer_kwargs,
             )
             if return_feedback:
