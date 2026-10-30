@@ -18,6 +18,10 @@ import subprocess
 import time
 from pathlib import Path
 
+# Import hnet first: it loads the pinned Transformer Engine before torch can
+# select a conflicting CUDA library set.
+from hnet.te import assert_fp8_runtime, fp8_context
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -232,6 +236,7 @@ def read_power_watts():
 
 def main():
     args = parse_args()
+    assert_fp8_runtime()
     rank, world, device = init_dist()
     torch.manual_seed(1729 + rank)
     cfg = load_config()
@@ -323,9 +328,13 @@ def main():
                 group["fallback_lr"] = args.fallback_lr * lr_scale
         t0 = time.perf_counter()
         mask = torch.ones_like(x, dtype=torch.bool)
-        out = model(x, mask=mask, fbt_passes=FBT_PASSES)
-        loss, _, ratio = loss_for_output(out, y, args)
         optimizer.zero_grad(set_to_none=True)
+        with fp8_context():
+            out = model(x, mask=mask, fbt_passes=FBT_PASSES)
+            loss, _, ratio = loss_for_output(out, y, args)
+        # Transformer Engine updates delayed-scaling state during the forward
+        # autocast scope; its backward kernels consume that state and should be
+        # launched after leaving the context.
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         finite_local = torch.isfinite(loss) & torch.isfinite(grad_norm)

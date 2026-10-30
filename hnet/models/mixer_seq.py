@@ -10,6 +10,7 @@ from .hnet import HNet, HNetState
 from .config_hnet import HNetConfig
 
 from hnet.modules.dc import RoutingModuleOutput
+from hnet.te import make_linear
 
 
 class FixedByteFeatures(nn.Module):
@@ -80,7 +81,7 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         self.byte_features = FixedByteFeatures(config.d_model[0], device=device)
         self.backbone = HNet(config=config, stage_idx=0, device=device, dtype=dtype)
         # Keep the CE output path in FP32, matching the TE model's stable head.
-        self.lm_head = nn.Linear(
+        self.lm_head = make_linear(
             config.d_model[0], config.vocab_size, bias=False, device=device, dtype=torch.float32
         )
         nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.02)

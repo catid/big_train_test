@@ -9,6 +9,7 @@ from einops import repeat, rearrange
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
 from hnet.modules.utils import get_seq_idx
+from hnet.te import make_linear
 from torch.utils._pytree import register_pytree_node
 
 
@@ -66,8 +67,8 @@ class RoutingModule(nn.Module):
         self.d_model = d_model
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
-        self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.q_proj_layer = make_linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.k_proj_layer = make_linear(d_model, d_model, bias=False, **factory_kwargs)
         with torch.no_grad():
             self.q_proj_layer.weight.copy_(torch.eye(d_model))
             self.k_proj_layer.weight.copy_(torch.eye(d_model))

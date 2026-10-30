@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from hnet.te import TEGroupedLinear, make_linear
 
 class SparseMoESwiGLU(nn.Module):
     """Static-shape top-1 sparse SwiGLU with a DeepSeek-style shared expert.
@@ -61,23 +62,29 @@ class SparseMoESwiGLU(nn.Module):
 
         # [E, 2I, D] and [E, D, I] are consumed as one grouped GEMM via
         # einsum.  The layout mirrors TE GroupedLinear's stacked experts.
-        self.experts_fc1 = nn.Parameter(
-            torch.empty(self.num_experts, 2 * expert_intermediate, d_model, **factory_kwargs)
+        self.experts_fc1 = TEGroupedLinear(
+            self.num_experts, d_model, 2 * expert_intermediate, bias=bias,
+            params_dtype=dtype, device=device, use_grouped_tensor=True,
         )
-        self.experts_fc2 = nn.Parameter(
-            torch.empty(self.num_experts, d_model, expert_intermediate, **factory_kwargs)
+        self.experts_fc2 = TEGroupedLinear(
+            self.num_experts, expert_intermediate, d_model, bias=bias,
+            params_dtype=dtype, device=device, use_grouped_tensor=True,
         )
-        self.shared_fc1 = nn.Linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
-        self.shared_fc2 = nn.Linear(shared_intermediate, d_model, bias=bias, **factory_kwargs)
-        self.router = nn.Linear(d_model, self.num_experts, bias=False, **factory_kwargs)
-        self.shared_gate = nn.Linear(d_model, 1, bias=True, **factory_kwargs)
+        self.shared_fc1 = make_linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
+        self.shared_fc2 = make_linear(shared_intermediate, d_model, bias=bias, **factory_kwargs)
+        self.router = make_linear(d_model, self.num_experts, bias=False, **factory_kwargs)
+        self.shared_gate = make_linear(d_model, 1, bias=True, **factory_kwargs)
         self._aux_loss = None
         self._aux_loss_count = 0
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.normal_(self.experts_fc1, mean=0.0, std=0.02)
-        nn.init.normal_(self.experts_fc2, mean=0.0, std=0.02 / math.sqrt(2.0))
+        for name, weight in self.experts_fc1.named_parameters():
+            if name.startswith("weight"):
+                nn.init.normal_(weight, mean=0.0, std=0.02)
+        for name, weight in self.experts_fc2.named_parameters():
+            if name.startswith("weight"):
+                nn.init.normal_(weight, mean=0.0, std=0.02 / math.sqrt(2.0))
         nn.init.normal_(self.router.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.shared_fc1.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.shared_fc2.weight, mean=0.0, std=0.02 / math.sqrt(2.0))
@@ -189,10 +196,27 @@ class SparseMoESwiGLU(nn.Module):
         dispatched.index_copy_(0, slot_safe, flat)
         dispatched = dispatched[:trash].view(self.num_experts, capacity, self.d_model)
 
-        expert_hidden = torch.einsum("ecd,eod->eco", dispatched, self.experts_fc1)
+        # The fused/native GroupedLinear path requires a device resident
+        # int64 split tensor.  A Python list is converted on the host by TE
+        # and then rejected when ``use_grouped_tensor`` is enabled; caching by
+        # capacity keeps the graph replay path allocation free after warmup.
+        split_key = (flat.device.type, flat.device.index, capacity)
+        m_splits = getattr(self, "_m_splits_cache", {}).get(split_key)
+        if m_splits is None:
+            if not hasattr(self, "_m_splits_cache"):
+                self._m_splits_cache = {}
+            m_splits = torch.full(
+                (self.num_experts,), capacity, dtype=torch.int64, device=flat.device
+            )
+            self._m_splits_cache[split_key] = m_splits
+        expert_hidden = self.experts_fc1(
+            dispatched.reshape(-1, self.d_model), m_splits
+        ).view(self.num_experts, capacity, 2 * self.expert_intermediate)
         value, gate = expert_hidden.chunk(2, dim=-1)
         expert_hidden = F.silu(gate) * value
-        expert_out = torch.einsum("eci,edi->ecd", expert_hidden, self.experts_fc2)
+        expert_out = self.experts_fc2(
+            expert_hidden.reshape(-1, self.expert_intermediate), m_splits
+        ).view(self.num_experts, capacity, self.d_model)
         gathered = expert_out.reshape(-1, self.d_model).index_select(0, slot.clamp_max(trash - 1))
         gathered = gathered * routing_prob[:, None].to(gathered.dtype)
         routed = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))

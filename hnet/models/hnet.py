@@ -13,6 +13,7 @@ from hnet.modules.dc import (
     DeChunkState,
 )
 from hnet.modules.utils import apply_optimization_params
+from hnet.te import make_linear
 
 from .config_hnet import HNetConfig
 
@@ -104,7 +105,7 @@ class HNet(nn.Module):
             self.dechunk_layer = DeChunkLayer(self.d_model)
 
             # do the residual in fp32
-            self.residual_proj = nn.Linear(
+            self.residual_proj = make_linear(
                 self.d_model, self.d_model, device=device, dtype=torch.float32
             )
             nn.init.zeros_(self.residual_proj.weight)
@@ -121,8 +122,8 @@ class HNet(nn.Module):
                 # The recursive main network returns its state projected back
                 # to the outer width D0. Feedback therefore stays at D0 and
                 # never changes chunk boundaries or inner dimensions.
-                self.fbt_up = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
-                self.fbt_gate = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+                self.fbt_up = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+                self.fbt_gate = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
                 nn.init.zeros_(self.fbt_up.weight)
                 nn.init.zeros_(self.fbt_gate.weight)
                 self.fbt_up.weight._no_reinit = True
@@ -145,7 +146,7 @@ class HNet(nn.Module):
         if self.is_innermost:
             n_residuals += self.main_network.height
             for name, m in self.main_network.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
+                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
                     if "out_proj" in name or "fc2" in name:
                         nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
                     else:
@@ -154,13 +155,13 @@ class HNet(nn.Module):
         else:
             n_residuals += self.encoder.height + self.decoder.height
             for name, m in self.encoder.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
+                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
                     if "out_proj" in name or "fc2" in name:
                         nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
                     else:
                         nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
             for name, m in self.decoder.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
+                if (isinstance(m, nn.Linear) or m.__class__.__name__ in ("Linear", "AlignedTELinear")) and not getattr(m.weight, "_no_reinit", False):
                     if "out_proj" in name or "fc2" in name:
                         nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
                     else:

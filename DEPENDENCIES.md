@@ -10,7 +10,9 @@ floating Git revisions during a training run.
 - Mamba-SSM 2.3.2.post1 (source-built for this CUDA/Python runtime)
 - causal-conv1d 1.7.0
 - einops, optree, regex, omegaconf
-- Transformer Engine from `/home/catid/fp8/TransformerEngine` at its checked-out commit
+- Transformer Engine from `/home/catid/fp8/TransformerEngine` at commit
+  `9646c3ef22455b6948cbe870f1aaf20fc8238d69`, rebuilt against this environment
+- cuDNN `9.23.2.1` (the packed fused FP8 DPA backend requires cuDNN >= 9.23 on B300)
 - BioNeMo Mixtral TE routing/GroupedMLP design reviewed at
   `NVIDIA-BioNeMo/bionemo-recipes` commit
   `2686b2418889ce346c5e50ea8614bb3b27415b97`; no BioNeMo runtime dependency is
