@@ -1,10 +1,11 @@
 """Direct 600M H-Net raw-byte trainer.
 
-The model consumes UTF-8 bytes through a frozen categorical byte code, then
-learns boundaries with H-Net routing from the first update. There is no BPE or
-trainable token embedding. The script keeps the CE and router losses in FP32,
-uses AnchorMuon/GramNS with its AdamATan2 fallback, FBT multi-pass training,
-and supports CUDA-graph capture for the fixed-shape padded training contract.
+The model consumes document-local UTF-8 bytes from a validated manifest through
+a frozen categorical byte code, then learns boundaries with H-Net routing from
+the first update. There is no BPE or trainable token embedding. The script
+keeps the CE and router losses in FP32, uses AnchorMuon/GramNS with its
+AdamATan2 fallback, FBT multi-pass training, and supports CUDA-graph capture
+for the fixed-shape padded training contract.
 """
 
 from __future__ import annotations
