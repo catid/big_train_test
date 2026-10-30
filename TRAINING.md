@@ -64,7 +64,7 @@ torchrun --nproc_per_node=8 train_hnet_600m.py \
 
 The trainer logs per-GPU power. Auto-batch calibration is enabled by default
 (`--no-auto-batch` disables it) and runs complete FP8 calibration
-steps at bounded candidate batches, averages readings across DDP ranks, and
+steps at bounded candidate batches, takes the worst-rank reading across DDP, and
 selects a measured draw against the approximately 1000 W per-B300 target. If
 every candidate remains below target, it selects the largest fully validated
 candidate and records that gap rather than pretending the target was reached;
