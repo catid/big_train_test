@@ -760,6 +760,12 @@ class CUDAGraphStep:
         self.world = int(world)
         self.capture_stream = capture_stream
         self.ddp = world > 1 and isinstance(model, DDP)
+        # DDP is used for construction and eager warmup so its reducer hooks
+        # are initialized against the complete parameter set.  Captured
+        # replay uses the underlying module after that setup: the wrapper's
+        # per-forward logger/DDPSink path is not graph-safe and is redundant
+        # because replay performs the explicit flat gradient all-reduce below.
+        self.forward_model = model.module if self.ddp else model
         # DDP's reducer only tracks trainable parameters.  Filtering here keeps
         # the flat post-capture collective aligned with the reducer and avoids
         # presence bookkeeping for the frozen byte-code buffer.
@@ -862,7 +868,7 @@ class CUDAGraphStep:
                     )
                 with graph_context:
                     self.optimizer.zero_grad(set_to_none=False)
-                    graph_out = self.model(
+                    graph_out = self.forward_model(
                         self.static_x, mask=self.static_mask, fbt_passes=FBT_PASSES
                     )
                     self.loss, self.metrics = loss_for_output(graph_out, self.static_y, args)
@@ -1019,7 +1025,19 @@ def main():
         # Calibrate after DDP and optimizer construction so the measured step
         # includes gradient synchronization and the real AnchorMuon update.
         # The canonical trainer has no partial/manual-batch execution path.
-        args.batch = calibrate_batch_to_power(model, optimizer, args, device, rank, world)
+        calibration_context = (
+            torch.cuda.stream(graph_stream)
+            if graph_stream is not None
+            else contextlib.nullcontext()
+        )
+        # DDP construction and its AccumulateGrad hooks run on graph_stream.
+        # Keep the direct-module calibration on that same stream; switching to
+        # the default stream here creates avoidable stream-mismatch waits before
+        # the later graph capture even though calibration bypasses the wrapper.
+        with calibration_context:
+            args.batch = calibrate_batch_to_power(
+                model, optimizer, args, device, rank, world
+            )
 
     if resume_state is not None:
         target_model = model.module if world > 1 else model
