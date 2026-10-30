@@ -219,12 +219,18 @@ class CausalMHA(nn.Module):
             device=device,
         )
 
-    def _ensure_loop_cache(self, inference_params, cache_layer_idx):
-        if cache_layer_idx not in inference_params.key_value_memory_dict:
-            base = inference_params.key_value_memory_dict[self.layer_idx]
-            inference_params.key_value_memory_dict[cache_layer_idx] = torch.empty_like(base)
+    def _layer_kv_cache(self, inference_params, batch):
+        """Return this layer's single shared recurrent KV slot."""
+        try:
+            cache = inference_params.key_value_memory_dict[self.layer_idx]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"missing KV cache for attention layer {self.layer_idx}; "
+                "allocate the complete canonical inference cache"
+            ) from exc
+        return cache[:batch]
 
-    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params, cache_layer_idx=None):
+    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
         """
         Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
         q: (batch_size, seqlen_q, nheads, head_dim)
@@ -243,9 +249,7 @@ class CausalMHA(nn.Module):
         else:
             rotary_cos, rotary_sin = None, None
         batch = q.shape[0]
-        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
-        self._ensure_loop_cache(inference_params, cache_layer_idx)
-        kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
+        kv_cache = self._layer_kv_cache(inference_params, batch)
         cache_seqlens = (
             inference_params.lengths_per_sample[:batch]
             if inference_params.lengths_per_sample is not None
@@ -269,12 +273,10 @@ class CausalMHA(nn.Module):
         )
         return context
 
-    def _update_kvcache_attention(self, q, kv, inference_params, cache_layer_idx=None):
+    def _update_kvcache_attention(self, q, kv, inference_params):
         """Write kv to inference_params, then do attention"""
         batch = q.shape[0]
-        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
-        self._ensure_loop_cache(inference_params, cache_layer_idx)
-        kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
+        kv_cache = self._layer_kv_cache(inference_params, batch)
         cache_seqlens = (
             inference_params.lengths_per_sample[:batch]
             if inference_params.lengths_per_sample is not None
@@ -390,9 +392,6 @@ class CausalMHA(nn.Module):
         # The recurrent executions share one KV slot. Each loop rewrites the
         # current token at the same sequence offset, so cache memory stays
         # constant while the second pass attends to the refined history.
-        kwargs.pop("loop_idx", None)
-        cache_layer_idx = self.layer_idx
-
         kwargs = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
         seqlen_offset = (
             0
@@ -432,7 +431,6 @@ class CausalMHA(nn.Module):
             else:
                 context = self._update_kvcache_attention(
                     q, torch.stack((k, v), dim=2), inference_params,
-                    cache_layer_idx=cache_layer_idx,
                 )
             # TE's DPA returns a flattened final dimension for both BSHD and
             # THD calls, while FlashAttention keeps an explicit head axis.
@@ -484,12 +482,11 @@ class CausalMHA(nn.Module):
                 context = self.inner_attn(qkv, **kwargs)
             else:
                 context = self._update_kvcache_attention(
-                    qkv[:, :, 0], qkv[:, :, 1:], inference_params, cache_layer_idx=cache_layer_idx
+                    qkv[:, :, 0], qkv[:, :, 1:], inference_params
                 )
         else:
             context = self._apply_rotary_update_kvcache_attention(
                 qkv[:, :, 0], qkv[:, :, 1:], inference_params,
-                cache_layer_idx=cache_layer_idx,
             )
         # TE DPA returns the head dimension flattened for its packed and
         # padded APIs, while FlashAttention returns ``[..., H, D]``.
@@ -501,8 +498,8 @@ class CausalMHA(nn.Module):
         out = self.out_proj(context_flat)
         return out
 
-    def step(self, x, inference_params, loop_idx=0):
+    def step(self, x, inference_params):
         # Recurrent inner-loop execution intentionally reuses the same cache
         # slot and sequence offset. The later loop refines the current token's
         # K/V in place instead of appending a duplicate position.
-        return self.forward(x, inference_params=inference_params, loop_idx=loop_idx)
+        return self.forward(x, inference_params=inference_params)

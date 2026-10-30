@@ -500,7 +500,7 @@ class Isotropic(nn.Module):
                             inference_params=inference_params,
                             mixer_kwargs=(
                                 ssm_mixer_kwargs if arch in ("m", "M")
-                                else {**attn_mixer_kwargs, "loop_idx": _loop_idx}
+                                else attn_mixer_kwargs
                             ),
                             active_mask=mask,
                         )
@@ -546,7 +546,7 @@ class Isotropic(nn.Module):
                             hidden_states = hidden_states.unsqueeze(0)
                             residual = None if residual is None else residual.unsqueeze(0)
                     elif arch in ("s", "S", "t", "T"):
-                        layer_mixer_kwargs = {**attn_mixer_kwargs, "loop_idx": _loop_idx}
+                        layer_mixer_kwargs = attn_mixer_kwargs
                         if hidden_states.dim() == 3 and packed:
                             hidden_states = hidden_states.squeeze(0)
                             residual = None if residual is None else residual.squeeze(0)
@@ -621,7 +621,6 @@ class Isotropic(nn.Module):
                             block_input,
                             inference_params,
                             residual=None,
-                            loop_idx=loop_idx,
                         )
                     raw_state = block_out[:, 0]
                     if block_residual is not None:
@@ -660,7 +659,7 @@ class Isotropic(nn.Module):
                 hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
                 with fp8_context():
                     hidden_states, residual = layer.step(
-                        hidden_states, inference_params, residual=residual, loop_idx=_loop_idx
+                        hidden_states, inference_params, residual=residual
                     )
             hidden_states = self.rmsnorm(
                 hidden_states, residual=residual, prenorm=False, residual_in_fp32=True

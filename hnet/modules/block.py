@@ -17,7 +17,7 @@ class Mamba2Wrapper(Mamba2):
     Mamba2 wrapper class that has the same inference interface as the CausalMHA class.
     """
 
-    def step(self, hidden_states, inference_params, loop_idx=0):
+    def step(self, hidden_states, inference_params):
         # Don't use _get_states_from_cache because we want to assert that they exist
         conv_state, ssm_state = inference_params.key_value_memory_dict[
             self.layer_idx
@@ -73,6 +73,7 @@ def create_block(
             expert_intermediate=int(getattr(moe_cfg, "moe_expert_intermediate", 0)),
             shared_intermediate=int(getattr(moe_cfg, "moe_shared_intermediate", 0)),
             capacity_factor=float(getattr(moe_cfg, "moe_capacity_factor", 1.25)),
+            capacity_tokens=int(getattr(moe_cfg, "moe_capacity_tokens", 0)),
             aux_loss_weight=float(getattr(moe_cfg, "moe_aux_loss_weight", 0.01)),
             **factory_kwargs,
         )
@@ -153,14 +154,14 @@ class Block(nn.Module):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def step(self, hidden_states, inference_params, residual=None, loop_idx=0):
+    def step(self, hidden_states, inference_params, residual=None):
         hidden_states, residual = self.norm1(
             hidden_states,
             residual=residual,
             prenorm=True,
             residual_in_fp32=self.residual_in_fp32,
         )
-        hidden_states = self.mixer.step(hidden_states, inference_params, loop_idx=loop_idx)
+        hidden_states = self.mixer.step(hidden_states, inference_params)
         if self.mlp is not None:
             hidden_states, residual = self.norm2(
                 hidden_states,
