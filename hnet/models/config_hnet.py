@@ -16,7 +16,11 @@ class AttnConfig:
     vha_rank: int = 0
     # Opt-in CroissAttn FP8 backward correction.  This keeps the auxiliary
     # unrounded O'=P@V_f used by the softmax derivative; see ~/fp8.
-    croissattn_aux: bool = False
+    # CroissAttn is stage-specific: the canonical model keeps the SWA path on
+    # FlashAttention and enables the patched TE correction only for global FA.
+    # Keep this as a list so malformed scalar configuration cannot pass type
+    # checking and later be broadcast implicitly by the attention builder.
+    croissattn_aux: List[bool] = field(default_factory=list)
 
 
 @dataclass
