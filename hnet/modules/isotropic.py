@@ -47,6 +47,14 @@ class IsotropicInferenceParams:
             lambda x: x.zero_() if isinstance(x, torch.Tensor) else x,
             self.key_value_memory_dict,
         )
+        # MSAR keeps causal stream state outside the attention KV tensors.  A
+        # reused cache must reset those histories as well, otherwise a new
+        # prompt reads the previous sequence's tail during its first decode
+        # tokens.
+        optree.tree_map(
+            lambda x: x.zero_() if isinstance(x, torch.Tensor) else x,
+            self.msar_history,
+        )
 
 
 class Isotropic(nn.Module):
@@ -292,6 +300,16 @@ class Isotropic(nn.Module):
             return
         history.copy_(torch.cat((history[:, 1:], current.unsqueeze(1)), dim=1))
 
+    @staticmethod
+    def _store_msar_history(history, sequence):
+        """Store the final bounded stream tail after cached prefill."""
+        if sequence.dim() != 3:
+            raise ValueError("MSAR cache prefill requires an unpacked (B,L,D) sequence")
+        history.zero_()
+        take = min(history.shape[1], sequence.shape[1])
+        if take:
+            history[:, -take:].copy_(sequence[:, -take:].to(dtype=history.dtype))
+
     def _msar_mix_step(self, source_currents, history, layer_idx, history_indices):
         """Compute one MSAR token using recurrent stream histories.
 
@@ -341,6 +359,16 @@ class Isotropic(nn.Module):
             cu_seqlens is not None and max_seqlen is not None
         ), "Either mask or cu_seqlens and max_seqlen must be provided"
 
+        # Cached prefill is token-indexed and cannot use packed variable-length
+        # metadata.  The top-level H-Net trims its static latent padding before
+        # calling this stack; force the same dense contract here for the
+        # one-chunk case as well.
+        if inference_params is not None and mask is not None:
+            if not bool(mask.all()):
+                raise ValueError("inference-cache prefill requires an all-true dense mask")
+            cu_seqlens = None
+            max_seqlen = None
+
         attn_mixer_kwargs = copy.deepcopy(mixer_kwargs)
         ssm_mixer_kwargs = copy.deepcopy(mixer_kwargs)
         unpack_mask = None
@@ -361,7 +389,11 @@ class Isotropic(nn.Module):
             if graph_capture_enabled():
                 active = mask.unsqueeze(-1)
                 hidden_states = hidden_states * active.to(hidden_states.dtype)
-            elif hidden_states.shape[1] == 1 and bool(mask.all()):
+            elif (
+                inference_params is None
+                and hidden_states.shape[1] == 1
+                and bool(mask.all())
+            ):
                 # The pinned TE BSHD CroissAttn kernel requires at least two
                 # query positions.  A learned router can legitimately emit a
                 # single latent boundary for a short/easy prompt; route that
@@ -448,6 +480,7 @@ class Isotropic(nn.Module):
                 if self.msar_enabled:
                     msar_state = hidden_states
                     msar_sources = [hidden_states]
+                    msar_stream_outputs = [hidden_states]
                     for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
                         layer_input = self._msar_mix(
                             msar_sources + [msar_state], layer_idx,
@@ -486,10 +519,15 @@ class Isotropic(nn.Module):
                             msar_state = msar_state.squeeze(0)
                         if (layer_idx + 1) % self.msar_block_size == 0:
                             msar_sources.append(msar_state)
+                        msar_stream_outputs.append(msar_state)
                     hidden_states = msar_state
                     hidden_states = self.rmsnorm(
                         hidden_states, residual=None, prenorm=False, residual_in_fp32=True
                     )
+                    if inference_params is not None:
+                        loop_history = inference_params.msar_history[_loop_idx]
+                        for source_idx, source in enumerate(msar_stream_outputs):
+                            self._store_msar_history(loop_history[source_idx], source)
                     residual = None
                     continue
                 residual = None
@@ -575,12 +613,16 @@ class Isotropic(nn.Module):
                         source_currents, history, layer_idx, history_indices
                     )
                     block_input = layer_input.unsqueeze(1)
-                    block_out, block_residual = layer.step(
-                        block_input,
-                        inference_params,
-                        residual=None,
-                        loop_idx=loop_idx,
-                    )
+                    # Decode must use the same TE FP8 projection path as
+                    # cached prefill; otherwise generation silently switches
+                    # to BF16 while training/prefill use delayed-scaling FP8.
+                    with fp8_context():
+                        block_out, block_residual = layer.step(
+                            block_input,
+                            inference_params,
+                            residual=None,
+                            loop_idx=loop_idx,
+                        )
                     raw_state = block_out[:, 0]
                     if block_residual is not None:
                         raw_state = raw_state + block_residual[:, 0]
@@ -616,9 +658,10 @@ class Isotropic(nn.Module):
             residual = None
             for layer in self.layers:
                 hidden_states = hidden_states.to(dtype=layer.norm1.weight.dtype)
-                hidden_states, residual = layer.step(
-                    hidden_states, inference_params, residual=residual, loop_idx=_loop_idx
-                )
+                with fp8_context():
+                    hidden_states, residual = layer.step(
+                        hidden_states, inference_params, residual=residual, loop_idx=_loop_idx
+                    )
             hidden_states = self.rmsnorm(
                 hidden_states, residual=residual, prenorm=False, residual_in_fp32=True
             )

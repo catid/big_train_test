@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import ctypes
+import re
 import subprocess
 from pathlib import Path
 
@@ -54,6 +55,17 @@ def _preload_pinned_cuda_blas() -> None:
         raise RuntimeError(
             "The pinned Transformer Engine requires CUDA 13.4 cuBLASLt "
             "(libcublasLt.so.13) before importing PyTorch."
+        )
+    # The pinned TE grouped-GEMM path is corrupted by the CUDA 13.4
+    # libcublasLt 13.8.0.4 build.  Do not run sparse MoE with an unreviewed
+    # library: fail before importing TE rather than silently training bad
+    # expert weights.  A later 13.8.x patch is required for this contract.
+    resolved_lt = os.path.realpath(os.path.join(root, "libcublasLt.so.13"))
+    match = re.search(r"\.so\.(\d+)\.(\d+)\.(\d+)\.(\d+)$", resolved_lt)
+    if match and tuple(map(int, match.groups())) < (13, 8, 1, 0):
+        raise RuntimeError(
+            "The canonical FP8 MoE path requires libcublasLt >= 13.8.1; "
+            f"found {resolved_lt}. Install the reviewed CUDA patch before training."
         )
     try:
         ctypes.CDLL(os.path.join(root, "libcublasLt.so.13"), mode=ctypes.RTLD_GLOBAL)
