@@ -361,6 +361,11 @@ class HNet(nn.Module):
             mask=mask,
             boundary_prob=bpred_output.boundary_prob,
         )
+        # Capacity clipping is causal and can discard later router decisions.
+        # Preserve the raw mask for diagnostics, but expose the retained mask
+        # to the objective so router balancing follows the actual chunk set
+        # consumed by the inner stack.
+        bpred_output.effective_boundary_mask = effective_boundary_mask
         # Dechunking must use the same capacity-trimmed boundary set that was
         # gathered for the inner stack.  Keep the router's original mask in
         # ``bpred_output`` so the routing loss and diagnostics measure the

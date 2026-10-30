@@ -18,10 +18,22 @@ class RoutingModuleOutput:
     boundary_prob: torch.Tensor
     boundary_mask: torch.Tensor
     selected_probs: torch.Tensor
+    # The router emits a causal hard decision for every byte, while the
+    # static chunker may retain only the first configured number of boundaries
+    # per document.  HNet fills this field after applying that capacity policy
+    # so the auxiliary routing objective measures the decisions that actually
+    # reach the inner stack.  Standalone router callers leave it unset and use
+    # the original hard mask.
+    effective_boundary_mask: torch.Tensor | None = None
 
 
 def _flatten_routing_output(value):
-    return (value.boundary_prob, value.boundary_mask, value.selected_probs), None
+    return (
+        value.boundary_prob,
+        value.boundary_mask,
+        value.selected_probs,
+        value.effective_boundary_mask,
+    ), None
 
 
 def _unflatten_routing_output(values, _context):

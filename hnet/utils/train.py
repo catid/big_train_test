@@ -27,7 +27,14 @@ def load_balancing_loss(
     """
     boundary_prob = router_output.boundary_prob
     tokenized_prob = boundary_prob[..., -1]
-    boundary_mask = router_output.boundary_mask
+    # Static chunk capacity can discard later hard boundaries.  Balance the
+    # mask that actually reaches the inner stack when the H-Net has supplied
+    # it; direct router callers retain the original mask for compatibility.
+    boundary_mask = (
+        router_output.effective_boundary_mask
+        if router_output.effective_boundary_mask is not None
+        else router_output.boundary_mask
+    )
 
     true_ratio = boundary_mask.float().mean()
     average_prob = tokenized_prob.float().mean()
