@@ -355,7 +355,7 @@ def _dependency_provenance() -> dict:
     }
 
 
-def _runtime_provenance():
+def _runtime_provenance(data_path: str | os.PathLike[str]):
     """Capture the runtime identity that produced a checkpoint.
 
     FP8 state is tied to the CUDA/cuDNN/Transformer Engine build.  Recording
@@ -364,6 +364,11 @@ def _runtime_provenance():
     changing the optimization path.
     """
     repo = Path(__file__).resolve().parent
+    data_file = Path(data_path).expanduser().resolve()
+    if not data_file.is_file():
+        raise FileNotFoundError(f"training data is not a regular file: {data_file}")
+    data_size = int(data_file.stat().st_size)
+    data_sha256 = _sha256_file(data_file)
     try:
         git_sha = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True, stderr=subprocess.DEVNULL
@@ -408,6 +413,11 @@ def _runtime_provenance():
         },
         "nvte_fp8_dpa_bwd": os.environ.get("NVTE_FP8_DPA_BWD"),
         "nvte_croissattn_aux": os.environ.get("NVTE_DPA_CROISSATTN_AUX"),
+        # The byte stream is part of the training function. Record its content
+        # identity so a resume cannot silently continue against a replaced or
+        # truncated corpus while retaining the same model/optimizer state.
+        "data_size": data_size,
+        "data_sha256": data_sha256,
         # Record the concrete MoE routing operators used by the canonical
         # trainer.  This prevents a run log from being mistaken for a fused
         # route when only the downstream graph-safe permutation was fused.
@@ -450,6 +460,8 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         "moe_router",
         "moe_router_kernel",
         "moe_dispatch_kernel",
+        "data_size",
+        "data_sha256",
         "dependencies",
     ):
         if saved_runtime.get(key) != runtime.get(key):
@@ -1303,7 +1315,7 @@ def main():
             f"need at least {minimum_ratio_target:g} for seq={args.seq} and "
             f"capacity={cfg.chunk_capacity_tokens}, got {args.ratio_target:g}"
         )
-    runtime = _runtime_provenance()
+    runtime = _runtime_provenance(args.data)
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
