@@ -92,9 +92,16 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         if not bool(getattr(self.config, "fbt", True)) or required_passes != 2:
             raise ValueError("the canonical model requires two-pass FBT in its configuration")
         if fbt_passes is None:
-            fbt_passes = required_passes
-        if int(fbt_passes) != required_passes:
+            fbt_passes = 1 if inference_params is not None else required_passes
+        if inference_params is None and int(fbt_passes) != required_passes:
             raise ValueError(f"the canonical model requires fbt_passes={required_passes}")
+        if inference_params is not None and int(fbt_passes) != 1:
+            raise ValueError("inference-cache prefill uses exactly one pass")
+        if inference_params is not None:
+            raise RuntimeError(
+                "canonical FBT+MSAR training weights do not expose a top-level inference-cache path; "
+                "use CausalMHA's compressed VHA cache for decoder prefill/decode"
+            )
         integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
         if input_ids.dtype not in integer_dtypes:
             raise TypeError("H-Net byte inputs must be integer byte IDs")
@@ -128,10 +135,6 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             raise ValueError("canonical H-Net training requires an explicit static mask")
         if mask.shape != input_ids.shape or mask.dtype != torch.bool:
             raise ValueError("canonical H-Net mask must be bool with shape (batch, sequence)")
-        if inference_params is not None:
-            raise RuntimeError(
-                "canonical FBT+MSAR training weights do not expose an inference-cache path"
-            )
         result = self.backbone(
             hidden_states,
             mask=mask,
