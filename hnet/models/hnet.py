@@ -141,12 +141,11 @@ class HNet(nn.Module):
                 # never changes chunk boundaries or inner dimensions.
                 self.fbt_up = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
                 self.fbt_gate = make_linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
-                # FBT normalizes both sides of the fusion as in the paper's
-                # full training recipe (Fig. 10): the token path is normalized
-                # before its gate projection and the multiplicative fused
-                # state is normalized before re-entering the stack.
+                # FBT uses the paper's shared input RMSNorm (Appendix Fig. 9)
+                # on the token gate input and again on the fused input before
+                # the shared stack. Sharing this norm keeps the two input
+                # paths in one learned basis.
                 self.fbt_input_norm_1 = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
-                self.fbt_input_norm_2 = RMSNorm(self.d_model, eps=1e-5, **factory_kwargs)
                 nn.init.zeros_(self.fbt_up.weight)
                 nn.init.zeros_(self.fbt_gate.weight)
                 self.fbt_up.weight._no_reinit = True
@@ -505,7 +504,7 @@ class HNet(nn.Module):
                         doc_idx = torch.bucketize(token_idx, ends[:-1], right=True)
                         plain = (token_idx - starts[doc_idx]) < prefixes[doc_idx]
                     pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
-                pass_input = self.fbt_input_norm_2(pass_input)
+                pass_input = self.fbt_input_norm_1(pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
                 pass_input,
                 cu_seqlens=next_cu_seqlens,
@@ -633,7 +632,7 @@ class HNet(nn.Module):
                 with fp8_context():
                     feedback_value = self.fbt_up(previous)
                     gate_logits = self.fbt_gate(token_path)
-                fused = self.fbt_input_norm_2(
+                fused = self.fbt_input_norm_1(
                     feedback_value
                     * torch.sigmoid(gate_logits.float()).to(feedback_value.dtype)
                 )
