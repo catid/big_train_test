@@ -28,8 +28,9 @@ averages a flat gradient buffer after replay because DDP's runtime logger is not
 capture-safe.
 
 The graph contract retains at most 512 learned latent rows per outer sequence.
-If routing emits more boundaries, the highest boundary probabilities are kept;
-the same effective boundary set is passed to the inner stack and dechunker.
+If routing emits more boundaries, the first 512 causal boundaries are kept; a
+future byte cannot retroactively evict an earlier latent. The same effective
+boundary set is passed to the inner stack and dechunker.
 MSAR and Mamba activations are recomputed during backward so larger B300
 microbatches fit without changing the forward equations. MoE capacity uses the
 same latent bound in eager, prefill, and graph execution. Streaming decode

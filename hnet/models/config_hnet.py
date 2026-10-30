@@ -95,6 +95,8 @@ class HNetConfig:
             raise ValueError("the canonical model is byte-level with vocab_size=256")
         if self.swa_window_size != 128 or self.inner_loops != 2:
             raise ValueError("the canonical model requires a 128-token SWA window and two inner loops")
+        if int(self.max_seq_len) != 4096:
+            raise ValueError("the canonical model requires max_seq_len=4096")
         if int(self.msar_block_size) != 4:
             raise ValueError("the canonical model requires MSAR boundaries every four layers")
         if not (self.msar and self.fbt and self.static_chunking and self.fbt_passes == 2):
