@@ -143,10 +143,12 @@ class HNetConfig:
             int(self.moe_expert_intermediate) != 512
             or int(self.moe_shared_intermediate) != 256
             or float(self.moe_capacity_factor) != 1.25
+            or float(self.moe_aux_loss_weight) != 0.01
             or int(self.moe_capacity_tokens)
             != min(int(self.max_seq_len), int(self.chunk_capacity_tokens))
         ):
             raise ValueError(
                 "the canonical model requires 512-wide routed experts, a 256-wide shared "
-                "expert, capacity_factor=1.25, and capacity sized to the latent chunk bound"
+                "expert, capacity_factor=1.25, aux_loss_weight=0.01, and capacity sized "
+                "to the latent chunk bound"
             )
