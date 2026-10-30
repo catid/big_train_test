@@ -289,11 +289,15 @@ class ByteStream:
         self.world = world
         self.seed = int(seed)
         self.stride = batch * seq
-        usable = len(self.documents) // (batch * world) * (batch * world)
-        if usable <= 0:
-            raise ValueError("manifest has fewer documents than one distributed batch")
-        self.n_documents = usable
-        self.n_batches = usable // (batch * world)
+        self.document_count = len(self.documents)
+        global_rows = batch * world
+        # Round the epoch up to a complete global batch. Repeating only the
+        # first few document indices is preferable to silently dropping the
+        # tail of a FineWeb shard, and keeps every rank's static shape valid.
+        self.n_documents = (
+            (self.document_count + global_rows - 1) // global_rows
+        ) * global_rows
+        self.n_batches = self.n_documents // global_rows
         # Reuse pinned host staging buffers so document-local sampling does
         # not allocate pageable tensors or force a synchronous host-to-device
         # copy on every graph replay. The buffers are private to this stream
@@ -323,7 +327,14 @@ class ByteStream:
             # by ``batch * world``; permuting only n_batches would silently
             # omit almost the entire manifest once there is more than one
             # batch per epoch.
-            self._permutation = torch.randperm(self.n_documents, generator=generator)
+            permutation = torch.randperm(self.document_count, generator=generator)
+            pad = self.n_documents - self.document_count
+            if pad:
+                repeats = (pad + self.document_count - 1) // self.document_count
+                permutation = torch.cat(
+                    (permutation, permutation.repeat(repeats)[:pad])
+                )
+            self._permutation = permutation
             self._epoch = epoch
         return self._permutation
 
@@ -986,7 +997,9 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     # One document-local window occupies each batch row. Bound the per-rank
     # candidate by the number of complete global rows, rather than payload
     # bytes, so calibration cannot select a shape the manifest cannot supply.
-    available_batches = manifest_doc_count // max(1, world)
+    available_batches = (
+        manifest_doc_count + max(1, world) - 1
+    ) // max(1, world)
     if available_batches < 1:
         raise ValueError("byte stream is shorter than one distributed batch")
     # Do not select a candidate the configured stream cannot supply. This is
