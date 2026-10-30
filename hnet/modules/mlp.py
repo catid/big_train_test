@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from hnet.te import TEGroupedLinear, make_linear
+from hnet.te import TEGroupedLinear, make_linear, te
 
 class SparseMoESwiGLU(nn.Module):
     """Static-shape top-1 sparse SwiGLU with a DeepSeek-style shared expert.
@@ -136,7 +136,7 @@ class SparseMoESwiGLU(nn.Module):
             active = active_mask.reshape(-1).to(dtype=torch.bool)
         logits = self.router(flat)
         probs = torch.softmax(logits.float(), dim=-1)
-        routing_prob, expert_idx = probs.max(dim=-1)
+        _, expert_idx = probs.max(dim=-1)
 
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
         # mean router probability times dispatched token fraction.  Keep this
@@ -156,9 +156,13 @@ class SparseMoESwiGLU(nn.Module):
             self._aux_loss = self._aux_loss + current_aux_loss
         self._aux_loss_count += 1
 
-        # Fixed per-expert capacity and grouped dispatch.  Capacity is derived
-        # from the static token count of the graph; overflow tokens are left on
-        # the shared path, preserving a finite output with no host sync.
+        # Fused TE permutation and grouped dispatch. Capacity is bounded by
+        # the configured fixed-capacity contract; overflow tokens are left on
+        # the shared path. We call TE's underlying fixed-count op directly
+        # rather than ``moe_permute_and_pad_with_probs``: that convenience
+        # wrapper calls ``.sum().item()`` to infer its output size, which would
+        # synchronize the host and make CUDA graph replay unsafe. Here the
+        # output row count is the static Python value E * capacity.
         n_tokens = flat.shape[0]
         # Keep the capacity derived from the static graph bound.  The active
         # mask still removes padding from the cumsum below, so inactive rows
@@ -175,31 +179,24 @@ class SparseMoESwiGLU(nn.Module):
             # of a device-to-host bincount/max read. This keeps decode capture
             # free of synchronization and guarantees no token is dropped.
             capacity = max(1, n_tokens)
-        # Count only active rows.  Inactive static-chunk padding receives a
-        # zero position and is discarded by ``valid`` without perturbing the
-        # priority of later real tokens.
+        # Count only active rows. Inactive static-chunk padding receives a
+        # zero route and is omitted from the fused map.
         positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
         token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
         valid = (token_pos < capacity) & active
-        # Inactive rows have token_pos=-1 after the masked cumsum. Clamp both
-        # ends before the gather path; ``valid`` still zeros these rows, while
-        # the lower bound avoids a negative index if a backend checks gather
-        # bounds eagerly during CUDA graph capture.
-        slot = expert_idx * capacity + token_pos.clamp(0, capacity - 1)
-        # Include one trash row so every token follows the same-shape
-        # index_copy_ path. Boolean compaction (`flat[valid]`) performs a
-        # data-dependent nonzero/host synchronization and breaks CUDA graph
-        # capture. Overflow rows are written to trash and discarded below.
-        trash = self.num_experts * capacity
-        slot_safe = torch.where(valid, slot, torch.full_like(slot, trash))
-        dispatched = flat.new_zeros((trash + 1, self.d_model))
-        dispatched.index_copy_(0, slot_safe, flat)
-        dispatched = dispatched[:trash].view(self.num_experts, capacity, self.d_model)
-
-        # The fused/native GroupedLinear path requires a device resident
-        # int64 split tensor.  A Python list is converted on the host by TE
-        # and then rejected when ``use_grouped_tensor`` is enabled; caching by
-        # capacity keeps the graph replay path allocation free after warmup.
+        routing_map = F.one_hot(expert_idx, self.num_experts).to(torch.int32)
+        routing_map = routing_map * valid[:, None].to(torch.int32)
+        routing_probs = probs * routing_map.to(probs.dtype)
+        # ``permute_mask_map_fwd`` is the graph-safe primitive behind TE's
+        # padding helper.  It accepts a fixed output count and returns exactly
+        # E*capacity rows, with zero rows and -1 row ids for unused slots.
+        dispatched, row_id_map, permuted_probs = torch.ops.te_moe.permute_mask_map_fwd(
+            flat,
+            routing_map,
+            self.num_experts * capacity,
+            routing_probs,
+            None,
+        )
         split_key = (flat.device.type, flat.device.index, capacity)
         m_splits = getattr(self, "_m_splits_cache", {}).get(split_key)
         if m_splits is None:
@@ -209,16 +206,19 @@ class SparseMoESwiGLU(nn.Module):
                 (self.num_experts,), capacity, dtype=torch.int64, device=flat.device
             )
             self._m_splits_cache[split_key] = m_splits
-        expert_hidden = self.experts_fc1(
-            dispatched.reshape(-1, self.d_model), m_splits
-        ).view(self.num_experts, capacity, 2 * self.expert_intermediate)
+        expert_hidden = self.experts_fc1(dispatched, m_splits)
         value, gate = expert_hidden.chunk(2, dim=-1)
         expert_hidden = F.silu(gate) * value
-        expert_out = self.experts_fc2(
-            expert_hidden.reshape(-1, self.expert_intermediate), m_splits
-        ).view(self.num_experts, capacity, self.d_model)
-        gathered = expert_out.reshape(-1, self.d_model).index_select(0, slot.clamp_max(trash - 1))
-        gathered = gathered * routing_prob[:, None].to(gathered.dtype)
-        routed = torch.where(valid[:, None], gathered, torch.zeros_like(gathered))
+        expert_out = self.experts_fc2(expert_hidden, m_splits)
+        # TE returns a flattened top-1 probability vector. Apply it before
+        # unpermute so the custom op receives no narrow [N,1] probability
+        # tensor (which older TE builds cannot differentiate correctly).
+        expert_out = expert_out * permuted_probs.reshape(-1, 1).to(expert_out.dtype)
+        routed = te.moe_unpermute(
+            expert_out,
+            row_id_map,
+            restore_shape=flat.shape,
+            pad_offsets=None,
+        )
         out = routed + self._shared(flat)
         return out.view(shape)
