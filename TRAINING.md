@@ -46,10 +46,11 @@ Example launch (artifacts stay outside this repository):
 ```sh
 torchrun --nproc_per_node=8 train_hnet_600m.py \
   --data /path/to/raw_utf8_bytes \
-  --seq 4096 --batch 1
+  --seq 4096
 ```
 
-The trainer logs per-GPU power. `--auto-batch` runs complete FP8 calibration
+The trainer logs per-GPU power. Auto-batch calibration is enabled by default
+(`--no-auto-batch` disables it) and runs complete FP8 calibration
 steps at bounded candidate batches, averages readings across DDP ranks, and
 selects a measured draw against the approximately 1000 W per-B300 target. If
 every candidate remains below target, it selects the largest fully validated

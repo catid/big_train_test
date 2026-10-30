@@ -51,7 +51,7 @@ def parse_args():
     p.add_argument(
         "--auto-batch",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="calibrate a DDP-safe batch against the measured per-GPU power target",
     )
     p.add_argument(
