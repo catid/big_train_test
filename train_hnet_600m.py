@@ -447,6 +447,9 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         "fp8_recipe",
         "nvte_fp8_dpa_bwd",
         "nvte_croissattn_aux",
+        "moe_router",
+        "moe_router_kernel",
+        "moe_dispatch_kernel",
         "dependencies",
     ):
         if saved_runtime.get(key) != runtime.get(key):
