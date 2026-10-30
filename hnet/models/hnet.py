@@ -501,10 +501,15 @@ class HNet(nn.Module):
                 gate = torch.sigmoid(gate_logits.float()).to(pass_input.dtype)
                 pass_input = feedback_value.to(pass_input.dtype) * gate
                 if getattr(self.config, "fbt_prefix_mixin", False):
-                    # Keep a plain prefix so training matches prompt-prefill
-                    # followed by feedback-conditioned generation.
-                    plain = torch.zeros(pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device)
-                    if next_cu_seqlens is None:
+                    # Keep a random plain prefix during training so the model
+                    # sees both prompt-prefill and feedback-conditioned rows.
+                    # Evaluation must be deterministic: use the fully
+                    # feedback-conditioned path rather than sampling a new
+                    # prefix on every forward.
+                    plain = torch.zeros(
+                        pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device
+                    )
+                    if self.training and next_cu_seqlens is None:
                         # ChunkLayer left-aligns real chunks and pads to a
                         # static bound. Draw one prefix length per batch row
                         # from the real count; a fixed first-half prefix would
@@ -520,7 +525,7 @@ class HNet(nn.Module):
                         )[None, :]
                         plain = token_idx < prefixes[:, None]
                         plain = plain & next_mask
-                    else:
+                    elif self.training:
                         # Draw one prefix length per packed document on the
                         # device and map each token to its document without
                         # Python ``tolist``/``item`` synchronization.
