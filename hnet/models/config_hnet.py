@@ -123,8 +123,14 @@ class HNetConfig:
             raise ValueError("the canonical model requires 128-token SWA and global FA")
         if self.attn_cfg.num_heads != [16, 16]:
             raise ValueError("the canonical model requires 16 attention heads per stage")
-        if self.attn_cfg.rotary_emb_dim != [32, 48]:
-            raise ValueError("the canonical model requires rotary dimensions [32, 48]")
+        # The middle stack uses RoPE only on local SWA.  Global FA uses NoPE
+        # so its long-range logits are not tied to a rotary phase.  The first
+        # stage is Mamba-only; its zero entry keeps the stage mapping explicit.
+        if self.attn_cfg.rotary_emb_dim != [0, 48]:
+            raise ValueError(
+                "the canonical model requires stage rotary dimensions [0, 48]; "
+                "SWA applies the 48-dim RoPE and FA applies NoPE"
+            )
         if self.attn_cfg.croissattn_aux != [False, True]:
             raise ValueError(
                 "the canonical model enables patched CroissAttn only on the global FA stage"

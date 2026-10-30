@@ -123,10 +123,18 @@ class Isotropic(nn.Module):
             if arch in ("s", "S"):
                 block_attn_cfg["window_size"] = int(getattr(config, "swa_window_size", 128))
                 block_attn_cfg["croissattn_aux"] = False
+                # Local SWA keeps rotary position information.  Global FA is
+                # explicitly NoPE below; selecting this by layer kind avoids
+                # accidentally applying the stage-wide rotary setting to FA.
+                block_attn_cfg["rotary_emb_dim"] = int(self.attn_cfg.get("rotary_emb_dim", 0))
                 # VHA is the requested FA KV-cache compression.  SWA keeps
                 # its ordinary same-head local attention path and is not part
                 # of the compressed global-cache budget.
                 block_attn_cfg["vha_enabled"] = False
+            elif arch in ("t", "T"):
+                # NoPE is required for global full attention.  Keep VHA and
+                # the patched CroissAttn path on this branch unchanged.
+                block_attn_cfg["rotary_emb_dim"] = 0
             layers += [
                 create_block(
                     arch,

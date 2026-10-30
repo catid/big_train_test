@@ -12,7 +12,7 @@
     "attn_cfg": {
         "num_heads": [16, 16],
         "num_kv_heads": [2, 2],
-        "rotary_emb_dim": [32, 48],
+        "rotary_emb_dim": [0, 48],
         "window_size": [128, -1],
         "croissattn_aux": [false, true],
         "vha_enabled": true,
