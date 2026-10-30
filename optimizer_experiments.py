@@ -806,7 +806,19 @@ class AnchorMuon(torch.optim.Optimizer):
                 destination = self.state[param]
                 for key, value in source.items():
                     if isinstance(value, torch.Tensor) and value.is_floating_point():
-                        destination[key] = value.to(device=param.device, dtype=torch.float32)
+                        # ``Optimizer.state_dict`` is intentionally a shallow
+                        # copy.  A caller may therefore pass the returned
+                        # dictionary directly to a second optimizer (as
+                        # happens in parity checks) while the first optimizer
+                        # is still live.  Reusing a same-device tensor here
+                        # would alias the two optimizers' moments and make the
+                        # second step depend on whether the first optimizer
+                        # happened to run first.  Clone every restored tensor
+                        # so checkpoint restore has value semantics even when
+                        # no serialization round-trip intervenes.
+                        destination[key] = value.detach().to(
+                            device=param.device, dtype=torch.float32
+                        ).clone(memory_format=torch.preserve_format)
         fp32_keys = {
             "master_param",
             "soda_z0",
