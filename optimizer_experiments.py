@@ -28,14 +28,14 @@ split with the official test split evaluated only once at the end:
     seeds:    123, 456, 789, 101112, 131415
     schedule: trainer-side WSD with 80-step warmup
 
-    lr=0.014, fallback_lr=0.007, fallback_mode="atan2", row_gamma=0.35,
+    lr=0.014, fallback_lr=0.007, row_gamma=0.35,
     pmuoneq_beta=0.90, normuon_beta2=0.93
 
     official test loss: 0.4147 +/- 0.0152
     official test acc:  87.57% +/- 0.39
     step time:          17.51 +/- 0.16 ms
 
-A 5-seed CIFAR-10 follow-up found that ``fallback_mode="atan2"``,
+A 5-seed CIFAR-10 follow-up found that the fixed AdamATan2 fallback,
 ``lr=0.014``, and ``fallback_lr=0.007`` slightly improved final validation
 accuracy/loss and was essentially tied with RMS on official test accuracy
 within seed variance. AdamATan2 is now the constructor default for fallback
@@ -43,11 +43,11 @@ parameters so new users get that stronger validation-loss recipe by default.
 
 Language-model transfer note: bounded byte-level 49.4M GPT checks now have two
 useful starting points. WikiText-103 selected ``lr=0.0015``,
-``fallback_lr=0.00075``, ``fallback_mode="atan2"``, ``row_gamma=0.55``, and
+``fallback_lr=0.00075``, ``row_gamma=0.55``, and
 ``soda_lambda_scale=0.01`` after a 213-candidate 1200-step HPO and 1600-step
 family replay. FineWeb-Edu needed its own tuning: a 255-candidate 1600-step HPO
 with 10k-step family replay selected ``lr=0.0012``, ``fallback_lr=0.0012``,
-``fallback_mode="atan2"``, ``row_gamma=0.45``, ``soda_lambda_scale=0.003``,
+``row_gamma=0.45``, ``soda_lambda_scale=0.003``,
 ``pmuoneq_beta=0.90``, and ``normuon_beta2=0.93``. That FineWeb point beat
 tuned plain Muon by 1.1755 vs 1.1798 validation loss while running faster per
 step. These are real-text but byte-level, single-seed optimizer-transfer
@@ -110,8 +110,8 @@ weights use the spectral matrix path. Stacked expert banks use a batched
 spectral path, keeping each expert's matrix independent; names are never used
 for routing in this standalone file.
 
-The fixed ``fallback_mode="atan2"`` keeps Adam first/second moments but uses
-an AdamATan2-style bounded angular update:
+The fixed AdamATan2 fallback keeps first/second moments but uses a bounded
+angular update:
 
        m_t = beta_1 m_{t-1} + (1 - beta_1) g_t
        v_t = beta_2 v_{t-1} + (1 - beta_2) g_t^2
@@ -181,9 +181,8 @@ Do not tune everything at once. Treat the knobs in three tiers:
         pmuoneq_beta = 0.90
             EMA coefficient for row gradient-power estimates.
 
-        fallback_mode = "atan2"
-            Scalar/vector AdamATan2 update. The canonical trainer fixes this
-            mode and does not expose alternate fallback optimizers.
+        AdamATan2 fallback
+            Scalar/vector AdamATan2 update; this is the only fallback path.
 
         fallback_betas = (0.9, 0.95)
             AdamATan2 first/second moment defaults.
@@ -287,8 +286,6 @@ POLAR_EXPRESS_COEFFICIENTS: tuple[tuple[float, float, float], ...] = tuple(
     )
     for a, b, c in POLAR_EXPRESS_UNSCALED
 )
-FALLBACK_MODES = {"atan2"}
-
 
 @torch.no_grad()
 def _matrix_view(x: torch.Tensor) -> torch.Tensor:
@@ -495,7 +492,6 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         lr: float = 8e-3,
         fallback_lr: float | None = None,
-        fallback_mode: str = "atan2",
         momentum: float = 0.95,
         fallback_betas: tuple[float, float] = (0.9, 0.95),
         fallback_weight_decay: float = 0.0,
@@ -510,9 +506,6 @@ class AnchorMuon(torch.optim.Optimizer):
         ns_epsilon: float = 1e-7,
         ns_compute_dtype: torch.dtype | None = None,
         min_matrix_dim: int = 32,
-        use_soda: bool = True,
-        use_pmuoneq: bool = True,
-        use_normuon: bool = True,
         matrix_weight_decay: float = 0.0,
     ) -> None:
         if isinstance(params, torch.nn.Module):
@@ -520,9 +513,6 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_lr = lr if fallback_lr is None else fallback_lr
         if lr < 0.0 or fallback_lr < 0.0:
             raise ValueError("learning rates must be non-negative")
-        fallback_mode = str(fallback_mode).lower()
-        if fallback_mode not in FALLBACK_MODES:
-            raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
         if fallback_weight_decay < 0.0:
             raise ValueError("fallback_weight_decay must be non-negative")
         if matrix_weight_decay < 0.0:
@@ -541,15 +531,14 @@ class AnchorMuon(torch.optim.Optimizer):
             raise ValueError("epsilon values must be positive")
         if min_matrix_dim < 1:
             raise ValueError("min_matrix_dim must be >= 1")
-        if soda_lambda_scale <= 0.0 and use_soda:
-            raise ValueError("soda_lambda_scale must be positive; SODA is always enabled")
+        if soda_lambda_scale <= 0.0:
+            raise ValueError("soda_lambda_scale must be positive")
         if soda_lambda_power <= 0.0:
             raise ValueError("soda_lambda_power must be positive")
         prepared = self._prepare_param_groups(
             params,
             lr=lr,
             fallback_lr=fallback_lr,
-            fallback_mode=fallback_mode,
             momentum=momentum,
             fallback_betas=fallback_betas,
             fallback_weight_decay=fallback_weight_decay,
@@ -565,9 +554,6 @@ class AnchorMuon(torch.optim.Optimizer):
 
         self.soda_lambda_scale = float(soda_lambda_scale)
         self.soda_lambda_power = float(soda_lambda_power)
-        self.use_soda = bool(use_soda)
-        self.use_pmuoneq = bool(use_pmuoneq)
-        self.use_normuon = bool(use_normuon)
         self.matrix_weight_decay = float(matrix_weight_decay)
         self._orthogonalizer = GramNewtonSchulz(epsilon=ns_epsilon, compute_dtype=ns_compute_dtype)
         self.last_stats: dict[str, float] = {}
@@ -590,7 +576,6 @@ class AnchorMuon(torch.optim.Optimizer):
         *,
         lr: float,
         fallback_lr: float,
-        fallback_mode: str,
         momentum: float,
         fallback_betas: tuple[float, float],
         fallback_weight_decay: float,
@@ -615,7 +600,6 @@ class AnchorMuon(torch.optim.Optimizer):
                 items,  # type: ignore[arg-type]
                 lr=lr,
                 fallback_lr=fallback_lr,
-                fallback_mode=fallback_mode,
                 momentum=momentum,
                 fallback_betas=fallback_betas,
                 fallback_weight_decay=fallback_weight_decay,
@@ -643,21 +627,18 @@ class AnchorMuon(torch.optim.Optimizer):
                     group.setdefault("normuon_beta2", normuon_beta2)
                     group.setdefault("normuon_eps", normuon_eps)
                     group.setdefault("min_matrix_dim", min_matrix_dim)
-                    # Forced fallback parameters (for example MSAR bias)
+                    # Forced AdamATan2 parameters (for example MSAR bias)
                     # retain the fallback schedule even though they share a
                     # matrix group for compact optimizer state.
                     group.setdefault("fallback_lr", fallback_lr)
-                    group.setdefault("fallback_mode", fallback_mode)
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("fallback_weight_decay", fallback_weight_decay)
                     group.setdefault("eps", eps)
                 else:
-                    group.setdefault("fallback_mode", fallback_mode)
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("fallback_weight_decay", fallback_weight_decay)
                     group.setdefault("eps", eps)
                 if is_matrix:
-                    group.setdefault("fallback_mode", fallback_mode)
                     group.setdefault("betas", fallback_betas)
                     group.setdefault("fallback_weight_decay", fallback_weight_decay)
                     group.setdefault("eps", eps)
@@ -765,7 +746,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "normuon_eps": normuon_eps,
                     "min_matrix_dim": min_matrix_dim,
                     "fallback_lr": fallback_lr,
-                    "fallback_mode": fallback_mode,
                     "betas": fallback_betas,
                     "fallback_weight_decay": fallback_weight_decay,
                     "eps": eps,
@@ -777,7 +757,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "params": fallback_params,
                     "use_matrix_update": False,
                     "lr": fallback_lr,
-                    "fallback_mode": fallback_mode,
                     "betas": fallback_betas,
                     "fallback_weight_decay": fallback_weight_decay,
                     "eps": eps,
@@ -849,7 +828,7 @@ class AnchorMuon(torch.optim.Optimizer):
                     "numel": int(sum(p.numel() for p in params)),
                     "named": bool(names),
                     "param_names": names,
-                    "fallback_mode": str(group.get("fallback_mode", "atan2")),
+                    "fallback_mode": "atan2",
                 }
             )
         return summary
@@ -885,8 +864,6 @@ class AnchorMuon(torch.optim.Optimizer):
         return master
 
     def _soda_weight(self, t: int) -> float:
-        if not self.use_soda:
-            return 0.0
         return min(1.0, self.soda_lambda_scale / float(t + 1) ** self.soda_lambda_power)
 
     def _pre_matrix_source(self, p: torch.Tensor, grad: torch.Tensor, momentum_beta: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -949,27 +926,23 @@ class AnchorMuon(torch.optim.Optimizer):
             second_buffers.append(second)
 
         row_stack = torch.stack(row_buffers, dim=0)
-        if self.use_pmuoneq:
-            beta_p = float(group["pmuoneq_beta"])
-            row_stack.mul_(beta_p).add_(grads.square().mean(dim=-1), alpha=1.0 - beta_p)
-            row_factor = _diag_inverse_power(
-                row_stack, gamma=float(group["row_gamma"]), eps=float(group["pmuoneq_eps"])
-            )
-        else:
-            row_factor = torch.ones_like(row_stack)
+        beta_p = float(group["pmuoneq_beta"])
+        row_stack.mul_(beta_p).add_(grads.square().mean(dim=-1), alpha=1.0 - beta_p)
+        row_factor = _diag_inverse_power(
+            row_stack, gamma=float(group["row_gamma"]), eps=float(group["pmuoneq_eps"])
+        )
 
         preconditioned = sources * row_factor.unsqueeze(-1)
         update = self._orthogonalizer(preconditioned)
         update = update * (0.2 * math.sqrt(max(update.size(-2), update.size(-1))))
 
         second_stack = torch.stack(second_buffers, dim=0)
-        if self.use_normuon:
-            update = _normuon_row_normalize(
-                update,
-                second_stack,
-                beta2=float(group["normuon_beta2"]),
-                eps=float(group["normuon_eps"]),
-            )
+        update = _normuon_row_normalize(
+            update,
+            second_stack,
+            beta2=float(group["normuon_beta2"]),
+            eps=float(group["normuon_eps"]),
+        )
 
         for idx, (p, _anchor, _source, _grad) in enumerate(entries):
             self.state[p]["pmuoneq_row_ema"].copy_(row_stack[idx])
@@ -1061,9 +1034,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     "Use dense gradients for this parameter or a different optimizer."
             )
         state = self.state[p]
-        mode = str(group.get("fallback_mode", "atan2")).lower()
-        if mode not in FALLBACK_MODES:
-            raise ValueError("the canonical fallback mode is AdamATan2 ('atan2')")
         exp_avg_sq = state.get("exp_avg_sq")
         if isinstance(exp_avg_sq, torch.Tensor) and exp_avg_sq.shape == p.shape:
             if exp_avg_sq.device != p.device or exp_avg_sq.dtype != torch.float32:
@@ -1149,7 +1119,6 @@ def build_param_groups(
     *,
     lr: float = 8e-3,
     fallback_lr: float | None = None,
-    fallback_mode: str = "atan2",
     momentum: float = 0.95,
     fallback_betas: tuple[float, float] = (0.9, 0.95),
     fallback_weight_decay: float = 0.0,
@@ -1174,9 +1143,6 @@ def build_param_groups(
     if min_matrix_dim < 1:
         raise ValueError("min_matrix_dim must be >= 1")
     fallback_lr = lr if fallback_lr is None else fallback_lr
-    fallback_mode = str(fallback_mode).lower()
-    if fallback_mode not in FALLBACK_MODES:
-        raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
     if fallback_weight_decay < 0.0:
         raise ValueError("fallback_weight_decay must be non-negative")
 
@@ -1221,7 +1187,6 @@ def build_param_groups(
                 "normuon_eps": normuon_eps,
                 "min_matrix_dim": min_matrix_dim,
                 "fallback_lr": fallback_lr,
-                "fallback_mode": fallback_mode,
                 "betas": fallback_betas,
                 "fallback_weight_decay": fallback_weight_decay,
                 "eps": eps,
@@ -1234,7 +1199,6 @@ def build_param_groups(
                 "param_names": fallback_names,
                 "use_matrix_update": False,
                 "lr": fallback_lr,
-                "fallback_mode": fallback_mode,
                 "betas": fallback_betas,
                 "fallback_weight_decay": fallback_weight_decay,
                 "eps": eps,
