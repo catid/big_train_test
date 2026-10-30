@@ -180,6 +180,32 @@ class DocumentManifest:
     manifest_sha256: str
 
 
+def _verify_document_hashes(data_path: Path, documents: list[dict]) -> None:
+    """Verify every manifest range against the payload before training.
+
+    The payload digest protects the file as a whole; per-document digests also
+    protect offsets and deduplication boundaries. This is a startup check for
+    the corpus build, not a per-step operation.
+    """
+    with data_path.open("rb") as handle:
+        for document in sorted(documents, key=lambda item: item["offset"]):
+            handle.seek(document["offset"])
+            digest = hashlib.sha256()
+            remaining = int(document["length"])
+            while remaining:
+                chunk = handle.read(min(16 * 1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError(
+                        f"manifest document {document['id']!r} extends past payload"
+                    )
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if digest.hexdigest() != document["sha256"].lower():
+                raise ValueError(
+                    f"manifest document {document['id']!r} sha256 does not match payload"
+                )
+
+
 def _load_manifest(path: str | os.PathLike[str], data_override: str | None = None) -> DocumentManifest:
     manifest_path = Path(path).expanduser().resolve()
     if not manifest_path.is_file():
@@ -193,7 +219,13 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
     declared_data = raw.get("data_path")
     if not isinstance(declared_data, str) or not declared_data:
         raise ValueError("document manifest requires a non-empty data_path")
+    if Path(declared_data).is_absolute():
+        raise ValueError("manifest data_path must be relative to the manifest")
     data_path = (manifest_path.parent / declared_data).resolve()
+    try:
+        data_path.relative_to(manifest_path.parent)
+    except ValueError as exc:
+        raise ValueError("manifest data_path escapes its manifest directory") from exc
     if data_override is not None:
         override_path = Path(data_override).expanduser().resolve()
         if override_path != data_path:
@@ -260,6 +292,7 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
             raise ValueError(
                 f"manifest document ranges overlap: {previous[2]!r} and {current[2]!r}"
             )
+    _verify_document_hashes(data_path, normalized)
     total_tokens = sum(document["token_count"] for document in normalized)
     declared_tokens = raw.get("total_token_equivalents", total_tokens)
     if int(declared_tokens) != total_tokens:
