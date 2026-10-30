@@ -10,13 +10,14 @@ from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_lo
 
 
 class FusedTokenRouter(nn.Module):
-    """Run TE's fused top-1 router and return scores plus a routing map.
+    """Own the complete TE top-1 routing and dispatch boundary.
 
     TE computes the FP32 softmax scores and the discrete routing map in one
-    CUDA operation.  Capacity remains in :class:`SparseMoESwiGLU` because this
+    CUDA operation.  Capacity remains in :class:`SparseMoESwiGLU` because the
     model applies causal per-sequence capacity, whereas the generic TE router
-    only sees the flattened token stream.  Keeping that policy outside the
-    fused helper preserves the fixed shapes required by CUDA graph replay.
+    only sees the flattened token stream.  The resulting fixed-capacity map is
+    dispatched and restored through this object as well, so callers cannot
+    silently replace the fused route with a Python or graph-unsafe permutation.
     """
 
     def __init__(self, num_experts: int, top_k: int = 1):
@@ -68,6 +69,68 @@ class FusedTokenRouter(nn.Module):
         # the contract here so a compatible TE rebuild cannot leak uint8 into
         # the int32 map consumed by ``permute_mask_map_fwd``.
         return probs.contiguous(), routing_map.to(dtype=torch.bool).contiguous()
+
+    def permute(
+        self,
+        tokens: torch.Tensor,
+        routing_map: torch.Tensor,
+        num_out_tokens: int,
+        routing_probs: torch.Tensor | None = None,
+        pad_offsets: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Dispatch routed rows with TE's fixed-count graph-safe primitive.
+
+        ``num_out_tokens`` is a static Python value (experts times capacity),
+        never inferred from a device reduction.  This is the only supported
+        dispatch path for this router.
+        """
+        if not tokens.is_cuda:
+            raise RuntimeError("FusedTokenRouter dispatch requires CUDA tokens")
+        if tokens.ndim != 2:
+            raise ValueError(f"dispatch tokens must be [tokens, hidden], got {tuple(tokens.shape)}")
+        if routing_map.shape != (tokens.shape[0], self.num_experts):
+            raise ValueError(
+                "dispatch routing_map must be [tokens, experts], got "
+                f"{tuple(routing_map.shape)} for tokens={tokens.shape[0]} experts={self.num_experts}"
+            )
+        if routing_map.dtype != torch.int32:
+            raise TypeError(f"dispatch routing_map must be int32, got {routing_map.dtype}")
+        if not isinstance(num_out_tokens, int) or num_out_tokens <= 0:
+            raise ValueError(f"dispatch num_out_tokens must be a positive int, got {num_out_tokens!r}")
+        if routing_probs is not None:
+            if routing_probs.shape != routing_map.shape or routing_probs.dtype != torch.float32:
+                raise ValueError(
+                    "dispatch routing_probs must be float32 with routing_map shape, got "
+                    f"{tuple(routing_probs.shape)} {routing_probs.dtype}"
+                )
+        if pad_offsets is not None:
+            if pad_offsets.shape != (self.num_experts,) or pad_offsets.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    "dispatch pad_offsets must be int32/int64 [experts], got "
+                    f"{tuple(pad_offsets.shape)} {pad_offsets.dtype}"
+                )
+        return torch.ops.te_moe.permute_mask_map_fwd(
+            tokens, routing_map, num_out_tokens, routing_probs, pad_offsets
+        )
+
+    def unpermute(
+        self,
+        expert_tokens: torch.Tensor,
+        row_id_map: torch.Tensor,
+        restore_shape: torch.Size,
+        pad_offsets: torch.Tensor | None = None,
+        merging_probs: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Restore dispatched rows through TE's fused unpermutation primitive."""
+        if not expert_tokens.is_cuda:
+            raise RuntimeError("FusedTokenRouter unpermute requires CUDA expert tokens")
+        return te.moe_unpermute(
+            expert_tokens,
+            row_id_map,
+            merging_probs=merging_probs,
+            restore_shape=restore_shape,
+            pad_offsets=pad_offsets,
+        )
 
 
 class SparseMoESwiGLU(nn.Module):
@@ -384,7 +447,7 @@ class SparseMoESwiGLU(nn.Module):
             self.num_experts, dtype=torch.int64, device=flat.device
         ) * capacity
         pad_offsets = expert_starts - prefix_counts
-        dispatched, row_id_map, permuted_probs = torch.ops.te_moe.permute_mask_map_fwd(
+        dispatched, row_id_map, permuted_probs = self.fused_router.permute(
             flat,
             routing_map,
             self.num_experts * capacity,
@@ -415,7 +478,7 @@ class SparseMoESwiGLU(nn.Module):
         # unpermute so the custom op receives no narrow [N,1] probability
         # tensor (which older TE builds cannot differentiate correctly).
         expert_out = expert_out * permuted_probs.reshape(-1, 1).to(expert_out.dtype)
-        routed = te.moe_unpermute(
+        routed = self.fused_router.unpermute(
             expert_out,
             row_id_map,
             restore_shape=flat.shape,
