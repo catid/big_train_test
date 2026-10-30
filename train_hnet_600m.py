@@ -44,7 +44,16 @@ ADAM_ATAN2_LR_RATIO = 0.5
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--data", required=True, help="raw UTF-8 byte stream")
+    p.add_argument(
+        "--manifest",
+        required=True,
+        help="versioned document manifest; its data_path identifies the raw UTF-8 byte file",
+    )
+    p.add_argument(
+        "--data",
+        default=None,
+        help="optional explicit data path; it must match the manifest data_path",
+    )
     p.add_argument("--seq", type=int, default=4096)
     p.add_argument(
         "--auto-batch-max",
@@ -151,21 +160,157 @@ def _wsqd_scale(step: int, args) -> float:
     return stable_base * max(0.0, (horizon - t) / cooldown)
 
 
-class ByteStream:
-    def __init__(self, path, seq, batch, rank, world, seed=1729):
-        self.data = torch.from_file(
-            str(path), shared=False, size=os.path.getsize(path), dtype=torch.uint8
+@dataclasses.dataclass(frozen=True)
+class DocumentManifest:
+    """Validated index for document-local byte windows.
+
+    The raw byte file is immutable and the manifest is the sampling contract.
+    Every document is sampled independently, so no input or target pair can
+    cross a document boundary.  Keeping offsets instead of materializing text
+    preserves mmap-style access for multi-hundred-billion-byte corpora.
+    """
+
+    path: Path
+    data_path: Path
+    data_size: int
+    data_sha256: str
+    documents: tuple[dict, ...]
+    total_token_equivalents: int
+    manifest_sha256: str
+
+
+def _load_manifest(path: str | os.PathLike[str], data_override: str | None = None) -> DocumentManifest:
+    manifest_path = Path(path).expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"manifest not found: {manifest_path}")
+    try:
+        raw = json.loads(manifest_path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON manifest: {manifest_path}") from exc
+    if not isinstance(raw, dict) or int(raw.get("version", -1)) != 1:
+        raise ValueError("document manifest requires integer version=1")
+    declared_data = raw.get("data_path")
+    if not isinstance(declared_data, str) or not declared_data:
+        raise ValueError("document manifest requires a non-empty data_path")
+    data_path = (manifest_path.parent / declared_data).resolve()
+    if data_override is not None:
+        override_path = Path(data_override).expanduser().resolve()
+        if override_path != data_path:
+            raise ValueError(
+                "--data must resolve to the same path as manifest data_path; "
+                f"manifest={data_path}, override={override_path}"
+            )
+    if not data_path.is_file():
+        raise FileNotFoundError(f"manifest data_path is not a regular file: {data_path}")
+    data_size = int(data_path.stat().st_size)
+    declared_size = raw.get("data_size")
+    if declared_size is None or int(declared_size) != data_size:
+        raise ValueError(
+            f"manifest data_size mismatch: manifest={declared_size}, actual={data_size}"
         )
+    declared_hash = raw.get("data_sha256")
+    if not isinstance(declared_hash, str) or len(declared_hash) != 64:
+        raise ValueError("document manifest requires a 64-character data_sha256")
+    data_sha256 = _sha256_file(data_path)
+    if data_sha256 != declared_hash.lower():
+        raise ValueError(
+            f"manifest data_sha256 mismatch: manifest={declared_hash}, actual={data_sha256}"
+        )
+    documents = raw.get("documents")
+    if not isinstance(documents, list) or not documents:
+        raise ValueError("document manifest requires a non-empty documents list")
+    normalized = []
+    intervals = []
+    seen_ids = set()
+    for index, document in enumerate(documents):
+        if not isinstance(document, dict):
+            raise ValueError(f"manifest document {index} must be an object")
+        required = ("id", "offset", "length", "token_count", "source", "license", "language", "sha256")
+        missing = [key for key in required if key not in document]
+        if missing:
+            raise ValueError(f"manifest document {index} missing fields: {missing}")
+        doc_id = document["id"]
+        if not isinstance(doc_id, str) or not doc_id or doc_id in seen_ids:
+            raise ValueError(f"manifest document {index} has a missing or duplicate id")
+        seen_ids.add(doc_id)
+        offset = int(document["offset"])
+        length = int(document["length"])
+        token_count = int(document["token_count"])
+        if offset < 0 or length < 2 or offset + length > data_size:
+            raise ValueError(
+                f"manifest document {doc_id!r} has invalid byte range "
+                f"offset={offset}, length={length}, data_size={data_size}"
+            )
+        if token_count < 0:
+            raise ValueError(f"manifest document {doc_id!r} has negative token_count")
+        for key in ("source", "license", "language"):
+            if not isinstance(document[key], str) or not document[key]:
+                raise ValueError(f"manifest document {doc_id!r} requires non-empty {key}")
+        doc_hash = document["sha256"]
+        if not isinstance(doc_hash, str) or len(doc_hash) != 64:
+            raise ValueError(f"manifest document {doc_id!r} requires a 64-character sha256")
+        normalized_doc = dict(document)
+        normalized_doc.update(offset=offset, length=length, token_count=token_count)
+        normalized.append(normalized_doc)
+        intervals.append((offset, offset + length, doc_id))
+    intervals.sort()
+    for previous, current in zip(intervals, intervals[1:]):
+        if current[0] < previous[1]:
+            raise ValueError(
+                f"manifest document ranges overlap: {previous[2]!r} and {current[2]!r}"
+            )
+    total_tokens = sum(document["token_count"] for document in normalized)
+    declared_tokens = raw.get("total_token_equivalents", total_tokens)
+    if int(declared_tokens) != total_tokens:
+        raise ValueError(
+            "manifest total_token_equivalents does not equal the sum of document token_count"
+        )
+    return DocumentManifest(
+        path=manifest_path,
+        data_path=data_path,
+        data_size=data_size,
+        data_sha256=data_sha256,
+        documents=tuple(normalized),
+        total_token_equivalents=total_tokens,
+        manifest_sha256=_sha256_file(manifest_path),
+    )
+
+
+class ByteStream:
+    def __init__(self, manifest: DocumentManifest, seq, batch, rank, world, seed=1729):
+        self.data = torch.from_file(
+            str(manifest.data_path), shared=False, size=manifest.data_size, dtype=torch.uint8
+        )
+        self.manifest = manifest
+        self.documents = manifest.documents
         self.seq = seq
         self.batch = batch
         self.rank = rank
         self.world = world
         self.seed = int(seed)
         self.stride = batch * seq
-        usable = (self.data.numel() - 1) // (self.stride * world) * self.stride * world
+        usable = len(self.documents) // (batch * world) * (batch * world)
         if usable <= 0:
-            raise ValueError("byte stream is shorter than one distributed batch")
-        self.n_batches = usable // (self.stride * world)
+            raise ValueError("manifest has fewer documents than one distributed batch")
+        self.n_documents = usable
+        self.n_batches = usable // (batch * world)
+        # Reuse pinned host staging buffers so document-local sampling does
+        # not allocate pageable tensors or force a synchronous host-to-device
+        # copy on every graph replay. The buffers are private to this stream
+        # and are fully overwritten before each transfer.
+        self._pinned = bool(torch.cuda.is_available())
+        self._x_cpu = torch.empty(
+            (self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned
+        )
+        self._y_cpu = torch.empty(
+            (self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned
+        )
+        self._active_cpu = torch.empty(
+            (self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned
+        )
+        self._loss_cpu = torch.empty(
+            (self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned
+        )
         self._epoch = None
         self._permutation = None
 
@@ -174,25 +319,52 @@ class ByteStream:
         if self._epoch != epoch:
             generator = torch.Generator(device="cpu")
             generator.manual_seed(self.seed + epoch)
-            self._permutation = torch.randperm(self.n_batches, generator=generator)
+            # Permute document rows, not batches. ``get`` slices this tensor
+            # by ``batch * world``; permuting only n_batches would silently
+            # omit almost the entire manifest once there is more than one
+            # batch per epoch.
+            self._permutation = torch.randperm(self.n_documents, generator=generator)
             self._epoch = epoch
         return self._permutation
 
+    @staticmethod
+    def _window_start(seed: int, epoch: int, document_index: int, length: int, seq: int) -> int:
+        max_start = max(0, length - (seq + 1))
+        if max_start == 0:
+            return 0
+        value = (int(seed) ^ (int(epoch) * 0x9E3779B1) ^ (int(document_index) * 0x85EBCA77))
+        value &= 0xFFFFFFFFFFFFFFFF
+        value ^= value >> 30
+        value = (value * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        value ^= value >> 27
+        return int(value % (max_start + 1))
+
     def get(self, step, device):
         epoch, offset = divmod(int(step), self.n_batches)
-        window = int(self._epoch_permutation(epoch)[offset])
-        base = (window * self.world + self.rank) * self.stride
-        # Input and target are adjacent in the byte stream. Copy the shared
-        # ``stride + 1`` span once, then form overlapping views on-device;
-        # this removes one host-to-device launch and avoids transferring the
-        # duplicated overlap byte twice while preserving exact sequence
-        # boundaries for every rank and CUDA-graph replay.
-        batch = self.data[base : base + self.stride + 1].to(
-            device=device, non_blocking=True
+        permutation = self._epoch_permutation(epoch)
+        first = (offset * self.world + self.rank) * self.batch
+        document_indices = permutation[first : first + self.batch]
+        x_cpu = self._x_cpu
+        y_cpu = self._y_cpu
+        active_cpu = self._active_cpu
+        loss_cpu = self._loss_cpu
+        x_cpu.zero_()
+        y_cpu.zero_()
+        active_cpu.zero_()
+        loss_cpu.zero_()
+        for row, document_index in enumerate(document_indices.tolist()):
+            document = self.documents[int(document_index)]
+            start = self._window_start(self.seed, epoch, int(document_index), document["length"], self.seq)
+            available = min(self.seq, document["length"] - 1)
+            span = self.data[document["offset"] + start : document["offset"] + start + available + 1]
+            x_cpu[row, :available].copy_(span[:-1])
+            y_cpu[row, :available].copy_(span[1:])
+            active_cpu[row, :available] = True
+            loss_cpu[row, :available] = True
+        return tuple(
+            tensor.to(device=device, non_blocking=True)
+            for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
         )
-        x = batch[:-1].view(self.batch, self.seq)
-        y = batch[1:].view(self.batch, self.seq)
-        return x, y
 
 
 def load_config():
@@ -359,7 +531,9 @@ def _dependency_provenance() -> dict:
     }
 
 
-def _runtime_provenance(data_path: str | os.PathLike[str]):
+def _runtime_provenance(
+    data_path: str | os.PathLike[str], manifest: DocumentManifest
+):
     """Capture the runtime identity that produced a checkpoint.
 
     FP8 state is tied to the CUDA/cuDNN/Transformer Engine build.  Recording
@@ -422,6 +596,12 @@ def _runtime_provenance(data_path: str | os.PathLike[str]):
         # truncated corpus while retaining the same model/optimizer state.
         "data_size": data_size,
         "data_sha256": data_sha256,
+        "manifest_path": str(manifest.path),
+        "manifest_size": int(manifest.path.stat().st_size),
+        "manifest_sha256": manifest.manifest_sha256,
+        "manifest_version": 1,
+        "manifest_doc_count": len(manifest.documents),
+        "manifest_total_token_equivalents": manifest.total_token_equivalents,
         # Record the concrete MoE routing operators used by the canonical
         # trainer.  This prevents a run log from being mistaken for a fused
         # route when only the downstream graph-safe permutation was fused.
@@ -466,6 +646,12 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         "moe_dispatch_kernel",
         "data_size",
         "data_sha256",
+        "manifest_path",
+        "manifest_size",
+        "manifest_sha256",
+        "manifest_version",
+        "manifest_doc_count",
+        "manifest_total_token_equivalents",
         "dependencies",
     ):
         if saved_runtime.get(key) != runtime.get(key):
@@ -580,18 +766,24 @@ def make_optimizer(model, args):
     )
 
 
-def ce(logits, target):
+def ce(logits, target, loss_mask=None):
     # TE's CE fixes apply here too: cast logits and reduction inputs to FP32,
     # then reject non-finite values before any optimizer state is mutated.
-    return F.cross_entropy(
-        logits.float().reshape(-1, logits.shape[-1]), target.long().reshape(-1)
-    )
+    flat_logits = logits.float().reshape(-1, logits.shape[-1])
+    flat_target = target.long().reshape(-1)
+    if loss_mask is None:
+        return F.cross_entropy(flat_logits, flat_target)
+    if loss_mask.shape != target.shape or loss_mask.dtype is not torch.bool:
+        raise ValueError("loss_mask must be bool with the same shape as target")
+    per_token = F.cross_entropy(flat_logits, flat_target, reduction="none")
+    weights = loss_mask.reshape(-1).to(dtype=per_token.dtype)
+    return (per_token * weights).sum() / weights.sum().clamp_min(1.0)
 
 
-def loss_for_output(out, target, args):
+def loss_for_output(out, target, args, loss_mask=None, active_mask=None):
     """Compute the FBT objective and retain every component for diagnostics."""
-    final_ce = ce(out.logits, target)
-    feedback_values = [ce(x, target) for x in (out.feedback_logits or [])]
+    final_ce = ce(out.logits, target, loss_mask)
+    feedback_values = [ce(x, target, loss_mask) for x in (out.feedback_logits or [])]
     if feedback_values:
         # ``feedback_logits`` contains the earlier plain pass; ``out.logits``
         # is the final feedback-conditioned pass. Keep the public metric names
@@ -612,10 +804,23 @@ def loss_for_output(out, target, args):
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     boundary_ratios = []
     soft_boundary_ratios = []
-    for router in out.bpred_output:
-        ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
-        boundary_ratios.append(router.boundary_mask.float().mean())
-        soft_boundary_ratios.append(router.boundary_prob[..., -1].float().mean())
+    for router_index, router in enumerate(out.bpred_output):
+        router_mask = active_mask if router_index == 0 else None
+        ratio = ratio + load_balancing_loss(
+            router, args.ratio_target, valid_mask=router_mask
+        ).float()
+        if router_mask is None:
+            boundary_ratios.append(router.boundary_mask.float().mean())
+            soft_boundary_ratios.append(router.boundary_prob[..., -1].float().mean())
+        else:
+            weights = router_mask.to(dtype=torch.float32)
+            denominator = weights.sum().clamp_min(1.0)
+            boundary_ratios.append(
+                (router.boundary_mask.float() * weights).sum() / denominator
+            )
+            soft_boundary_ratios.append(
+                (router.boundary_prob[..., -1].float() * weights).sum() / denominator
+            )
     moe_aux_value = getattr(out, "moe_aux_loss", None)
     moe_aux = (moe_aux_value.float() if moe_aux_value is not None
                else out.logits.new_zeros((), dtype=torch.float32))
@@ -766,7 +971,13 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     # DDP rank. Use the requested bound directly; a conservative memory
     # heuristic would reject the larger validated graph batches on B300.
     max_batch = max(1, int(args.auto_batch_max))
-    available_batches = (os.path.getsize(args.data) - 1) // (args.seq * max(1, world))
+    manifest_doc_count = int(getattr(args, "_manifest_doc_count", 0))
+    if manifest_doc_count <= 0:
+        raise RuntimeError("manifest document count must be set before batch calibration")
+    # One document-local window occupies each batch row. Bound the per-rank
+    # candidate by the number of complete global rows, rather than payload
+    # bytes, so calibration cannot select a shape the manifest cannot supply.
+    available_batches = manifest_doc_count // max(1, world)
     if available_batches < 1:
         raise ValueError("byte stream is shorter than one distributed batch")
     # Do not select a candidate the configured stream cannot supply. This is
@@ -1083,6 +1294,7 @@ class CUDAGraphStep:
         self.static_x = torch.empty((batch, seq), dtype=torch.uint8, device=device)
         self.static_y = torch.empty((batch, seq), dtype=torch.uint8, device=device)
         self.static_mask = torch.ones((batch, seq), dtype=torch.bool, device=device)
+        self.static_loss_mask = torch.ones((batch, seq), dtype=torch.bool, device=device)
         self.graph = torch.cuda.CUDAGraph()
         self.loss = None
         self.metrics = None
@@ -1111,7 +1323,13 @@ class CUDAGraphStep:
             for _ in range(3):
                 self.optimizer.zero_grad(set_to_none=True)
                 warm_out = self.model(warm_x, mask=self.static_mask, fbt_passes=FBT_PASSES)
-                warm_loss, _ = loss_for_output(warm_out, warm_y, args)
+                warm_loss, _ = loss_for_output(
+                    warm_out,
+                    warm_y,
+                    args,
+                    loss_mask=self.static_loss_mask,
+                    active_mask=self.static_mask,
+                )
                 warm_loss.backward()
         # Do not retain an eager autograd graph while capturing the next graph;
         # AccumulateGrad nodes remember the warmup stream and CUDA rejects a
@@ -1152,7 +1370,13 @@ class CUDAGraphStep:
                     graph_out = self.forward_model(
                         self.static_x, mask=self.static_mask, fbt_passes=FBT_PASSES
                     )
-                    self.loss, self.metrics = loss_for_output(graph_out, self.static_y, args)
+                    self.loss, self.metrics = loss_for_output(
+                        graph_out,
+                        self.static_y,
+                        args,
+                        loss_mask=self.static_loss_mask,
+                        active_mask=self.static_mask,
+                    )
                     self.loss.backward()
         except Exception as exc:
             raise RuntimeError(
@@ -1230,10 +1454,12 @@ class CUDAGraphStep:
         self._ddp_direct_storage = compatible
         self._ddp_storage_buckets = groups if compatible else None
 
-    def replay(self, x, y):
+    def replay(self, x, y, active_mask, loss_mask):
         if self.capture_stream is None:
             self.static_x.copy_(x)
             self.static_y.copy_(y)
+            self.static_mask.copy_(active_mask)
+            self.static_loss_mask.copy_(loss_mask)
             self.graph.replay()
         else:
             current_stream = torch.cuda.current_stream(self.device)
@@ -1241,6 +1467,8 @@ class CUDAGraphStep:
             with torch.cuda.stream(self.capture_stream):
                 self.static_x.copy_(x)
                 self.static_y.copy_(y)
+                self.static_mask.copy_(active_mask)
+                self.static_loss_mask.copy_(loss_mask)
                 self.graph.replay()
             current_stream.wait_stream(self.capture_stream)
         # Delayed scaling updates are deliberately outside the captured region;
@@ -1330,7 +1558,10 @@ def main():
             f"need at least {minimum_ratio_target:g} for seq={args.seq} and "
             f"capacity={cfg.chunk_capacity_tokens}, got {args.ratio_target:g}"
         )
-    runtime = _runtime_provenance(args.data)
+    manifest = _load_manifest(args.manifest, args.data)
+    args.data = str(manifest.data_path)
+    args._manifest_doc_count = len(manifest.documents)
+    runtime = _runtime_provenance(args.data, manifest)
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
@@ -1434,7 +1665,7 @@ def main():
                 torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
-    stream = ByteStream(args.data, args.seq, args.batch, rank, world, seed=args.data_seed)
+    stream = ByteStream(manifest, args.seq, args.batch, rank, world, seed=args.data_seed)
     graph_step = None
     if CANONICAL_CUDA_GRAPHS:
         graph_step = CUDAGraphStep(
@@ -1498,7 +1729,7 @@ def main():
         )
     latest_power = []
     for step in range(start_step, args.steps):
-        x, y = stream.get(step, device)
+        x, y, active_mask, loss_mask = stream.get(step, device)
         lr_scale = _wsqd_scale(step, args)
         log["learning_rate_scale"].append(float(lr_scale))
         for group in optimizer.param_groups:
@@ -1517,16 +1748,18 @@ def main():
                 group["fallback_lr"] = args.lr * ADAM_ATAN2_LR_RATIO * lr_scale
         t0 = time.perf_counter()
         if graph_step is not None:
-            loss, metrics = graph_step.replay(x, y)
+            loss, metrics = graph_step.replay(x, y, active_mask, loss_mask)
         else:
-            mask = torch.ones_like(x, dtype=torch.bool)
+            mask = active_mask
             optimizer.zero_grad(set_to_none=True)
             # FP8 autocast regions are owned by the model at each repeated-layer
             # boundary.  The canonical H-Net reuses the middle layers for two
             # recurrent executions and two FBT passes; one trainer-wide region
             # would make delayed-scaling TE state invalid on the second call.
             out = model(x, mask=mask, fbt_passes=FBT_PASSES)
-            loss, metrics = loss_for_output(out, y, args)
+            loss, metrics = loss_for_output(
+                out, y, args, loss_mask=loss_mask, active_mask=active_mask
+            )
             # Transformer Engine updates delayed-scaling state during the forward
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.

@@ -1,7 +1,8 @@
 # Direct H-Net run
 
-`train_hnet_600m.py` is the canonical run. It reads a raw UTF-8 byte file,
-uses the frozen 256-row byte code (zero trainable embedding parameters), and
+`train_hnet_600m.py` is the canonical run. It reads a versioned document
+manifest over an immutable raw UTF-8 byte payload, uses the frozen 256-row byte
+code (zero trainable embedding parameters), and
 trains `M4 -> (S3T1)×5 -> M4` with learned routing. Each group starts with
 three sliding-window attention (SWA) layers and ends with one full-attention
 (FA) layer; the first layer is SWA. MSAR remains in the innermost stack,
@@ -63,9 +64,18 @@ Example launch (artifacts stay outside this repository):
 
 ```sh
 torchrun --nproc_per_node=8 train_hnet_600m.py \
-  --data /path/to/raw_utf8_bytes \
+  --manifest /path/to/fineweb_text.manifest.json \
   --seq 4096
 ```
+
+Each manifest entry identifies one document byte range and its source,
+license, language, quality metadata, SHA-256, and token-equivalent count. The
+sampler chooses one document-local window per fixed-shape batch row and pads
+only at the right edge; `active_mask` prevents padded rows from entering the
+model and `loss_mask` removes the final input byte when its next target would
+cross the document boundary. A separator byte is not used as a substitute for
+these masks because it would not reset recurrent H-Net, FBT, MSAR, or KV-cache
+state. FineWeb production runs therefore require the manifest path.
 
 The planned text pretraining corpus targets 100B GPT-2-token equivalents, not
 100B raw byte positions. The raw UTF-8 budget will normally be about 300–500B

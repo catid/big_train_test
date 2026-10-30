@@ -11,6 +11,7 @@ from hnet.modules.dc import RoutingModuleOutput
 def load_balancing_loss(
     router_output: RoutingModuleOutput,
     N: float,
+    valid_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute the load balancing loss.
@@ -34,8 +35,17 @@ def load_balancing_loss(
     # pushing the router back below capacity and causes the tail of each
     # sequence to be decoded from the final retained latent. The effective
     # mask remains available on the output for execution/overflow diagnostics.
-    true_ratio = router_output.boundary_mask.float().mean()
-    average_prob = tokenized_prob.float().mean()
+    if valid_mask is None:
+        weights = torch.ones_like(tokenized_prob, dtype=torch.float32)
+    else:
+        if valid_mask.shape != tokenized_prob.shape or valid_mask.dtype is not torch.bool:
+            raise ValueError(
+                "router valid_mask must be bool with the same shape as boundary_prob"
+            )
+        weights = valid_mask.to(dtype=torch.float32)
+    denominator = weights.sum().clamp_min(1.0)
+    true_ratio = (router_output.boundary_mask.float() * weights).sum() / denominator
+    average_prob = (tokenized_prob.float() * weights).sum() / denominator
 
     return (
         (1 - true_ratio) * (1 - average_prob) +
