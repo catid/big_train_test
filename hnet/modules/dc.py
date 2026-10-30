@@ -251,10 +251,11 @@ class ChunkLayer(nn.Module):
                     total_length=boundary_mask.shape[0],
                 )[0].to(dtype=torch.long)
                 per_doc_rank = global_rank - offsets.index_select(0, doc_idx)
-                # ``per_doc_rank`` is zero-based: a capacity of 512 permits
-                # ranks 0..511, matching the decoder's ``boundary_count <
-                # capacity`` rule and the fixed latent tensor bound.
-                effective_boundary_mask = boundary_mask & (per_doc_rank < capacity)
+                # ``per_doc_rank`` is one-based on boundary rows (the
+                # cumulative count), so retain ranks through the capacity.
+                # This matches decode's pre-increment ``boundary_count <
+                # capacity`` rule, which admits exactly capacity boundaries.
+                effective_boundary_mask = boundary_mask & (per_doc_rank <= capacity)
 
             next_hidden_states = hidden_states[effective_boundary_mask]
             next_cu_seqlens = F.pad(
@@ -294,8 +295,6 @@ class ChunkLayer(nn.Module):
                 boundary_rank = torch.cumsum(
                     boundary_mask.to(dtype=torch.int32), dim=1
                 )
-                # ``boundary_rank`` is one-based here, so rank 512 is the
-                # final retained boundary for capacity 512.
                 effective_boundary_mask = boundary_mask & (boundary_rank <= capacity)
                 num_tokens = effective_boundary_mask.sum(dim=-1)
             if self.static_max_seqlen is None and int(num_tokens.max()) > next_max_seqlen:
