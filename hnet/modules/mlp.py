@@ -191,24 +191,22 @@ class SparseMoESwiGLU(nn.Module):
         routing_map = F.one_hot(expert_idx, self.num_experts).to(torch.int32)
         routing_map = routing_map * valid[:, None].to(torch.int32)
         routing_probs = probs * routing_map.to(probs.dtype)
-        # ``permute_mask_map_fwd`` is the graph-safe primitive behind TE's
-        # padding helper.  It accepts a fixed output count and returns exactly
-        # E*capacity rows, with zero rows and -1 row ids for unused slots.
-        # Passing a zero pad-offset vector is deliberate: TE's Triton wrapper
-        # uses ``empty`` when pad_offsets is None, leaving unused fixed-capacity
-        # rows uninitialized.  Those rows then enter FP8 GroupedLinear and can
-        # poison its delayed-scaling amax/wgrad state with NaNs.  Zero offsets
-        # preserve the unpadded layout while selecting the wrapper's zero-fill
-        # allocation path.
-        pad_key = (flat.device.type, flat.device.index)
-        pad_offsets = getattr(self, "_pad_offsets_cache", {}).get(pad_key)
-        if pad_offsets is None:
-            if not hasattr(self, "_pad_offsets_cache"):
-                self._pad_offsets_cache = {}
-            pad_offsets = torch.zeros(
-                (self.num_experts,), dtype=torch.int64, device=flat.device
-            )
-            self._pad_offsets_cache[pad_key] = pad_offsets
+        # ``permute_mask_map_fwd`` first packs routed rows by their actual
+        # expert counts.  GroupedLinear, however, receives fixed ``capacity``
+        # rows per expert.  Shift each expert's packed segment into its own
+        # fixed-capacity block; a zero offset would send the tail of a short
+        # expert through the next expert's weights whenever the router loads
+        # are uneven.  Counts are derived from the already capacity-trimmed
+        # routing map, so this remains a fixed-shape, CUDA-graph-safe tensor
+        # computation (the values may vary on each replay).
+        counts = routing_map.sum(dim=0, dtype=torch.int64)
+        prefix_counts = torch.cat(
+            [torch.zeros(1, dtype=torch.int64, device=flat.device), torch.cumsum(counts, dim=0)[:-1]]
+        )
+        expert_starts = torch.arange(
+            self.num_experts, dtype=torch.int64, device=flat.device
+        ) * capacity
+        pad_offsets = expert_starts - prefix_counts
         dispatched, row_id_map, permuted_probs = torch.ops.te_moe.permute_mask_map_fwd(
             flat,
             routing_map,
