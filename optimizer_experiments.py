@@ -262,6 +262,13 @@ from typing import Any, TypeAlias
 import torch
 
 
+# Full 623M profiling on B300: 32-entry GramNS banks are about 21% faster
+# than the previous eight-entry banks, while 64-entry banks add memory without
+# improving the optimizer tail. Keep this as one canonical setting rather than
+# exposing an unvalidated optimizer ablation through the production trainer.
+MATRIX_BUCKET_CHUNK_SIZE = 32
+
+
 __version__ = "0.5.1"
 
 try:
@@ -991,8 +998,10 @@ class AnchorMuon(torch.optim.Optimizer):
             # reduced matrix dimension. Process a bounded number of same-shape
             # banks at a time so optimizer work cannot consume the last few
             # GiB after a large CUDA-graph private pool has been captured.
-            for start in range(0, len(bucket_entries), 8):
-                chunk_entries = bucket_entries[start : start + 8]
+            for start in range(0, len(bucket_entries), MATRIX_BUCKET_CHUNK_SIZE):
+                chunk_entries = bucket_entries[
+                    start : start + MATRIX_BUCKET_CHUNK_SIZE
+                ]
                 updates = self._transform_matrix_bucket(chunk_entries, group)
                 for (p, anchor, _source, _grad), update in zip(
                     chunk_entries, updates.unbind(0), strict=True
