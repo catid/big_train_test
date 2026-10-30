@@ -10,6 +10,9 @@ losses, AnchorMuon/GramNS plus its AdamATan2 fallback, weight decay, and DDP.
 The production SWA width is 128 tokens;
 three SWA layers still provide a stacked receptive span above the 4096-byte
 training context before each global FA layer.
+SWA uses 48 rotary dimensions; global FA is NoPE. The stage configuration keeps
+the first (Mamba-only) entry at zero and applies the 48-dimension RoPE only to
+the `S` layers, so FA never allocates or rotates a positional cache.
 
 The public Cartesia posts support the outer Mamba-2 `M4` stacks and the causal
 adjacent-state router used here. They describe 1024-token SWA in encoder and
@@ -63,6 +66,19 @@ torchrun --nproc_per_node=8 train_hnet_600m.py \
   --data /path/to/raw_utf8_bytes \
   --seq 4096
 ```
+
+The planned text pretraining corpus targets 100B GPT-2-token equivalents, not
+100B raw byte positions. The raw UTF-8 budget will normally be about 300–500B
+bytes and is recorded separately from the tokenizer-equivalent count. The
+recommended open-data mixture is 45% recent FineWeb dumps, 20% strict
+FineWeb-Edu (score at least 3), 10% score-2-only educational documents, 10%
+curated Dolma non-web text, 10% quota-controlled FineWeb2 multilingual text,
+and 5% other clearly licensed educational/reference sources. FineWeb-Edu
+documents must be assigned to one tier before mixing because they are subsets
+of FineWeb. A manifest records document ID, source and dump, URL, license,
+language, quality fields, SHA-256, UTF-8 byte count, and token-equivalent
+count; exact and near-duplicate removal happens across the complete mixture
+before the train/validation split.
 
 The trainer logs per-GPU power. It always runs complete FP8 auto-batch
 calibration steps at bounded candidate batches, takes the worst-rank reading across DDP, and
