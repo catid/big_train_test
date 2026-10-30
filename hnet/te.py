@@ -38,6 +38,11 @@ _GROUPED_LINEAR_ORIGINAL = None
 _MODULE_GROUPED_LINEAR_ORIGINAL = None
 _GROUPED_LINEAR_EAGER_ORIGINAL = None
 _EXPECTED_TE_COMMIT = "9646c3ef22455b6948cbe870f1aaf20fc8238d69"
+# The reviewed packed CroissAttn build was compiled and validated against this
+# cuDNN release.  A minimum version check would allow a later kernel ABI to
+# change the fused attention implementation while still claiming the same
+# FP8 contract, so fail closed on a different reported release.
+_EXPECTED_CUDNN_VERSION = (9, 23, 2)
 _CUBLASLT_PATH = None
 _CUBLASLT_VERSION = None
 _RUNTIME_MANIFEST = Path(__file__).resolve().parents[1] / "runtime_manifest.json"
@@ -335,10 +340,12 @@ def assert_fp8_attention_backend() -> None:
     except Exception as exc:
         raise RuntimeError("Unable to query cuDNN for FP8 attention") from exc
     # Canonical H-Net routes the chunked middle stack through packed ``thd``
-    # DPA, whose fused FP8 backend requires cuDNN 9.23 or newer on B300.
-    if version < (9, 23, 0):
+    # DPA.  Pin the tested cuDNN release rather than accepting any future
+    # implementation under a loose minimum-version check.
+    if tuple(version[:3]) != _EXPECTED_CUDNN_VERSION:
         raise RuntimeError(
-            "Pinned packed FP8 CroissAttn requires cuDNN >= 9.23; found "
+            "Pinned packed FP8 CroissAttn requires cuDNN "
+            f"{'.'.join(map(str, _EXPECTED_CUDNN_VERSION))}; found "
             f"{'.'.join(map(str, version))}. Install the reviewed cuDNN runtime."
         )
 
@@ -522,6 +529,12 @@ def _verify_runtime_binaries() -> None:
         raise RuntimeError(f"Unable to read runtime allowlist {_RUNTIME_MANIFEST}") from exc
     if manifest.get("transformer_engine_commit") != _EXPECTED_TE_COMMIT:
         raise RuntimeError("runtime allowlist has an unexpected Transformer Engine commit")
+    expected_cudnn = tuple(manifest.get("cudnn_version", ()))
+    if expected_cudnn != _EXPECTED_CUDNN_VERSION:
+        raise RuntimeError(
+            "runtime allowlist has an unexpected cuDNN version: "
+            f"expected {_EXPECTED_CUDNN_VERSION}, found {expected_cudnn}"
+        )
     expected = manifest.get("binaries")
     if not isinstance(expected, dict):
         raise RuntimeError("runtime allowlist is missing its binary hashes")

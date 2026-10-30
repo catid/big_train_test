@@ -1,5 +1,6 @@
 {
   "transformer_engine_commit": "9646c3ef22455b6948cbe870f1aaf20fc8238d69",
+  "cudnn_version": [9, 23, 2],
   "binaries": {
     "transformer_engine_core": "f5e783ca33d3aa0d46721a416c04e5ad31dc2d7501b5d41011b0890f08b20975",
     "transformer_engine_torch": "542aac0d37d49d26a2cc132485aedd048f37d8d882892e71b59546f54a4cc854",
