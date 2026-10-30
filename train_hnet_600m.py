@@ -546,7 +546,16 @@ def _runtime_provenance(
     if not data_file.is_file():
         raise FileNotFoundError(f"training data is not a regular file: {data_file}")
     data_size = int(data_file.stat().st_size)
-    data_sha256 = _sha256_file(data_file)
+    if data_file != manifest.data_path:
+        raise ValueError(
+            "runtime provenance data path does not match the loaded manifest"
+        )
+    # _load_manifest already verified the payload size and digest. Reuse that
+    # result instead of hashing a 300–500 GB corpus a second time on every DDP
+    # rank before training starts.
+    if data_size != manifest.data_size:
+        raise ValueError("manifest payload size changed after validation")
+    data_sha256 = manifest.data_sha256
     try:
         git_sha = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=repo, text=True, stderr=subprocess.DEVNULL
