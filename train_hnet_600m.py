@@ -351,6 +351,14 @@ def _runtime_provenance():
         },
         "nvte_fp8_dpa_bwd": os.environ.get("NVTE_FP8_DPA_BWD"),
         "nvte_croissattn_aux": os.environ.get("NVTE_DPA_CROISSATTN_AUX"),
+        # Record the concrete MoE routing operators used by the canonical
+        # trainer.  This prevents a run log from being mistaken for a fused
+        # route when only the downstream graph-safe permutation was fused.
+        "moe_router": "hnet.modules.mlp.FusedTokenRouter",
+        "moe_router_kernel": (
+            "transformer_engine.pytorch.router.fused_compute_score_for_moe_aux_loss"
+        ),
+        "moe_dispatch_kernel": "te_moe::permute_mask_map_fwd",
         "dependencies": dependencies,
     }
 
