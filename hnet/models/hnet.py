@@ -519,9 +519,14 @@ class HNet(nn.Module):
             and self.fbt_enabled
             and inference_params.feedback_hidden_state is not None
         ):
-            # Prefill is the plain-input pass. Its final top-level state is
-            # the latent feedback carried into the first generated token.
-            inference_params.feedback_hidden_state.copy_(hidden_states[:, -1])
+            # Prefill is the plain-input pass.  FBT is attached to the
+            # chunk-level main network, so the recurrence state is the final
+            # valid latent produced by that network rather than the decoded
+            # byte-level state.  Decode applies exactly the same GLU to the
+            # next selected latent boundary.
+            if previous_inner is None or previous_inner.shape[1] == 0:
+                raise RuntimeError("FBT prefill produced no latent state")
+            inference_params.feedback_hidden_state.copy_(previous_inner[:, -1])
             inference_params.feedback_initialized.fill_(True)
         result = [bpred_output, *final_prev_boundary_predictions]
         if return_feedback:
@@ -530,28 +535,6 @@ class HNet(nn.Module):
 
     def step(self, hidden_states, inference_params):
         D = hidden_states.shape[-1]
-
-        if self.fbt_enabled:
-            if (
-                inference_params.feedback_hidden_state is None
-                or inference_params.feedback_initialized is None
-            ):
-                raise RuntimeError("FBT inference cache was not allocated for the outer H-Net")
-            # Eq. (glu_cross) from arXiv:2608.08888. The previous top-level
-            # state is the value path; the current byte feature is only the
-            # multiplicative gate. The first token remains a plain prefill
-            # input because no prior top-level state exists yet.
-            token_path = self.fbt_input_norm_1(hidden_states)
-            previous = inference_params.feedback_hidden_state.unsqueeze(1)
-            with fp8_context():
-                feedback_value = self.fbt_up(previous)
-                gate_logits = self.fbt_gate(token_path)
-            fused = self.fbt_input_norm_2(
-                feedback_value
-                * torch.sigmoid(gate_logits.float()).to(feedback_value.dtype)
-            )
-            use_feedback = inference_params.feedback_initialized[:, None, None]
-            hidden_states = torch.where(use_feedback, fused, hidden_states)
 
         if self.pad_dimension is not None:
             hidden_states = torch.cat(
@@ -583,9 +566,52 @@ class HNet(nn.Module):
         )
 
         if hidden_states_inner.shape[0] > 0:
+            if self.fbt_enabled:
+                if (
+                    inference_params.feedback_hidden_state is None
+                    or inference_params.feedback_initialized is None
+                ):
+                    raise RuntimeError("FBT inference cache was not allocated for the outer H-Net")
+                # The training objective fuses ``shift_right(h)`` with the
+                # current chunk input ``e`` before rerunning the shared main
+                # network.  Apply the same recurrence at decode time, after
+                # routing selects a latent boundary.  Keeping this at the
+                # chunk level is essential: the training pass does not feed
+                # the decoded byte stream back into the encoder/router.
+                active_rows = bpred_output.boundary_mask.nonzero(as_tuple=True)[0]
+                previous = inference_params.feedback_hidden_state.index_select(
+                    0, active_rows
+                ).unsqueeze(1)
+                initialized = inference_params.feedback_initialized.index_select(
+                    0, active_rows
+                )[:, None, None]
+                token_path = self.fbt_input_norm_1(hidden_states_inner)
+                with fp8_context():
+                    feedback_value = self.fbt_up(previous)
+                    gate_logits = self.fbt_gate(token_path)
+                fused = self.fbt_input_norm_2(
+                    feedback_value
+                    * torch.sigmoid(gate_logits.float()).to(feedback_value.dtype)
+                )
+                # The first selected boundary after a plain prefill remains a
+                # normal input only when no prefill state exists.  This also
+                # keeps direct one-token calls well-defined before prefill.
+                hidden_states_inner = torch.where(
+                    initialized, fused, hidden_states_inner
+                )
             hidden_states_inner, prev_boundary_predictions = self.main_network.step(
                 hidden_states_inner, inference_params.main_network_state
             )
+            if self.fbt_enabled:
+                # Store the new top-layer latent only for streams that emitted
+                # a boundary.  Non-boundary bytes update the dechunker but do
+                # not advance the chunk-level FBT recurrence.
+                inference_params.feedback_hidden_state.index_copy_(
+                    0, active_rows, hidden_states_inner[:, -1]
+                )
+                inference_params.feedback_initialized.index_fill_(
+                    0, active_rows, True
+                )
         else:
             prev_boundary_predictions = []
 
@@ -602,9 +628,5 @@ class HNet(nn.Module):
 
         hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)
         hidden_states = hidden_states[..., :D]
-
-        if self.fbt_enabled:
-            inference_params.feedback_hidden_state.copy_(hidden_states[:, -1])
-            inference_params.feedback_initialized.fill_(True)
 
         return hidden_states, [bpred_output, *prev_boundary_predictions]
