@@ -252,19 +252,28 @@ def loss_for_output(out, target, args):
         feedback_ce = standard_ce.new_zeros(())
         objective = standard_ce
     ratio = out.logits.new_zeros((), dtype=torch.float32)
+    boundary_ratios = []
     for router in out.bpred_output:
         ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
+        boundary_ratios.append(router.boundary_mask.float().mean())
     moe_aux_value = getattr(out, "moe_aux_loss", None)
     moe_aux = (moe_aux_value.float() if moe_aux_value is not None
                else out.logits.new_zeros((), dtype=torch.float32))
     objective = objective + args.ratio_weight * ratio + moe_aux
+    routing_ratio = (
+        torch.stack(boundary_ratios).mean()
+        if boundary_ratios
+        else standard_ce.new_zeros((), dtype=torch.float32)
+    )
+    target_ratio = standard_ce.new_tensor(1.0 / float(args.ratio_target))
     metrics = {
         "objective": objective,
         "standard_ce": standard_ce,
         "feedback_ce": feedback_ce,
         "router_loss": ratio,
         "moe_aux": moe_aux,
-        "ratio_target_error": (ratio.detach() - float(args.ratio_target)).abs(),
+        "routing_ratio": routing_ratio,
+        "ratio_target_error": (routing_ratio - target_ratio).abs(),
     }
     return objective, metrics
 
@@ -365,6 +374,7 @@ def main():
         "feedback_ce": [],
         "router_loss": [],
         "moe_aux": [],
+        "routing_ratio": [],
         "ratio_target_error": [],
         "time_ms": [],
         "power_w": [],
@@ -441,6 +451,7 @@ def main():
                 f"fb_ce={float(reduced_metrics['feedback_ce']):.6f} "
                 f"router={float(reduced_metrics['router_loss']):.6f} "
                 f"moe={float(reduced_metrics['moe_aux']):.6f} "
+                f"route_ratio={float(reduced_metrics['routing_ratio']):.6f} "
                 f"time_ms={elapsed:.1f} "
                 f"power_w={','.join(f'{x:.0f}' for x in latest_power) or 'n/a'}",
                 flush=True,
