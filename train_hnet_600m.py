@@ -39,7 +39,19 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True, help="raw UTF-8 byte stream")
     p.add_argument("--seq", type=int, default=4096)
-    p.add_argument("--batch", type=int, default=1)
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="per-rank microbatch; use --auto-batch to size from GPU memory",
+    )
+    p.add_argument(
+        "--auto-batch",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="choose the largest conservative full-model batch from GPU memory",
+    )
+    p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1.2e-3)
@@ -73,7 +85,7 @@ def parse_args():
 
 
 class ByteStream:
-    def __init__(self, path, seq, batch, rank, world):
+    def __init__(self, path, seq, batch, rank, world, seed=1729):
         self.data = torch.from_file(
             str(path), shared=False, size=os.path.getsize(path), dtype=torch.uint8
         )
@@ -81,14 +93,28 @@ class ByteStream:
         self.batch = batch
         self.rank = rank
         self.world = world
+        self.seed = int(seed)
         self.stride = batch * seq
         usable = (self.data.numel() - 1) // (self.stride * world) * self.stride * world
         if usable <= 0:
             raise ValueError("byte stream is shorter than one distributed batch")
         self.n_batches = usable // (self.stride * world)
+        self._epoch = None
+        self._permutation = None
+
+    def _epoch_permutation(self, epoch):
+        """Return a reproducible window permutation for one data epoch."""
+        if self._epoch != epoch:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self.seed + epoch)
+            self._permutation = torch.randperm(self.n_batches, generator=generator)
+            self._epoch = epoch
+        return self._permutation
 
     def get(self, step, device):
-        base = ((step % self.n_batches) * self.world + self.rank) * self.stride
+        epoch, offset = divmod(int(step), self.n_batches)
+        window = int(self._epoch_permutation(epoch)[offset])
+        base = (window * self.world + self.rank) * self.stride
         # Input and target are adjacent in the byte stream. Copy the shared
         # ``stride + 1`` span once, then form overlapping views on-device;
         # this removes one host-to-device launch and avoids transferring the
@@ -206,19 +232,36 @@ def ce(logits, target):
 
 
 def loss_for_output(out, target, args):
-    losses = [ce(out.logits, target)]
-    if out.feedback_logits:
-        losses = [ce(out.feedback_logits[0], target)]
-        if len(out.feedback_logits) > 1:
-            losses.append(args.fbt_lambda * torch.stack([ce(x, target) for x in out.feedback_logits[1:]]).mean())
+    """Compute the FBT objective and retain every component for diagnostics."""
+    standard_ce = ce(out.logits, target)
+    feedback_values = [ce(x, target) for x in (out.feedback_logits or [])]
+    if feedback_values:
+        feedback_ce = torch.stack(feedback_values).mean()
+        # With two FBT passes, the first-pass logits are retained separately
+        # and the final pass is ``standard_ce``. This is algebraically the
+        # previous two-pass objective while avoiding a duplicate final head.
+        objective = feedback_values[0] + args.fbt_lambda * standard_ce
+        if len(feedback_values) > 1:
+            objective = objective + args.fbt_lambda * torch.stack(feedback_values[1:]).mean()
+    else:
+        feedback_ce = standard_ce.new_zeros(())
+        objective = standard_ce
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     for router in out.bpred_output:
         ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
     moe_aux_value = getattr(out, "moe_aux_loss", None)
     moe_aux = (moe_aux_value.float() if moe_aux_value is not None
                else out.logits.new_zeros((), dtype=torch.float32))
-    return (losses[0] + (sum(losses[1:]) if len(losses) > 1 else 0.0)
-            + args.ratio_weight * ratio + moe_aux), losses[0], ratio
+    objective = objective + args.ratio_weight * ratio + moe_aux
+    metrics = {
+        "objective": objective,
+        "standard_ce": standard_ce,
+        "feedback_ce": feedback_ce,
+        "router_loss": ratio,
+        "moe_aux": moe_aux,
+        "ratio_target_error": (ratio.detach() - float(args.ratio_target)).abs(),
+    }
+    return objective, metrics
 
 
 def read_power_watts():
@@ -238,6 +281,17 @@ def main():
     args = parse_args()
     assert_fp8_runtime()
     rank, world, device = init_dist()
+    if args.auto_batch:
+        if device.type != "cuda":
+            raise RuntimeError("--auto-batch requires CUDA")
+        # The full model keeps a large recurrent activation graph. Reserve
+        # 25% of VRAM for NCCL/allocator work and choose a deterministic local
+        # batch; power is measured after the first step and recorded for later
+        # closed-loop tuning rather than changing shapes mid-graph.
+        total_gib = torch.cuda.get_device_properties(device).total_memory / (1024**3)
+        args.batch = max(1, min(8, int(total_gib // 64)))
+        if rank == 0:
+            print(f"auto_batch selected per-rank batch={args.batch} from {total_gib:.1f} GiB", flush=True)
     torch.manual_seed(1729 + rank)
     cfg = load_config()
     cfg.max_seq_len = args.seq
@@ -289,7 +343,7 @@ def main():
                 torch.cuda.set_rng_state(resume_state["cuda_rng_state"], device=device)
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
-    stream = ByteStream(args.data, args.seq, args.batch, rank, world)
+    stream = ByteStream(args.data, args.seq, args.batch, rank, world, seed=args.data_seed)
     if args.cuda_graphs:
         raise RuntimeError(
             "CUDA graphs are not supported for the canonical DDP+FBT2+AnchorMuon "
@@ -301,7 +355,12 @@ def main():
         "world": world,
         "optimizer_groups": optimizer.group_summary(),
         "loss": [],
-        "ratio": [],
+        "objective": [],
+        "standard_ce": [],
+        "feedback_ce": [],
+        "router_loss": [],
+        "moe_aux": [],
+        "ratio_target_error": [],
         "time_ms": [],
         "power_w": [],
         "nonfinite": [],
@@ -331,7 +390,7 @@ def main():
         optimizer.zero_grad(set_to_none=True)
         with fp8_context():
             out = model(x, mask=mask, fbt_passes=FBT_PASSES)
-            loss, _, ratio = loss_for_output(out, y, args)
+            loss, metrics = loss_for_output(out, y, args)
         # Transformer Engine updates delayed-scaling state during the forward
         # autocast scope; its backward kernels consume that state and should be
         # launched after leaving the context.
@@ -353,14 +412,16 @@ def main():
             torch.cuda.synchronize()
         elapsed = (time.perf_counter() - t0) * 1e3
         reduced = loss.detach().float()
-        reduced_ratio = ratio.detach().float()
+        reduced_metrics = {name: value.detach().float() for name, value in metrics.items()}
         if world > 1:
             dist.all_reduce(reduced)
             reduced /= world
-            dist.all_reduce(reduced_ratio)
-            reduced_ratio /= world
+            for value in reduced_metrics.values():
+                dist.all_reduce(value)
+                value /= world
         log["loss"].append(float(reduced))
-        log["ratio"].append(float(reduced_ratio))
+        for name, value in reduced_metrics.items():
+            log[name].append(float(value))
         log["time_ms"].append(elapsed)
         if rank == 0 and args.power_every > 0 and (
             step == start_step or step % args.power_every == 0
@@ -370,7 +431,12 @@ def main():
             log["power_w"].append(list(latest_power))
         if rank == 0 and (step < 3 or step % args.log_every == 0):
             print(
-                f"step={step} loss={float(reduced):.6f} time_ms={elapsed:.1f} "
+                f"step={step} objective={float(reduced):.6f} "
+                f"ce={float(reduced_metrics['standard_ce']):.6f} "
+                f"fb_ce={float(reduced_metrics['feedback_ce']):.6f} "
+                f"router={float(reduced_metrics['router_loss']):.6f} "
+                f"moe={float(reduced_metrics['moe_aux']):.6f} "
+                f"time_ms={elapsed:.1f} "
                 f"power_w={','.join(f'{x:.0f}' for x in latest_power) or 'n/a'}",
                 flush=True,
             )
