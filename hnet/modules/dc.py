@@ -219,36 +219,27 @@ class ChunkLayer(nn.Module):
             effective_boundary_mask = boundary_mask
             if self.static_max_seqlen is not None:
                 capacity = int(self.static_max_seqlen)
-                lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-                doc_idx = torch.repeat_interleave(
-                    torch.arange(lengths.numel(), device=boundary_mask.device),
-                    lengths.to(device=boundary_mask.device, dtype=torch.long),
+                # Retain the first boundaries in each document. Selecting by
+                # score over the complete prompt would let a future byte evict
+                # an earlier latent, which violates causality and disagrees
+                # with the online decoder's boundary counter. Build the
+                # per-document rank entirely on-device so packed callers keep
+                # the same tensor-only contract as graph training.
+                flat_mask = boundary_mask.to(dtype=torch.int32)
+                global_rank = torch.cumsum(flat_mask, dim=0)
+                starts = cu_seqlens[:-1].to(
+                    device=boundary_mask.device, dtype=torch.long
                 )
-                counts = torch.zeros(
-                    lengths.numel(), device=boundary_mask.device, dtype=torch.int32
-                ).scatter_add_(0, doc_idx, boundary_mask.to(torch.int32))
-                if bool((counts > capacity).any()):
-                    # Packed execution is already a dynamic varlen path, so
-                    # using host section offsets here does not affect CUDA
-                    # graph capture.  Keep the selection per document and
-                    # force each structural first token to survive ties.
-                    effective_boundary_mask = boundary_mask.clone()
-                    sections = cu_seqlens.detach().cpu().tolist()
-                    for start, end in zip(sections[:-1], sections[1:], strict=True):
-                        local_mask = boundary_mask[start:end]
-                        if int(local_mask.sum().item()) <= capacity:
-                            continue
-                        local_scores = boundary_prob[start:end, -1].float().masked_fill(
-                            ~local_mask, float("-inf")
-                        )
-                        if bool(local_mask[0]):
-                            local_scores[0] = float("inf")
-                        selected = torch.topk(
-                            local_scores, k=capacity, sorted=False
-                        ).indices
-                        keep = torch.zeros_like(local_mask)
-                        keep[selected] = True
-                        effective_boundary_mask[start:end] = local_mask & keep
+                offsets = global_rank.index_select(0, starts) - flat_mask.index_select(
+                    0, starts
+                )
+                doc_idx = get_seq_idx(
+                    cu_seqlens,
+                    device=boundary_mask.device,
+                    total_length=boundary_mask.shape[0],
+                )[0].to(dtype=torch.long)
+                per_doc_rank = global_rank - offsets.index_select(0, doc_idx)
+                effective_boundary_mask = boundary_mask & (per_doc_rank <= capacity)
 
             next_hidden_states = hidden_states[effective_boundary_mask]
             next_cu_seqlens = F.pad(
@@ -281,31 +272,14 @@ class ChunkLayer(nn.Module):
                 next_max_seqlen = min(int(self.static_max_seqlen), L)
             else:
                 next_max_seqlen = int(num_tokens.max())
-            # In the configured static path the full input length bounds the
-            # number of selected boundaries. Avoid a device-to-host max read
-            # that would prevent CUDA graph capture; dynamic callers retain
-            # the explicit check.
+            # The causal rank rule below is tensor-only and replay-safe under
+            # CUDA graphs while keeping the latent tensor statically shaped.
             capacity = min(int(next_max_seqlen), int(L))
             if self.static_max_seqlen is not None and capacity < L:
-                # Keep a fixed latent tensor for graph replay while retaining
-                # the learned routing decision: if too many boundaries are
-                # emitted, retain the highest boundary probabilities.  The
-                # first position is always a boundary and therefore survives
-                # the top-k selection.
-                scores = boundary_prob[..., -1].float().masked_fill(
-                    ~boundary_mask, float("-inf")
+                boundary_rank = torch.cumsum(
+                    boundary_mask.to(dtype=torch.int32), dim=1
                 )
-                # Position zero is structural.  Force it into the retained
-                # set even when several router probabilities tie.
-                scores[:, 0] = torch.where(
-                    boundary_mask[:, 0],
-                    torch.full_like(scores[:, 0], float("inf")),
-                    scores[:, 0],
-                )
-                _, top_indices = torch.topk(scores, k=capacity, dim=1, sorted=False)
-                keep = torch.zeros_like(boundary_mask)
-                keep.scatter_(1, top_indices, True)
-                effective_boundary_mask = boundary_mask & keep
+                effective_boundary_mask = boundary_mask & (boundary_rank <= capacity)
                 num_tokens = effective_boundary_mask.sum(dim=-1)
             if self.static_max_seqlen is None and int(num_tokens.max()) > next_max_seqlen:
                 raise ValueError(

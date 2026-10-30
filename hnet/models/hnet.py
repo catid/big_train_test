@@ -553,7 +553,9 @@ class HNet(nn.Module):
             # next selected latent boundary.
             if previous_inner is None or previous_inner.shape[1] == 0:
                 raise RuntimeError("FBT prefill produced no latent state")
-            inference_params.feedback_hidden_state.copy_(previous_inner[:, -1])
+            inference_params.feedback_hidden_state.copy_(
+                previous_inner[:, -1].to(dtype=inference_params.feedback_hidden_state.dtype)
+            )
             inference_params.feedback_initialized.fill_(True)
         result = [bpred_output, *final_prev_boundary_predictions]
         if return_feedback:
@@ -650,7 +652,11 @@ class HNet(nn.Module):
                 # a boundary.  Non-boundary bytes update the dechunker but do
                 # not advance the chunk-level FBT recurrence.
                 inference_params.feedback_hidden_state.index_copy_(
-                    0, active_rows, hidden_states_inner[:, -1]
+                    0,
+                    active_rows,
+                    hidden_states_inner[:, -1].to(
+                        dtype=inference_params.feedback_hidden_state.dtype
+                    ),
                 )
                 inference_params.feedback_initialized.index_fill_(
                     0, active_rows, True
