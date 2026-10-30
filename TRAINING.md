@@ -30,12 +30,10 @@ The looped attention executions share the layer KV slot and rewrite it on each
 refinement; weights are shared across both executions. FBT training uses fresh
 caches and fixed chunk boundaries, as required by its multipass objective. The
 outer encoder, router, chunker, dechunker, and decoder do not use MSAR or FBT.
-MSAR currently has no recurrent stream-state implementation for token-by-token
-decoding; `Isotropic.step` rejects that combination instead of silently serving
-a model with different residual dynamics. The VHA cache itself is allocated
-per FA layer with two physical KV heads and rank-4 postmix compression, but the
-top-level FBT/MSAR wrapper intentionally exposes training and full-sequence
-evaluation only until an MSAR stream-state implementation is added.
+Cached prefill stores bounded MSAR stream tails for the base stream and each
+inner layer, and decode advances those histories after both shared-weight loops.
+The VHA cache is allocated per FA layer with two physical KV heads and rank-4
+postmix compression.
 
 FBT follows arXiv:2608.08888 Fig. 10: jitter is applied before document-local
 shift-right, the shifted state is fused through a gated GLU with normalized

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 import ctypes
-import re
+import site
 import subprocess
 from pathlib import Path
 
@@ -35,6 +35,8 @@ _GROUPED_LINEAR_ORIGINAL = None
 _MODULE_GROUPED_LINEAR_ORIGINAL = None
 _GROUPED_LINEAR_EAGER_ORIGINAL = None
 _EXPECTED_TE_COMMIT = "9646c3ef22455b6948cbe870f1aaf20fc8238d69"
+_CUBLASLT_PATH = None
+_CUBLASLT_VERSION = None
 
 
 def _preload_pinned_cuda_blas() -> None:
@@ -46,7 +48,12 @@ def _preload_pinned_cuda_blas() -> None:
     build time before importing TE, and fail with a useful message if they are
     absent rather than allowing a later unresolved-symbol error.
     """
-    candidates = (
+    global _CUBLASLT_PATH, _CUBLASLT_VERSION
+    venv_candidates = tuple(
+        os.path.join(prefix, "nvidia", "cu13", "lib")
+        for prefix in site.getsitepackages()
+    )
+    candidates = venv_candidates + (
         "/usr/local/cuda-13.4/targets/x86_64-linux/lib",
         "/usr/local/cuda/lib64",
     )
@@ -61,12 +68,23 @@ def _preload_pinned_cuda_blas() -> None:
     # library: fail before importing TE rather than silently training bad
     # expert weights.  A later 13.8.x patch is required for this contract.
     resolved_lt = os.path.realpath(os.path.join(root, "libcublasLt.so.13"))
-    match = re.search(r"\.so\.(\d+)\.(\d+)\.(\d+)\.(\d+)$", resolved_lt)
-    if match is None or tuple(map(int, match.groups())) < (13, 8, 1, 0):
+    try:
+        lt_probe = ctypes.CDLL(resolved_lt, mode=ctypes.RTLD_LOCAL)
+        lt_probe.cublasLtGetVersion.restype = ctypes.c_size_t
+        lt_version = int(lt_probe.cublasLtGetVersion())
+    except (AttributeError, OSError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Unable to query the libcublasLt version required by the canonical "
+            f"FP8 MoE path: {resolved_lt}"
+        ) from exc
+    if lt_version < 130801:
         raise RuntimeError(
             "The canonical FP8 MoE path requires libcublasLt >= 13.8.1; "
-            f"found {resolved_lt}. Install the reviewed CUDA patch before training."
+            f"found version code {lt_version} at {resolved_lt}. "
+            "Install the reviewed CUDA patch before training."
         )
+    _CUBLASLT_PATH = resolved_lt
+    _CUBLASLT_VERSION = lt_version
     try:
         ctypes.CDLL(os.path.join(root, "libcublasLt.so.13"), mode=ctypes.RTLD_GLOBAL)
         ctypes.CDLL(os.path.join(root, "libcublas.so.13"), mode=ctypes.RTLD_GLOBAL)
@@ -397,3 +415,9 @@ def transformer_engine_git_commit() -> str | None:
         ).strip()
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def cublaslt_provenance() -> dict[str, str | int | None]:
+    """Return the exact cuBLASLt library accepted by the FP8 MoE guard."""
+
+    return {"path": _CUBLASLT_PATH, "version_code": _CUBLASLT_VERSION}

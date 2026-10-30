@@ -13,8 +13,10 @@ floating Git revisions during a training run.
 - Transformer Engine from `/home/catid/fp8/TransformerEngine` at commit
   `9646c3ef22455b6948cbe870f1aaf20fc8238d69`, rebuilt against this environment
 - cuDNN `9.23.2.1` (the packed fused FP8 DPA backend requires cuDNN >= 9.23 on B300)
-- CUDA `libcublasLt` >= `13.8.1` (13.8.0.4 is rejected because it corrupts the
-  pinned TE grouped-GEMM MoE path)
+- NVIDIA `nvidia-cublas==13.8.2.12` (wheel SHA-256
+  `21721774d8e7044debec3034ecc1a8cd22e173eb6dae5d7f5f8a014852382894`), which
+  supplies libcublasLt 13.8.2; 13.8.0.4 is rejected because it corrupts the
+  pinned TE grouped-GEMM MoE path
 - BioNeMo Mixtral TE routing/GroupedMLP design reviewed at
   `NVIDIA-BioNeMo/bionemo-recipes` commit
   `2686b2418889ce346c5e50ea8614bb3b27415b97`; no BioNeMo runtime dependency is

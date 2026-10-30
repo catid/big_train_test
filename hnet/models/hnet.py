@@ -40,6 +40,11 @@ class HNetState:
     main_network_state: Optional[Union["HNetState", IsotropicInferenceParams]] = None
     dechunk_state: Optional[DeChunkState] = None
     decoder_state: Optional[IsotropicInferenceParams] = None
+    # Outer-stage FBT state. The first decoded token uses the plain byte
+    # feature; subsequent tokens fuse this previous top-level state with the
+    # current byte feature through the learned gated cross.
+    feedback_hidden_state: Optional[torch.Tensor] = None
+    feedback_initialized: Optional[torch.Tensor] = None
 
 
 class HNet(nn.Module):
@@ -232,6 +237,21 @@ class HNet(nn.Module):
                 ),
                 decoder_state=self.decoder.allocate_inference_cache(
                     batch_size, max_seqlen, dtype=dtype
+                ),
+                feedback_hidden_state=(
+                    torch.zeros(
+                        batch_size,
+                        self.d_model,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    if self.fbt_enabled
+                    else None
+                ),
+                feedback_initialized=(
+                    torch.zeros(batch_size, device=device, dtype=torch.bool)
+                    if self.fbt_enabled
+                    else None
                 ),
             )
 
@@ -494,6 +514,15 @@ class HNet(nn.Module):
         hidden_states = decoded
 
         hidden_states = hidden_states[..., :D]
+        if (
+            cache_requested
+            and self.fbt_enabled
+            and inference_params.feedback_hidden_state is not None
+        ):
+            # Prefill is the plain-input pass. Its final top-level state is
+            # the latent feedback carried into the first generated token.
+            inference_params.feedback_hidden_state.copy_(hidden_states[:, -1])
+            inference_params.feedback_initialized.fill_(True)
         result = [bpred_output, *final_prev_boundary_predictions]
         if return_feedback:
             return hidden_states, result, feedback_logits
@@ -501,6 +530,28 @@ class HNet(nn.Module):
 
     def step(self, hidden_states, inference_params):
         D = hidden_states.shape[-1]
+
+        if self.fbt_enabled:
+            if (
+                inference_params.feedback_hidden_state is None
+                or inference_params.feedback_initialized is None
+            ):
+                raise RuntimeError("FBT inference cache was not allocated for the outer H-Net")
+            # Eq. (glu_cross) from arXiv:2608.08888. The previous top-level
+            # state is the value path; the current byte feature is only the
+            # multiplicative gate. The first token remains a plain prefill
+            # input because no prior top-level state exists yet.
+            token_path = self.fbt_input_norm_1(hidden_states)
+            previous = inference_params.feedback_hidden_state.unsqueeze(1)
+            with fp8_context():
+                feedback_value = self.fbt_up(previous)
+                gate_logits = self.fbt_gate(token_path)
+            fused = self.fbt_input_norm_2(
+                feedback_value
+                * torch.sigmoid(gate_logits.float()).to(feedback_value.dtype)
+            )
+            use_feedback = inference_params.feedback_initialized[:, None, None]
+            hidden_states = torch.where(use_feedback, fused, hidden_states)
 
         if self.pad_dimension is not None:
             hidden_states = torch.cat(
@@ -551,5 +602,9 @@ class HNet(nn.Module):
 
         hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)
         hidden_states = hidden_states[..., :D]
+
+        if self.fbt_enabled:
+            inference_params.feedback_hidden_state.copy_(hidden_states[:, -1])
+            inference_params.feedback_initialized.fill_(True)
 
         return hidden_states, [bpred_output, *prev_boundary_predictions]
