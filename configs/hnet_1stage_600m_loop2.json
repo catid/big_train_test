@@ -19,6 +19,7 @@
         "vha_rank": 4
     },
     "inner_loops": 2,
+    "msar_block_size": 4,
     "msar": true,
     "msar_stream_kernels": [1, 4, 8, 12],
     "swa_window_size": 128,

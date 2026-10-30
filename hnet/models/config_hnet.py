@@ -46,6 +46,10 @@ class HNetConfig:
     swa_window_size: int = 128
     # Shared recurrent execution count for the deepest (middle) network.
     inner_loops: int = 2
+    # Number of middle layers between MSAR stream boundaries.  This is kept
+    # in the canonical configuration rather than hidden in the module so a
+    # checkpoint's architecture signature fully describes the recurrence.
+    msar_block_size: int = 4
     fbt: bool = True
     fbt_passes: int = 2
     fbt_jitter: float = 0.02
@@ -87,8 +91,16 @@ class HNetConfig:
             raise ValueError("the canonical model is byte-level with vocab_size=256")
         if self.swa_window_size != 128 or self.inner_loops != 2:
             raise ValueError("the canonical model requires a 128-token SWA window and two inner loops")
+        if int(self.msar_block_size) != 4:
+            raise ValueError("the canonical model requires MSAR boundaries every four layers")
         if not (self.msar and self.fbt and self.static_chunking and self.fbt_passes == 2):
             raise ValueError("the canonical model requires MSAR, two-pass FBT, and static chunking")
+        if not self.fbt_prefix_mixin or float(self.fbt_jitter) != 0.02:
+            raise ValueError(
+                "the canonical model requires the enabled FBT prefix mix-in and jitter=0.02"
+            )
+        if tuple(int(v) for v in self.msar_stream_kernels) != (1, 4, 8, 12):
+            raise ValueError("the canonical model requires MSAR stream kernels [1, 4, 8, 12]")
         if int(self.chunk_capacity_tokens) != 512:
             raise ValueError("the canonical model requires a 512-token latent chunk capacity")
         if not self.msar_activation_checkpointing:
@@ -103,9 +115,23 @@ class HNetConfig:
             raise ValueError("the canonical model requires VHA postmix rank 4")
         if self.attn_cfg.window_size != [128, -1]:
             raise ValueError("the canonical model requires 128-token SWA and global FA")
+        if self.attn_cfg.num_heads != [16, 16]:
+            raise ValueError("the canonical model requires 16 attention heads per stage")
+        if self.attn_cfg.rotary_emb_dim != [32, 48]:
+            raise ValueError("the canonical model requires rotary dimensions [32, 48]")
         if self.attn_cfg.croissattn_aux != [False, True]:
             raise ValueError(
                 "the canonical model enables patched CroissAttn only on the global FA stage"
+            )
+        if (
+            int(self.ssm_cfg.chunk_size) != 256
+            or int(self.ssm_cfg.d_conv) != 4
+            or int(self.ssm_cfg.d_state) != 128
+            or int(self.ssm_cfg.expand) != 2
+        ):
+            raise ValueError(
+                "the canonical model requires SSM settings chunk_size=256, d_conv=4, "
+                "d_state=128, expand=2"
             )
         if (
             int(self.moe_expert_intermediate) != 512
