@@ -971,6 +971,61 @@ class AnchorMuon(torch.optim.Optimizer):
             self.state[p]["normuon_second_momentum"].copy_(second_stack[idx])
         return update
 
+    def _apply_matrix_residual_updates(
+        self,
+        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
+        updates: torch.Tensor,
+        *,
+        lr: float,
+        soda_weight: float,
+    ) -> int:
+        """Apply independent matrix residual updates with foreach kernels.
+
+        The residual equation for each matrix is unchanged: SODA anchor pull,
+        optional decoupled decay, then the GramNS update.  Foreach only batches
+        these elementwise operations across the already same-shape chunk; the
+        FP32 master-to-parameter copies remain per parameter so dtype and
+        storage semantics stay identical to the scalar path.
+        """
+        records = []
+        for (p, anchor, _source, _grad), update in zip(
+            entries, updates.unbind(0), strict=True
+        ):
+            master = self._master_param(p)
+            records.append(
+                (
+                    p,
+                    master,
+                    anchor,
+                    update.reshape_as(master),
+                    bool(getattr(p, "_no_weight_decay", False)),
+                )
+            )
+        if not records:
+            return 0
+
+        masters = [record[1] for record in records]
+        anchors = [record[2] for record in records]
+        torch._foreach_lerp_(masters, anchors, soda_weight)
+
+        if self.matrix_weight_decay:
+            decay_records = [record for record in records if not record[4]]
+            if decay_records:
+                torch._foreach_mul_(
+                    [record[1] for record in decay_records],
+                    1.0 - lr * self.matrix_weight_decay,
+                )
+
+        torch._foreach_add_(
+            masters,
+            [record[3] for record in records],
+            alpha=-lr,
+        )
+        for p, master, _anchor, _update, _no_weight_decay in records:
+            if master is not p:
+                p.copy_(master.to(dtype=p.dtype))
+        return len(records)
+
     def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
         beta_m = float(group["momentum"])
         entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
@@ -1018,22 +1073,12 @@ class AnchorMuon(torch.optim.Optimizer):
                     start : start + MATRIX_BUCKET_CHUNK_SIZE
                 ]
                 updates = self._transform_matrix_bucket(chunk_entries, group)
-                for (p, anchor, _source, _grad), update in zip(
-                    chunk_entries, updates.unbind(0), strict=True
-                ):
-                    master = self._master_param(p)
-                    master.lerp_(end=anchor, weight=soda_weight)
-                    matrix_decay = (
-                        0.0
-                        if getattr(p, "_no_weight_decay", False)
-                        else self.matrix_weight_decay
-                    )
-                    if matrix_decay:
-                        master.mul_(1.0 - lr * matrix_decay)
-                    master.add_(update.reshape_as(master), alpha=-lr)
-                    if master is not p:
-                        p.copy_(master.to(dtype=p.dtype))
-                    matrix_count += 1
+                matrix_count += self._apply_matrix_residual_updates(
+                    chunk_entries,
+                    updates,
+                    lr=lr,
+                    soda_weight=soda_weight,
+                )
 
         return {
             "matrix_count": float(matrix_count),

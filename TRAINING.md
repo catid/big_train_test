@@ -139,6 +139,12 @@ AnchorMuon applies GramNS/PMuonEq/NorMuon to sufficiently wide matrix banks
 and AdamATan2 to vectors and skinny control projections. BF16 model weights use
 persistent FP32 master copies for every update, SODA anchor, moment, and decay;
 checkpoint reload restores those tensors without narrowing them.
+The matrix residual stage batches the SODA pull, decoupled decay, and update
+with foreach kernels within each same-shape optimizer chunk. A deterministic
+probe over all canonical parameter shapes (603,935,652 elements) produced
+bit-identical BF16 parameters and FP32 optimizer state for two updates; the
+full eight-rank B14 graph remained finite with no measured end-to-end
+regression.
 
 The CroissAttn correction in `~/fp8` uses the separate unrounded auxiliary
 `O' = P @ V_f` for the softmax backward correction, rather than the rounded
