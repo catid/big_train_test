@@ -71,6 +71,7 @@ class _ExpertMLP(nn.Module):
 
     def __init__(self, d_in: int, d_hidden: int, *, bias: bool, device, dtype, fp8: bool):
         super().__init__()
+        self.fp8 = bool(fp8)
         if fp8:
             try:
                 import transformer_engine.pytorch as te
@@ -83,6 +84,16 @@ class _ExpertMLP(nn.Module):
             self.fc2 = nn.Linear(d_hidden, d_in, bias=bias, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
+        # TE's FP8 GEMM requires the flattened token dimension to be a
+        # multiple of eight.  Routing produces variable per-expert counts,
+        # and document-aware chunking can produce an arbitrary shared-expert
+        # count, so pad only the row dimension for the GEMM and discard those
+        # rows afterward.  This keeps the full production FP8 path enabled
+        # without changing routing probabilities or sequence boundaries.
+        rows = x.shape[0]
+        pad_rows = (-rows) % 8 if self.fp8 else 0
+        if pad_rows:
+            x = F.pad(x, (0, 0, 0, pad_rows))
         a, gate = self.fc1(x).chunk(2, dim=-1)
         # Center the post-activation features per token.  The activation-bias
         # study (arXiv:2610.14500) uses this adaptive shift in its scale-up
@@ -96,7 +107,8 @@ class _ExpertMLP(nn.Module):
         )
         # The caller performs the routed weighted sum in FP32 before converting
         # back to model dtype.
-        return self.fc2(activated)
+        output = self.fc2(activated)
+        return output[:rows] if pad_rows else output
 
 
 class LatentMoE(nn.Module):
@@ -178,14 +190,27 @@ class LatentMoE(nn.Module):
         if not self.fp8:
             return nullcontext()
         import transformer_engine.pytorch as te
+        # ``common`` is a separate package in current Transformer Engine
+        # releases (including the patched TE used by ``~/fp8``); older
+        # releases happened to re-export it from ``transformer_engine.pytorch``.
+        # Importing the public recipe module directly keeps the production FP8
+        # path compatible without silently dropping to a non-FP8 implementation.
+        from transformer_engine.common.recipe import DelayedScaling
         # Delayed scaling gives the MoE GEMMs amax history and keeps all gate
         # reductions outside FP8.  The caller may nest a project-wide TE context;
         # TE permits the nested context and reuses its metadata tensors.
-        recipe = te.common.recipe.DelayedScaling(fp8_dpa=False, amax_history_len=16)
+        recipe = DelayedScaling(fp8_dpa=False, amax_history_len=16)
         return te.fp8_autocast(enabled=True, fp8_recipe=recipe)
 
     def _route(self, x: Tensor):
-        logits = self.router(x.float())
+        # Router reductions are intentionally FP32 for stable top-k decisions.
+        # The production model stores parameters in BF16, so calling the
+        # module directly with ``x.float()`` would trigger a dtype mismatch.
+        # Make the tiny router matmul explicitly homogeneous instead of
+        # weakening the FP32 routing path or relying on implicit casts.
+        router_weight = self.router.weight.float()
+        router_bias = None if self.router.bias is None else self.router.bias.float()
+        logits = F.linear(x.float(), router_weight, router_bias)
         probs = F.softmax(logits, dim=-1)
         weights, indices = probs.topk(self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
