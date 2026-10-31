@@ -1150,14 +1150,104 @@ class AnchorMuon(torch.optim.Optimizer):
         return 1
 
     def _step_fallback_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
-        fallback_count = 0
+        # AdamATan2 is used by a large collection of skinny controls (biases,
+        # norms, router scales).  The old scalar loop launched every pointwise
+        # operation once per tensor.  Group equal-shape tensors and use
+        # foreach kernels for the EMA, bias correction, decay, and master
+        # update; atan2 remains one operation per tensor on PyTorch versions
+        # that do not expose a foreach atan2 kernel.
+        buckets: dict[tuple[torch.device, torch.dtype, torch.Size, bool], list[torch.Tensor]] = defaultdict(list)
         for p in group["params"]:
-            fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
+            if p.grad is None:
+                continue
+            key = (
+                p.device,
+                p.dtype,
+                p.shape,
+                bool(getattr(p, "_no_weight_decay", False)),
+            )
+            buckets[key].append(p)
+
+        fallback_count = 0
+        for bucket in buckets.values():
+            fallback_count += self._step_fallback_bucket(
+                bucket, group, lr=lr, t=t
+            )
         return {
             "matrix_count": 0.0,
             "fallback_count": float(fallback_count),
             "soda_weight": float(self._soda_weight(t)),
         }
+
+    def _step_fallback_bucket(
+        self,
+        params: list[torch.Tensor],
+        group: dict[str, Any],
+        *,
+        lr: float,
+        t: int,
+    ) -> int:
+        if not params:
+            return 0
+        beta1, beta2 = (float(v) for v in group.get("betas", (0.9, 0.95)))
+        eps = float(group.get("eps", 1e-8))
+        exp_avg_sq = []
+        exp_avg = []
+        masters = []
+        anchors = []
+        grads = []
+        states = []
+        for p in params:
+            grad = p.grad
+            if grad is None:
+                continue
+            state = self.state[p]
+            second = state.get("exp_avg_sq")
+            if not isinstance(second, torch.Tensor) or second.shape != p.shape:
+                second = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                state["step"] = 0
+            elif second.device != p.device or second.dtype != torch.float32:
+                second = state["exp_avg_sq"] = second.to(device=p.device, dtype=torch.float32)
+            first = state.get("exp_avg")
+            if not isinstance(first, torch.Tensor) or first.shape != p.shape:
+                first = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            elif first.device != p.device or first.dtype != torch.float32:
+                first = state["exp_avg"] = first.to(device=p.device, dtype=torch.float32)
+            state["step"] = int(state.get("step", 0)) + 1
+            exp_avg_sq.append(second)
+            exp_avg.append(first)
+            masters.append(self._master_param(p))
+            anchors.append(self._soda_anchor(p))
+            grads.append(grad.detach().to(torch.float32))
+            states.append(state)
+
+        if not states:
+            return 0
+        torch._foreach_mul_(exp_avg_sq, beta2)
+        torch._foreach_addcmul_(exp_avg_sq, grads, grads, value=1.0 - beta2)
+        denoms = torch._foreach_div(
+            exp_avg_sq,
+            [max(1.0 - beta2 ** int(state["step"]), 1e-16) for state in states],
+        )
+        denoms = torch._foreach_sqrt(denoms)
+        denoms = torch._foreach_add(denoms, eps)
+
+        torch._foreach_mul_(exp_avg, beta1)
+        torch._foreach_add_(exp_avg, grads, alpha=1.0 - beta1)
+        numerators = torch._foreach_div(
+            exp_avg,
+            [max(1.0 - beta1 ** int(state["step"]), 1e-16) for state in states],
+        )
+        updates = [torch.atan2(numerator, denom) for numerator, denom in zip(numerators, denoms, strict=True)]
+
+        torch._foreach_lerp_(masters, anchors, self._soda_weight(t))
+        if not bool(getattr(params[0], "_no_weight_decay", False)):
+            decay = float(group.get("fallback_weight_decay", 0.0))
+            if decay:
+                torch._foreach_mul_(masters, 1.0 - lr * decay)
+        torch._foreach_add_(masters, updates, alpha=-lr)
+        torch._foreach_copy_(params[: len(states)], masters)
+        return len(states)
 
     @torch.no_grad()
     def step(self, closure: Callable[[], torch.Tensor] | None = None) -> torch.Tensor | None:
