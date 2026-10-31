@@ -82,7 +82,7 @@ def _depthwise_dx(grad_y: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         length,
         kernel,
         BLOCK_T=block_t,
-        num_warps=8,
+        num_warps=4,
     )
     return grad_x
 
