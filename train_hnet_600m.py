@@ -1425,6 +1425,36 @@ class CUDAGraphStep:
             # this keeps the captured graph free of logger/NCCL setup calls.
             self.model.require_backward_grad_sync = False
         hnet_te.set_graph_capture(True)
+        # TE's DPA backend key includes its ``cuda_graph`` flag.  A normal
+        # eager warmup therefore leaves the first graph replay trying to run
+        # the cuDNN backend selector while the stream is already capturing;
+        # cuDNN handle creation is not capture safe.  Mark one graph-mode
+        # forward outside the raw CUDA capture to populate TE's backend cache
+        # with the exact graph key, then capture only the already-selected
+        # kernels below.
+        from transformer_engine.pytorch import graph as te_graph
+        te_graph.set_capture_start()
+        try:
+            graph_backend_warmup = self.forward_model(
+                self.static_x, mask=self.static_mask, fbt_passes=FBT_PASSES
+            )
+            graph_backend_loss, _graph_backend_metrics = loss_for_output(
+                graph_backend_warmup,
+                self.static_y,
+                self.args,
+                loss_mask=self.static_loss_mask,
+                active_mask=self.static_mask,
+            )
+            # The backward fused-attention selector has the same lazy cuDNN
+            # handle as forward. Exercise it under TE's graph-mode key before
+            # entering raw CUDA capture, then discard the warmup graph.
+            graph_backend_loss.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            del graph_backend_warmup
+            del graph_backend_loss, _graph_backend_metrics
+            torch.cuda.synchronize(self.device)
+        finally:
+            te_graph.set_capture_end()
         try:
             # Capture on the same non-default stream used for DDP construction
             # and warmup. Single-GPU capture keeps PyTorch's default stream
