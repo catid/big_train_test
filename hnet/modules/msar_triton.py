@@ -1,10 +1,8 @@
 """Triton kernels for the padded MSAR depthwise convolution.
 
 The forward MSAR expansion stays on PyTorch's depthwise convolution kernel.
-Its input-gradient kernel, however, is a short causal correlation and can be
-computed without the generic convolution backward launch.  The weight
-gradient deliberately remains PyTorch's grouped-convolution implementation so
-the custom path changes only the dominant input-gradient work.
+Its input and weight-gradient kernels are short causal correlations and can be
+computed without the generic grouped-convolution backward launches.
 """
 
 from __future__ import annotations
@@ -57,6 +55,87 @@ def _causal_depthwise_dx(
             grad_x,
             mask=token_mask,
         )
+
+
+@triton.jit
+def _causal_depthwise_dw(
+    grad_y_ptr,
+    x_ptr,
+    grad_weight_ptr,
+    batch,
+    channels,
+    length,
+    BLOCK_T: tl.constexpr,
+    KERNEL: tl.constexpr,
+    K_PAD: tl.constexpr,
+):
+    """Weight gradient for the causal depthwise correlation.
+
+    The forward uses ``w[K - 1 - lag]`` at output position ``t``.  One
+    program owns a channel and accumulates all K coefficients in FP32 while
+    streaming the input/gradient tiles over the batch.  Keeping the
+    coefficient loop inside the program avoids the generic grouped-conv
+    weight-gradient setup and its per-call workspace for this tiny fixed
+    depthwise kernel.
+    """
+
+    channel = tl.program_id(0)
+    acc = tl.zeros((K_PAD,), dtype=tl.float32)
+    coefficient = tl.arange(0, K_PAD)
+    coefficient_mask = coefficient < KERNEL
+    for batch_index in range(batch):
+        base = (batch_index * channels + channel) * length
+        for tile_start in range(0, length, BLOCK_T):
+            token = tile_start + tl.arange(0, BLOCK_T)
+            token_mask = token < length
+            grad_y = tl.load(grad_y_ptr + base + token, mask=token_mask, other=0).to(
+                tl.float32
+            )
+            # Keep the coefficient axis explicit so each coefficient gets a
+            # distinct reduction.  K_PAD is a power of two (required by
+            # Triton block shapes); lanes beyond KERNEL are masked.
+            source_token = token[:, None] - (KERNEL - 1 - coefficient[None, :])
+            source_mask = token_mask[:, None] & (source_token >= 0) & coefficient_mask[None, :]
+            source = tl.load(
+                x_ptr + base + source_token,
+                mask=source_mask,
+                other=0,
+            ).to(tl.float32)
+            acc += tl.sum(grad_y[:, None] * source, axis=0)
+    # The parameter is BF16 in production; the cast is performed by the
+    # store rather than narrowing each partial accumulation.
+    tl.store(
+        grad_weight_ptr + channel * KERNEL + coefficient,
+        acc,
+        mask=coefficient_mask,
+    )
+
+
+def _depthwise_dw(
+    grad_y: torch.Tensor,
+    x: torch.Tensor,
+    kernel: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    if not grad_y.is_cuda or not x.is_cuda:
+        raise RuntimeError("MSAR Triton depthwise backward requires CUDA tensors")
+    batch, channels, length = grad_y.shape
+    grad_weight = torch.empty(
+        (channels, 1, kernel), device=grad_y.device, dtype=torch.float32
+    )
+    _causal_depthwise_dw[(channels,)](
+        grad_y,
+        x,
+        grad_weight,
+        batch,
+        channels,
+        length,
+        BLOCK_T=256,
+        KERNEL=kernel,
+        K_PAD=16,
+        num_warps=4,
+    )
+    return grad_weight.to(dtype=output_dtype)
 
 
 def _depthwise_dx(grad_y: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -119,15 +198,12 @@ class _CausalDepthwiseFunction(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         grad_x = _depthwise_dx(grad_output, weight)
-        # Keep the existing grouped-convolution weight-gradient kernel.  This
-        # avoids changing optimizer-visible parameter math while replacing
-        # only the expensive input-gradient launch.
-        padded_x = torch.nn.functional.pad(x, (weight.shape[-1] - 1, 0))
-        grad_weight = torch.nn.grad.conv1d_weight(
-            padded_x,
-            weight.shape,
-            grad_output,
-            groups=x.shape[1],
+        # The depthwise weight gradient is the same causal correlation as the
+        # forward, with one independent reduction per channel.  Keep its
+        # accumulation in FP32 inside the fused Triton kernel and narrow only
+        # the final result to the parameter dtype.
+        grad_weight = _depthwise_dw(
+            grad_output, x, weight.shape[-1], weight.dtype
         )
         return grad_x, grad_weight
 
