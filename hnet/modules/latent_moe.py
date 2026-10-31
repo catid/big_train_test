@@ -404,7 +404,12 @@ class LatentMoE(nn.Module):
         # that pair of conversion kernels is on the hot path for every MoE
         # invocation.  Integer masking is exact for the binary route and the
         # single FP32 cast below remains sufficient for the auxiliary loss.
-        routing_map = routing_map * active[:, None].to(torch.int32)
+        # The fused router map is discrete and does not participate in
+        # autograd. Mask it in place after the one required bool->int32 cast;
+        # constructing a second int32 tensor and then casting it again for the
+        # auxiliary loss used to add two full-token launches and a transient
+        # map on every routed invocation.
+        routing_map.mul_(active[:, None])
         active_one_hot = routing_map.to(torch.float32)
         # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
         # this normalization explicit so the Switch/GShard term remains
