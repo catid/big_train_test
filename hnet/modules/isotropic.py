@@ -81,6 +81,12 @@ class Isotropic(nn.Module):
                     d_intermediate=config.d_intermediate[self.stage_idx],
                     ssm_cfg=self.ssm_cfg,
                     attn_cfg=self.attn_cfg,
+                    latent_moe=getattr(config, "latent_moe", True),
+                    moe_num_experts=getattr(config, "moe_num_experts", 8),
+                    moe_top_k=getattr(config, "moe_top_k", 4),
+                    moe_latent_alpha=getattr(config, "moe_latent_alpha", 2),
+                    moe_matched=getattr(config, "moe_matched", True),
+                    moe_fp8=getattr(config, "moe_fp8", True),
                     layer_idx=(layer_idx + i),
                     **factory_kwargs,
                 )

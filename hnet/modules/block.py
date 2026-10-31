@@ -9,7 +9,7 @@ from flash_attn.ops.triton.layer_norm import RMSNorm
 from mamba_ssm.modules.mamba2 import Mamba2
 
 from .mha import CausalMHA
-from .mlp import SwiGLU
+from .latent_moe import LatentMoE
 
 
 class Mamba2Wrapper(Mamba2):
@@ -17,7 +17,7 @@ class Mamba2Wrapper(Mamba2):
     Mamba2 wrapper class that has the same inference interface as the CausalMHA class.
     """
 
-    def step(self, hidden_states, inference_params):
+    def step(self, hidden_states, inference_params, loop_idx=0):
         # Don't use _get_states_from_cache because we want to assert that they exist
         conv_state, ssm_state = inference_params.key_value_memory_dict[
             self.layer_idx
@@ -41,6 +41,12 @@ def create_block(
     norm_epsilon=1e-5,
     layer_idx=None,
     residual_in_fp32=True,
+    latent_moe=True,
+    moe_num_experts=8,
+    moe_top_k=4,
+    moe_latent_alpha=2,
+    moe_matched=True,
+    moe_fp8=True,
     device=None,
     dtype=None,
 ):
@@ -60,9 +66,17 @@ def create_block(
 
     # MLP
     if arch in ("T", "M"):
+        if not latent_moe:
+            raise ValueError("production H-Net requires LatentMoE for FFN blocks")
+        if not moe_matched:
+            raise ValueError("production H-Net requires matched LatentMoE widths")
         mlp_cls = partial(
-            SwiGLU,
+            LatentMoE,
             d_intermediate=d_intermediate,
+            num_experts=moe_num_experts,
+            top_k=moe_top_k,
+            latent_alpha=moe_latent_alpha,
+            fp8=moe_fp8,
             **factory_kwargs,
         )
     elif arch in ("t", "m"):
@@ -141,14 +155,14 @@ class Block(nn.Module):
             batch_size, max_seqlen, dtype=dtype, **kwargs
         )
 
-    def step(self, hidden_states, inference_params, residual=None):
+    def step(self, hidden_states, inference_params, residual=None, loop_idx=0):
         hidden_states, residual = self.norm1(
             hidden_states,
             residual=residual,
             prenorm=True,
             residual_in_fp32=self.residual_in_fp32,
         )
-        hidden_states = self.mixer.step(hidden_states, inference_params)
+        hidden_states = self.mixer.step(hidden_states, inference_params, loop_idx=loop_idx)
         if self.mlp is not None:
             hidden_states, residual = self.norm2(
                 hidden_states,
