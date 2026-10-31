@@ -14,6 +14,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from flash_attn.ops.triton.layer_norm import RMSNorm
 
 from hnet.modules.block import create_block
+from hnet.modules.msar_triton import causal_depthwise_conv1d
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
@@ -242,12 +243,7 @@ class Isotropic(nn.Module):
             # as explicit left padding, while avoiding the full-width F.pad
             # copy.  Keep only the causal output positions; the slice is a
             # view and the following reshape/permute preserves graph safety.
-            expanded = F.conv1d(
-                x,
-                grouped_weight,
-                padding=kernel - 1,
-                groups=channels,
-            )[..., :length]
+            expanded = causal_depthwise_conv1d(x, grouped_weight)
             streams.append(
                 expanded.reshape(batch, n_sources, width, length)
                 .permute(1, 0, 3, 2)
