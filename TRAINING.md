@@ -39,12 +39,13 @@ The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
 future byte cannot retroactively evict an earlier latent. The same effective
 boundary set is passed to the inner stack and dechunker.
-The canonical B=14 graph keeps MSAR and compatible mixer activations for the
-backward pass. This removes recomputation overhead and fits within the tested
-B300 memory budget including the first AnchorMuon state allocation; B=15 can
-replay but exhausts the device on that first optimizer update. B=16 without
-recomputation exhausts the device during capture. The fused Mamba-3 SISO
-kernel keeps its native custom-autograd path.
+The canonical graph keeps MSAR and compatible mixer activations for the
+backward pass. A complete B=16/S=4096 FP8 graph step with the first AnchorMuon
+state allocation is validated on B300; it measures 45,994 tokens/s/GPU versus
+44,464 at B=14. B=20 and B=24 exhaust the CUDA graph pool near 260 GiB during
+the first complete update, so the validated cap is 16. Power calibration still
+selects the largest safe batch at or below the approximately 1000 W per-GPU
+target. The fused Mamba-3 SISO kernel keeps its native custom-autograd path.
 MoE capacity uses the same latent bound in eager, prefill, and graph execution.
 Streaming decode
 enforces the bound monotonically: once the prefill or decode count reaches 512,

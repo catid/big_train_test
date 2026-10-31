@@ -65,7 +65,7 @@ class HNetConfig:
     # router emits more boundaries, the earliest causal boundaries are kept
     # so a future byte cannot change an earlier latent decision.
     chunk_capacity_tokens: int = 512
-    # Keep the complete activation graph for the canonical B=14 CUDA-graph
+    # Keep the complete activation graph for the canonical B=16 CUDA-graph
     # shape. Recomputing MSAR or compatible mixers saves memory but adds more
     # work than it removes on B300; the no-checkpoint shape has higher token
     # throughput while remaining below the device memory limit.

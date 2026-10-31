@@ -41,11 +41,12 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
-# With activation recomputation disabled, B=14 at S=4096 is the largest
-# validated complete full-model step with optimizer state on a B300. B=15
-# replays but exhausts the device when AnchorMuon lazily allocates its FP32
-# state; B=16 exhausts capture. B=32 also exceeds the graph pool boundary.
-CANONICAL_MAX_BATCH = 14
+# With activation recomputation disabled, B=16 at S=4096 is the largest
+# validated complete full-model step with optimizer state on a B300. B=20
+# and larger exhaust the CUDA graph pool during the first complete update.
+# Power calibration still chooses a smaller shape when the per-GPU target is
+# reached before this bound.
+CANONICAL_MAX_BATCH = 16
 
 
 def parse_args():
@@ -65,7 +66,7 @@ def parse_args():
         "--auto-batch-max",
         type=int,
         default=CANONICAL_MAX_BATCH,
-        help="upper bound for power-calibration candidates (validated complete-step cap is 14)",
+        help="upper bound for power-calibration candidates (validated complete-step cap is 16)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
@@ -1084,11 +1085,11 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     if device.type != "cuda":
         raise RuntimeError("--auto-batch requires CUDA")
     # Keep a generous memory reserve for the real optimizer and DDP buckets.
-    # The canonical no-checkpoint B=14 graph is validated on B300; smaller
+    # The canonical no-checkpoint B=16 graph is validated on B300; smaller
     # devices receive a proportionally lower bound through calibration.
     if int(args.auto_batch_max) < 1:
         raise ValueError("--auto-batch-max must be positive")
-    # The full model keeps its activation graph for the canonical B=14 shape;
+    # The full model keeps its activation graph for the canonical B=16 shape;
     # calibration catches a synchronized OOM before any collective that would
     # deadlock a DDP rank. Use the requested bound directly; a conservative
     # memory heuristic would reject the validated graph batch on B300.
