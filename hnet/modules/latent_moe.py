@@ -357,7 +357,11 @@ class LatentMoE(nn.Module):
         # Keep the router z regularizer in FP32, alongside the load-balancing
         # term. This prevents large logits from destabilizing FP8 expert GEMMs.
         self._z_loss = 1e-3 * torch.logsumexp(logits, dim=-1).square().mean()
-        expert_idx = fused_routing_map.to(dtype=torch.int64).argmax(dim=-1)
+        # Convert the dense boolean route map once.  Reusing this int32 map
+        # for expert selection and the capacity/auxiliary paths avoids a
+        # second bool->int64 conversion on every routed invocation.
+        routing_map = fused_routing_map.to(dtype=torch.int32)
+        expert_idx = routing_map.argmax(dim=-1)
 
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
         # mean router probability times dispatched token fraction.  Keep this
@@ -370,7 +374,6 @@ class LatentMoE(nn.Module):
         # that pair of conversion kernels is on the hot path for every MoE
         # invocation.  Integer masking is exact for the binary route and the
         # single FP32 cast below remains sufficient for the auxiliary loss.
-        routing_map = fused_routing_map.to(torch.int32)
         routing_map = routing_map * active[:, None].to(torch.int32)
         active_one_hot = routing_map.to(torch.float32)
         # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
