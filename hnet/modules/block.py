@@ -132,7 +132,7 @@ def create_block(
         # Mamba-3's fused SISO path is tuned for 64-token chunks.  Its
         # constructor absorbs the legacy d_conv field, which is not part of
         # Mamba-3's recurrence.
-        mamba_cfg["chunk_size"] = 32
+        mamba_cfg["chunk_size"] = 64
         mixer_cls = partial(
             Mamba3Wrapper, **mamba_cfg, **factory_kwargs, layer_idx=layer_idx
         )
