@@ -1433,26 +1433,33 @@ class CUDAGraphStep:
         # with the exact graph key, then capture only the already-selected
         # kernels below.
         from transformer_engine.pytorch import graph as te_graph
+        backend_warmup_context = (
+            torch.cuda.stream(self.capture_stream)
+            if self.capture_stream is not None
+            else contextlib.nullcontext()
+        )
         te_graph.set_capture_start()
         try:
-            graph_backend_warmup = self.forward_model(
-                self.static_x, mask=self.static_mask, fbt_passes=FBT_PASSES
-            )
-            graph_backend_loss, _graph_backend_metrics = loss_for_output(
-                graph_backend_warmup,
-                self.static_y,
-                self.args,
-                loss_mask=self.static_loss_mask,
-                active_mask=self.static_mask,
-            )
-            # The backward fused-attention selector has the same lazy cuDNN
-            # handle as forward. Exercise it under TE's graph-mode key before
-            # entering raw CUDA capture, then discard the warmup graph.
-            graph_backend_loss.backward()
-            self.optimizer.zero_grad(set_to_none=True)
-            del graph_backend_warmup
-            del graph_backend_loss, _graph_backend_metrics
-            torch.cuda.synchronize(self.device)
+            with backend_warmup_context:
+                graph_backend_warmup = self.forward_model(
+                    self.static_x, mask=self.static_mask, fbt_passes=FBT_PASSES
+                )
+                graph_backend_loss, _graph_backend_metrics = loss_for_output(
+                    graph_backend_warmup,
+                    self.static_y,
+                    self.args,
+                    loss_mask=self.static_loss_mask,
+                    active_mask=self.static_mask,
+                )
+                # The backward fused-attention selector has the same lazy
+                # cuDNN handle as forward. Exercise it under TE's graph-mode
+                # key before entering raw CUDA capture, then discard the
+                # warmup graph.
+                graph_backend_loss.backward()
+                self.optimizer.zero_grad(set_to_none=True)
+                del graph_backend_warmup
+                del graph_backend_loss, _graph_backend_metrics
+                torch.cuda.synchronize(self.device)
         finally:
             te_graph.set_capture_end()
         try:
