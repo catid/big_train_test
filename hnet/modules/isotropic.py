@@ -239,18 +239,25 @@ class Isotropic(nn.Module):
                         source, kernel, self.msar_conv[kernel_idx], cu_seqlens
                     )
                 )
-            scores = []
-            for stream, stream_query in zip(streams, query, strict=True):
-                stream_f = stream.float()
-                normed = stream_f * torch.rsqrt(
-                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
-                )
-                scores.append(
-                    torch.einsum("...d,d->...", normed, stream_query)
-                    / (self.d_model**0.5)
-                )
-            source_streams.append(streams)
-            source_scores.append(torch.stack(scores, dim=0))
+            # Keep the stream axis together while doing the normalization and
+            # query projection.  The previous per-stream loop launched four
+            # independent FP32 reductions and einsums for every source.  A
+            # temporary [streams, ..., width] view lets PyTorch use one
+            # reduction and one contraction per source, while replacing the
+            # list with this stack releases the individual stream references
+            # immediately.  The MSAR equations are unchanged: normalization
+            # still uses the same mean-square + 1e-6 denominator and each
+            # stream keeps its own learned query vector.
+            stream_bank = torch.stack(streams, dim=0)
+            stream_f = stream_bank.float()
+            normed = stream_f * torch.rsqrt(
+                stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
+            )
+            scores = torch.einsum("k...d,kd->k...", normed, query) / (
+                self.d_model**0.5
+            )
+            source_streams.append(stream_bank)
+            source_scores.append(scores)
         weights = torch.softmax(torch.stack(source_scores, dim=0), dim=0)
         retrieved_streams = []
         for stream_index in range(len(self.msar_kernels)):
