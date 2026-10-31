@@ -41,11 +41,12 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
-# The largest full-model CUDA-graph shape with repeatable finite replay on a
-# B300 is B=16 at S=4096.  Larger captures consumed roughly 190 GiB and did
-# not produce a valid replay, so calibration must not spend time probing an
-# unvalidated shape.  This is a throughput safety bound, not a smaller model
-# or partial training path.
+# B=16 at S=4096 is the largest full-model CUDA-graph shape with repeatable
+# production headroom on a B300: it replays finitely at about 26.5k tokens/s
+# and uses roughly 63 GiB. B=32 can replay in an isolated run, but consumes
+# about 274 GiB of the 275 GiB device and leaves no allocator or DDP margin;
+# calibration must not select that shape. This is a throughput safety bound,
+# not a smaller model or partial training path.
 CANONICAL_MAX_BATCH = 16
 
 
