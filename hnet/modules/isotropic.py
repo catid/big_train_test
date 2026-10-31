@@ -175,6 +175,7 @@ class Isotropic(nn.Module):
                 residual,
                 inference_params=inference_params,
                 mixer_kwargs=layer_mixer_kwargs,
+                token_mask=mask,
             )
 
         # Setting prenorm=False ignores the residual

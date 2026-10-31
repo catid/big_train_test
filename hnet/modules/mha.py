@@ -216,6 +216,9 @@ class CausalMHA(nn.Module):
         self.softmax_scale = softmax_scale
         self.rotary_emb_dim = rotary_emb_dim
         self.window_size = window_size
+        # The decode path chooses between the fused KV-cache kernel and the
+        # portable cache update below.
+        self.use_flash_attn = flash_attn_with_kvcache is not None
 
         self.num_heads = num_heads
         assert self.d_model % num_heads == 0, "d_model must be divisible by num_heads"
@@ -256,14 +259,20 @@ class CausalMHA(nn.Module):
             device=device,
         )
 
-    def _update_kv_cache(self, kv, inference_params):
+    def _update_kv_cache(self, kv, inference_params, cache_layer_idx=None):
         """kv: (batch_size, seqlen, 2, nheads, head_dim) or (batch_size, 1, 2, nheads, head_dim)"""
         assert (
             self.layer_idx is not None
         ), "Generation requires layer_idx in the constructor"
-        return _update_kv_cache(kv, inference_params, self.layer_idx)
+        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+        return _update_kv_cache(kv, inference_params, cache_layer_idx)
 
-    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params):
+    def _ensure_loop_cache(self, inference_params, cache_layer_idx):
+        if cache_layer_idx not in inference_params.key_value_memory_dict:
+            base = inference_params.key_value_memory_dict[self.layer_idx]
+            inference_params.key_value_memory_dict[cache_layer_idx] = torch.empty_like(base)
+
+    def _apply_rotary_update_kvcache_attention(self, q, kv, inference_params, cache_layer_idx=None):
         """
         Fast path that combine 3 steps: apply rotary to Q and K, update kv cache, and apply attention.
         q: (batch_size, seqlen_q, nheads, head_dim)
@@ -282,7 +291,9 @@ class CausalMHA(nn.Module):
         else:
             rotary_cos, rotary_sin = None, None
         batch = q.shape[0]
-        kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+        cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+        self._ensure_loop_cache(inference_params, cache_layer_idx)
+        kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
         cache_seqlens = (
             inference_params.lengths_per_sample[:batch]
             if inference_params.lengths_per_sample is not None
@@ -306,7 +317,7 @@ class CausalMHA(nn.Module):
         )
         return context
 
-    def _update_kvcache_attention(self, q, kv, inference_params):
+    def _update_kvcache_attention(self, q, kv, inference_params, cache_layer_idx=None):
         """Write kv to inference_params, then do attention"""
         if (
             inference_params.seqlen_offset == 0
@@ -314,11 +325,13 @@ class CausalMHA(nn.Module):
             or not self.use_flash_attn
         ):
             # TODO: this only uses seqlen_offset and not lengths_per_sample.
-            kv = self._update_kv_cache(kv, inference_params)
+            kv = self._update_kv_cache(kv, inference_params, cache_layer_idx=cache_layer_idx)
             return self.inner_cross_attn(q, kv)
         else:
             batch = q.shape[0]
-            kv_cache = inference_params.key_value_memory_dict[self.layer_idx][:batch]
+            cache_layer_idx = self.layer_idx if cache_layer_idx is None else cache_layer_idx
+            self._ensure_loop_cache(inference_params, cache_layer_idx)
+            kv_cache = inference_params.key_value_memory_dict[cache_layer_idx][:batch]
             cache_seqlens = (
                 inference_params.lengths_per_sample[:batch]
                 if inference_params.lengths_per_sample is not None
@@ -362,6 +375,11 @@ class CausalMHA(nn.Module):
         if inference_params is not None:
             assert cu_seqlens is None and max_seqlen is None
 
+        # Used only to document shared-cache recurrent execution; Flash
+        # Attention does not consume this control flag.
+        loop_idx = int(kwargs.pop("loop_idx", 0))
+        cache_layer_idx = self.layer_idx + loop_idx * 10000 if self.layer_idx is not None else None
+
         kwargs = {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen, **kwargs}
         seqlen_offset = (
             0
@@ -394,14 +412,18 @@ class CausalMHA(nn.Module):
                 context = self.inner_attn(qkv, **kwargs)
             else:
                 context = self._update_kvcache_attention(
-                    qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                    qkv[:, :, 0], qkv[:, :, 1:], inference_params, cache_layer_idx=cache_layer_idx
                 )
         else:
             context = self._apply_rotary_update_kvcache_attention(
-                qkv[:, :, 0], qkv[:, :, 1:], inference_params
+                qkv[:, :, 0], qkv[:, :, 1:], inference_params,
+                cache_layer_idx=cache_layer_idx,
             )
         out = self.out_proj(rearrange(context, "... h d -> ... (h d)"))
         return out
 
-    def step(self, x, inference_params):
-        return self.forward(x, inference_params=inference_params)
+    def step(self, x, inference_params, loop_idx=0):
+        # Recurrent inner-loop execution intentionally reuses the same cache
+        # slot and sequence offset. The later loop refines the current token's
+        # K/V in place instead of appending a duplicate position.
+        return self.forward(x, inference_params=inference_params, loop_idx=loop_idx)

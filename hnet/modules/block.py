@@ -125,6 +125,7 @@ class Block(nn.Module):
         residual: Optional[Tensor] = None,
         inference_params=None,
         mixer_kwargs=None,
+        token_mask: Optional[Tensor] = None,
     ):
         hidden_states, residual = self.norm1(
             hidden_states,
@@ -146,7 +147,7 @@ class Block(nn.Module):
                 prenorm=True,
                 residual_in_fp32=self.residual_in_fp32,
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(hidden_states, token_mask=token_mask)
 
         return hidden_states, residual
 

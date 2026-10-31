@@ -64,6 +64,24 @@ class ByteStream:
         self.rank = rank
         self.world = world
         self.stride = batch * seq
+        # ``torch.from_file`` exposes pageable host memory, so a nominal
+        # non_blocking=True transfer would still serialize the input pipeline.
+        # Keep a small ring of pinned staging buffers and only wait when a
+        # buffer is actually being reused.  The ring is tiny relative to the
+        # model and lets the next H2D copy overlap the previous step.
+        if torch.cuda.is_available():
+            self._staged = [
+                (
+                    torch.empty((batch, seq), dtype=torch.uint8, pin_memory=True),
+                    torch.empty((batch, seq), dtype=torch.uint8, pin_memory=True),
+                )
+                for _ in range(4)
+            ]
+            self._stage_events = [torch.cuda.Event() for _ in self._staged]
+            self._stage_used = [False] * len(self._staged)
+            self._stage_index = 0
+        else:
+            self._staged = None
         usable = (self.data.numel() - 1) // (self.stride * world) * self.stride * world
         if usable <= 0:
             raise ValueError("byte stream is shorter than one distributed batch")
@@ -76,7 +94,23 @@ class ByteStream:
         # overlap from the stream. This keeps every rank's sequence fixed for
         # CUDA graph replay.
         y = self.data[base + 1 : base + self.stride + 1].view(self.batch, self.seq)
-        return x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+        if self._staged is None or device.type != "cuda":
+            return x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+        slot = self._stage_index
+        self._stage_index = (slot + 1) % len(self._staged)
+        if self._stage_used[slot]:
+            # The event marks completion of the prior H2D reads from this
+            # pinned buffer, so overwriting it cannot race the DMA engine.
+            self._stage_events[slot].synchronize()
+        sx, sy = self._staged[slot]
+        sx.copy_(x)
+        sy.copy_(y)
+        stream = torch.cuda.current_stream(device)
+        out_x = sx.to(device=device, non_blocking=True)
+        out_y = sy.to(device=device, non_blocking=True)
+        self._stage_events[slot].record(stream)
+        self._stage_used[slot] = True
+        return out_x, out_y
 
 
 def load_config(path):
@@ -154,9 +188,16 @@ def ce(logits, target):
 def loss_for_output(out, target, args):
     losses = [ce(out.logits, target)]
     if out.feedback_logits:
-        losses = [ce(out.feedback_logits[0], target)]
-        if len(out.feedback_logits) > 1:
-            losses.append(args.fbt_lambda * torch.stack([ce(x, target) for x in out.feedback_logits[1:]]).mean())
+        # ``out.logits`` is the final feedback pass. Earlier passes are
+        # auxiliary supervision; treating feedback_logits[0] as the primary
+        # objective accidentally trained the stale first pass and left the
+        # final prediction weakly supervised.
+        earlier = out.feedback_logits[:-1]
+        if earlier:
+            losses.append(
+                args.fbt_lambda
+                * torch.stack([ce(x, target) for x in earlier]).mean()
+            )
     ratio = out.logits.new_zeros((), dtype=torch.float32)
     for router in out.bpred_output:
         ratio = ratio + load_balancing_loss(router, args.ratio_target).float()
@@ -187,7 +228,7 @@ def read_power_watts():
 
 
 class GraphStep:
-    def __init__(self, model, optimizer, x, y, args):
+    def __init__(self, model, optimizer, x, y, args, capture_stream=None):
         self.model, self.optimizer, self.args = model, optimizer, args
         # The eager MoE path overlaps the shared expert on a private stream.
         # CUDA graph capture cannot import autograd dependencies created on
@@ -199,7 +240,7 @@ class GraphStep:
         # A nonblocking capture stream avoids the legacy-stream implicit
         # dependency that PyTorch's AccumulateGrad creates after warmup. The
         # same stream is used for every warmup, capture, and replay.
-        self.capture_stream = torch.cuda.Stream(device=x.device)
+        self.capture_stream = capture_stream or torch.cuda.Stream(device=x.device)
         self.x = torch.zeros_like(x)
         self.y = torch.zeros_like(y)
         self.static_loss = torch.zeros((), device=x.device)
@@ -260,14 +301,32 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
+    graph_stream = (
+        torch.cuda.Stream(device=device) if args.cuda_graphs and device.type == "cuda" else None
+    )
     if world > 1:
-        model = DDP(model, device_ids=[device.index], broadcast_buffers=False, bucket_cap_mb=256, static_graph=True)
+        ddp_context = torch.cuda.stream(graph_stream) if graph_stream is not None else torch.cuda.stream(torch.cuda.current_stream(device))
+        with ddp_context:
+            model = DDP(
+                model,
+                device_ids=[device.index],
+                broadcast_buffers=False,
+                bucket_cap_mb=256,
+                # Graph dispatch executes every expert through the fixed
+                # capacity path, so static_graph is safe there. Eager routing
+                # is intentionally variable-size and may leave an expert
+                # unused on a batch; let DDP discover those parameters rather
+                # than asserting an invalid static graph.
+                static_graph=bool(args.cuda_graphs),
+                find_unused_parameters=not bool(args.cuda_graphs),
+                gradient_as_bucket_view=True,
+            )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
     stream = ByteStream(args.data, args.seq, args.batch, rank, world)
     graph_step = None
     if args.cuda_graphs and device.type == "cuda":
         x0, y0 = stream.get(0, device)
-        graph_step = GraphStep(model, optimizer, x0, y0, args)
+        graph_step = GraphStep(model, optimizer, x0, y0, args, capture_stream=graph_stream)
     log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
     step_start_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     step_end_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None

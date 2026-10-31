@@ -456,6 +456,25 @@ def _is_matrix_like_parameter(param: torch.Tensor, *, min_matrix_dim: int) -> bo
     return min(rows, cols) >= int(min_matrix_dim)
 
 
+def _muon_name_excluded(name: str, param: torch.Tensor) -> bool:
+    """Exclude matrices whose semantics are not compatible with Muon.
+
+    Muon's polar update is appropriate for dense projection matrices.  A
+    depthwise/convolutional kernel can look matrix-like after singleton
+    dimensions are removed, and the vocabulary/output head benefits from the
+    AdamATan2 fallback because its rows are directly supervised logits.  Keep
+    those tensors on the numerically stable fallback path even when their
+    effective shape passes the generic matrix test.
+    """
+
+    lowered = str(name).lower()
+    if any(token in lowered for token in ("lm_head", "output_head", "conv1d", "depthwise")):
+        return True
+    if param.ndim >= 3 and any(token in lowered for token in (".conv", "conv.")):
+        return True
+    return False
+
+
 class GramNewtonSchulz:
     """Batched Gram Newton-Schulz polar approximation used by AnchorMuon."""
 
@@ -580,7 +599,7 @@ class AnchorMuon(torch.optim.Optimizer):
         matrix_weight_decay: float = 0.0,
     ) -> None:
         if isinstance(params, torch.nn.Module):
-            params = params.parameters()
+            params = params.named_parameters()
         fallback_lr = lr if fallback_lr is None else fallback_lr
         if lr < 0.0 or fallback_lr < 0.0:
             raise ValueError("learning rates must be non-negative")
@@ -646,7 +665,10 @@ class AnchorMuon(torch.optim.Optimizer):
         This is the least error-prone public API for normal training code.
         """
 
-        return cls(model.parameters(), **kwargs)
+        # Preserve names so semantic exclusions (depthwise kernels and the
+        # output head) are routed to AdamATan2 instead of being flattened into
+        # the GramNS matrix path.
+        return cls(model.named_parameters(), **kwargs)
 
     @staticmethod
     def _prepare_param_groups(
@@ -1132,9 +1154,11 @@ def build_param_groups(
 ) -> list[dict[str, Any]]:
     """Split named parameters into matrix and fallback groups.
 
-    Routing uses effective tensor shape only. Singleton dimensions are ignored,
-    so ``[1, 1, width]`` is a vector and ``[1, tokens, width]`` is a matrix.
-    Parameter names are retained only for group summaries and diagnostics.
+    Routing uses effective tensor shape plus semantic exclusions. Singleton
+    dimensions are ignored, so ``[1, 1, width]`` is a vector and
+    ``[1, tokens, width]`` is a matrix; depthwise convolution kernels and the
+    output head remain on AdamATan2 even when their shape looks matrix-like.
+    Parameter names are retained for both routing and diagnostics.
 
     Tied parameters are deduplicated by object identity. The effective shape of
     the shared tensor decides the route regardless of aliases.
@@ -1165,8 +1189,11 @@ def build_param_groups(
             unique[key][1].append(name)
 
     for _key, (p, names) in unique.items():
-        use_matrix = _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim)
         display_name = "|".join(names)
+        use_matrix = (
+            not _muon_name_excluded(display_name, p)
+            and _is_matrix_like_parameter(p, min_matrix_dim=min_matrix_dim)
+        )
         if use_matrix:
             matrix_params.append(p)
             matrix_names.append(display_name)

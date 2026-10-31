@@ -75,6 +75,36 @@ python generate.py --model-path [MODEL_CKPT] --config-path [CONFIG]
 python generate.py --model-path hnet_2stage_XL.pt --config-path configs/hnet_2stage_XL.json --max-tokens 1024 --temperature 1.0 --top-p 1.0
 ```
 
+## Reproducing the byte-level check
+
+The Cartesia posts report large scaling ladders, so reproducing the exact
+curves requires their training data, distributed training runs, and evaluation
+suite. The released implementation and checkpoints do make the core result
+directly testable: an H-Net reads UTF-8 bytes, learns boundaries end to end, and
+produces byte logits. `scripts/reproduce_hnet.py` reports bits per byte,
+learned bytes per chunk, parameter count, and a deterministic completion.
+
+Download the authors' 1-stage Large checkpoint (2.7 GB), then run:
+
+```sh
+mkdir -p checkpoints
+curl -L -o checkpoints/hnet_1stage_L.pt \
+  https://huggingface.co/cartesia-ai/hnet_1stage_L/resolve/main/hnet_1stage_L.pt
+python scripts/reproduce_hnet.py \
+  --checkpoint checkpoints/hnet_1stage_L.pt \
+  --config configs/hnet_1stage_L.json \
+  --text "The capital of France is" --generate 16
+```
+
+On the Cartesia authors' checkpoint, the model has 679,405,312 parameters and
+greedy generation begins with `Paris.`. The exact bpb and chunk ratio depend on
+the supplied text. The blog's headline scaling results are the reported fitted
+multipliers: 1.28x H-Net vs. BPE on validation loss, 2.06x on OLMES, and 1.61x
+for validation-to-OLMES transfer. In the larger two-stage comparison, the
+reported H-Net is 3.67B parameters and 4.44 GFLOPs/byte versus SmolLM3's 3.08B
+and 4.36 GFLOPs/byte, reaching its final score after about 1T rather than 11T
+tokens.
+
 
 ## Citation
 

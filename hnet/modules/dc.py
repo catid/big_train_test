@@ -83,11 +83,12 @@ class RoutingModule(nn.Module):
             # We are in packed mode, so hidden_states is (T, D). Make it (B, T, D)
             hidden_states = hidden_states.unsqueeze(0)
 
-        cos_sim = torch.einsum(
-            "b l d, b l d -> b l",
-            F.normalize(self.q_proj_layer(hidden_states[:, :-1]), dim=-1),
-            F.normalize(self.k_proj_layer(hidden_states[:, 1:]), dim=-1),
-        )
+        # Router probabilities feed hard selection and the EMA dechunker. Do
+        # the normalization in FP32 so BF16 roundoff cannot create NaNs or
+        # probabilities outside [0, 1] in long runs.
+        q = F.normalize(self.q_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
+        cos_sim = torch.einsum("b l d, b l d -> b l", q, k)
         # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
 
@@ -97,7 +98,13 @@ class RoutingModule(nn.Module):
 
         if cu_seqlens is not None:
             boundary_prob = boundary_prob.squeeze(0)
-            boundary_prob[cu_seqlens[:-1]] = PAD_PROB
+            starts = torch.zeros_like(boundary_prob, dtype=torch.bool)
+            starts[cu_seqlens[:-1]] = True
+            boundary_prob = torch.where(
+                starts,
+                torch.full_like(boundary_prob, PAD_PROB),
+                boundary_prob,
+            )
 
         boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
 
@@ -140,11 +147,9 @@ class RoutingModule(nn.Module):
     def step(self, hidden_states, inference_params):
         # hidden_states is (B, 1, D)
         hidden_states = hidden_states.squeeze(1)
-        cos_sim = torch.einsum(
-            "b d, b d -> b",
-            F.normalize(self.q_proj_layer(inference_params.last_hidden_state), dim=-1),
-            F.normalize(self.k_proj_layer(hidden_states), dim=-1),
-        )
+        q = F.normalize(self.q_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(hidden_states).float(), dim=-1)
+        cos_sim = torch.einsum("b d, b d -> b", q, k)
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
         boundary_prob = torch.where(
@@ -166,6 +171,10 @@ class RoutingModule(nn.Module):
 
 class ChunkLayer(nn.Module):
 
+    def __init__(self, static_max_seqlen: int | None = None):
+        super().__init__()
+        self.static_max_seqlen = static_max_seqlen
+
     def forward(self, hidden_states, boundary_mask, cu_seqlens=None, mask=None):
         assert (mask is not None) or (
             cu_seqlens is not None
@@ -181,14 +190,37 @@ class ChunkLayer(nn.Module):
         else:
             next_cu_seqlens = None
             num_tokens = boundary_mask.sum(dim=-1)
-            next_max_seqlen = int(num_tokens.max())
-
+            # CUDA graph capture cannot depend on a host read of a
+            # data-dependent max. A configured static bound keeps all inner
+            # tensors at one address/shape; the mask carries the true count.
             device = hidden_states.device
             L = hidden_states.shape[1]
+            if self.static_max_seqlen is not None:
+                next_max_seqlen = int(self.static_max_seqlen)
+                if next_max_seqlen < L:
+                    raise ValueError(
+                        "static_max_seqlen must be >= the input sequence length "
+                        f"({next_max_seqlen} < {L})"
+                    )
+            else:
+                next_max_seqlen = int(num_tokens.max())
             token_idx = (
                 torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
             )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
+
+            # A static bound can exceed the current input length (for example,
+            # a short validation batch captured with the 4096-token production
+            # bound). Pad the gather indices so the inner network and its mask
+            # have the same fixed shape. Invalid rows are masked below and do
+            # not contribute to the dechunked output.
+            if next_max_seqlen > L:
+                pad = torch.zeros(
+                    (hidden_states.shape[0], next_max_seqlen - L),
+                    device=device,
+                    dtype=seq_sorted_indices.dtype,
+                )
+                seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
 
             next_hidden_states = torch.gather(
                 hidden_states,
@@ -198,10 +230,7 @@ class ChunkLayer(nn.Module):
                 ),
             )
 
-            next_mask = (
-                torch.arange(next_max_seqlen, device=device)[None, :]
-                < num_tokens[:, None]
-            )
+            next_mask = torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None]
             next_max_seqlen = None
 
         return next_hidden_states, next_cu_seqlens, next_max_seqlen, next_mask
@@ -218,9 +247,11 @@ class DeChunkLayer(nn.Module):
         dtype=torch.bfloat16,
         block_size=256,
         headdim=32,
+        static_max_seqlen: int | None = None,
     ):
         super().__init__()
         self.d_model = d_model
+        self.static_max_seqlen = static_max_seqlen
 
         # Just for Mamba2 kernel.
         self.dtype = dtype
@@ -258,6 +289,10 @@ class DeChunkLayer(nn.Module):
         if cu_seqlens is not None:
             p = p[boundary_mask].unsqueeze(0)
             seq_idx = get_seq_idx(cu_seqlens, device=hidden_states.device)
+            # ChunkLayer's packed path returns (M, D), while the fused scan
+            # contract is batched (B, M, D). Keep the document dimension for
+            # the scan and remove it only after the recurrent aggregation.
+            hidden_states = hidden_states.unsqueeze(0)
         else:
             B, L = boundary_mask.shape
             seq_idx = None
@@ -267,6 +302,18 @@ class DeChunkLayer(nn.Module):
                 + (~boundary_mask).long() * L
             )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
+
+            # ChunkLayer may pad the latent sequence to a configured static
+            # bound. Mirror that padding for the boundary probabilities so the
+            # Mamba scan receives tensors with matching sequence lengths.
+            latent_len = hidden_states.shape[1]
+            if latent_len > L:
+                pad = torch.zeros(
+                    (B, latent_len - L),
+                    device=hidden_states.device,
+                    dtype=seq_sorted_indices.dtype,
+                )
+                seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
 
             p = torch.gather(
                 p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]

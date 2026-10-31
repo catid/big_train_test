@@ -19,6 +19,13 @@ from torch import Tensor, nn
 import torch.nn.functional as F
 
 
+# DelayedScaling recipes are immutable configuration objects. Reusing one
+# object across MoE calls avoids repeated recipe construction/metadata setup
+# and keeps Transformer Engine's FP8 state keyed consistently across grouped
+# and shared experts.
+_FP8_RECIPE = None
+
+
 def _round_multiple(value: int, multiple: int = 128) -> int:
     return max(multiple, (int(value) + multiple - 1) // multiple * multiple)
 
@@ -235,9 +242,30 @@ class LatentMoE(nn.Module):
         # routing and the selected experts.
         self.disable_async_shared = False
 
+    def _ensure_graph_grouped_splits(self, capacity: int) -> Tensor:
+        """Materialize fixed grouped-GEMM metadata before CUDA capture.
+
+        Transformer Engine's grouped-linear implementation consumes the split
+        metadata on the host in the patched integration.  Allocating it while
+        a CUDA graph is being captured is unsafe even though the tensor itself
+        is CPU-resident, so eager warmup must populate this cache first.
+        """
+        splits = self._graph_grouped_splits.get(int(capacity))
+        if splits is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "grouped FP8 graph metadata was not prewarmed for this capacity"
+                )
+            splits = torch.full(
+                (self.num_experts,), int(capacity), dtype=torch.int64
+            )
+            self._graph_grouped_splits[int(capacity)] = splits
+        return splits
+
     def _fp8_context(self):
         if not self.fp8:
             return nullcontext()
+        global _FP8_RECIPE
         import transformer_engine.pytorch as te
         # ``common`` is a separate package in current Transformer Engine
         # releases (including the patched TE used by ``~/fp8``); older
@@ -248,10 +276,11 @@ class LatentMoE(nn.Module):
         # Delayed scaling gives the MoE GEMMs amax history and keeps all gate
         # reductions outside FP8.  The caller may nest a project-wide TE context;
         # TE permits the nested context and reuses its metadata tensors.
-        recipe = DelayedScaling(fp8_dpa=False, amax_history_len=16)
-        return te.fp8_autocast(enabled=True, fp8_recipe=recipe)
+        if _FP8_RECIPE is None:
+            _FP8_RECIPE = DelayedScaling(fp8_dpa=False, amax_history_len=16)
+        return te.fp8_autocast(enabled=True, fp8_recipe=_FP8_RECIPE)
 
-    def _route(self, x: Tensor):
+    def _route(self, x: Tensor, token_mask: Tensor | None = None):
         # Router reductions are intentionally FP32 for stable top-k decisions.
         # The production model stores parameters in BF16, so calling the
         # module directly with ``x.float()`` would trigger a dtype mismatch.
@@ -265,10 +294,17 @@ class LatentMoE(nn.Module):
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
         slots = torch.zeros_like(probs)
         slots.scatter_(1, indices, 1.0)
-        fraction = slots.mean(dim=0)
-        mean_prob = probs.mean(dim=0)
+        if token_mask is None:
+            valid = torch.ones((x.shape[0],), device=x.device, dtype=probs.dtype)
+        else:
+            valid = token_mask.to(dtype=probs.dtype)
+        valid_count = valid.sum().clamp_min(1.0)
+        fraction = (slots * valid[:, None]).sum(dim=0) / valid_count
+        mean_prob = (probs * valid[:, None]).sum(dim=0) / valid_count
         aux = self.aux_loss_coef * self.num_experts * (fraction * mean_prob).sum()
-        z = self.z_loss_coef * torch.logsumexp(logits, dim=-1).square().mean()
+        z = self.z_loss_coef * (
+            torch.logsumexp(logits, dim=-1).square() * valid
+        ).sum() / valid_count
         return indices, weights, aux, z
 
     def _dispatch(
@@ -324,6 +360,12 @@ class LatentMoE(nn.Module):
             ) + ranks
             packed = latent.new_zeros((total, latent.shape[-1]))
             packed.index_copy_(0, destinations, latent.index_select(0, sorted_tokens))
+            # Populate the graph-capacity metadata during eager warmup.  The
+            # exact variable-size metadata remains used for this eager call.
+            if self.grouped_experts is not None:
+                align = 8 if self.fp8 else 1
+                graph_capacity = ((latent.shape[0] + align - 1) // align) * align
+                self._ensure_graph_grouped_splits(graph_capacity)
             m_splits = torch.tensor(rounded, dtype=torch.int64)
             context = self._fp8_context() if fp8_context else nullcontext()
             with context:
@@ -364,12 +406,7 @@ class LatentMoE(nn.Module):
             if self.grouped_experts is not None:
                 # A CPU split tensor is safe for TE's internal ``tolist``
                 # conversion during capture and remains constant on replay.
-                m_splits = self._graph_grouped_splits.get(capacity)
-                if m_splits is None:
-                    m_splits = torch.full(
-                        (self.num_experts,), capacity, dtype=torch.int64
-                    )
-                    self._graph_grouped_splits[capacity] = m_splits
+                m_splits = self._ensure_graph_grouped_splits(capacity)
                 packed_out = self.grouped_experts(packed, m_splits)
             else:
                 packed_out = torch.empty_like(packed)
@@ -387,11 +424,18 @@ class LatentMoE(nn.Module):
         with context:
             return self.shared_expert(x)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, token_mask: Tensor | None = None) -> Tensor:
         shape = x.shape
         if shape[-1] != self.d_model:
             raise ValueError(f"LatentMoE expected width {self.d_model}, got {shape[-1]}")
         flat = x.reshape(-1, self.d_model)
+        flat_mask = None if token_mask is None else token_mask.reshape(-1).bool()
+        # Keep static graph shapes unchanged, but make padded latent rows
+        # inert so they cannot bias router regularizers or contribute to the
+        # residual output. The GEMMs still receive fixed-size buffers during
+        # capture; only their values are masked.
+        if flat_mask is not None:
+            flat = flat.masked_fill(~flat_mask[:, None], 0)
         shared = None
         event = None
         # Shared expert is independent of routing. Launch it on a separate CUDA
@@ -406,13 +450,19 @@ class LatentMoE(nn.Module):
                 self._shared_stream = torch.cuda.Stream(device=flat.device)
             stream = self._shared_stream
             event = torch.cuda.Event()
+            # ``flat`` was produced on the caller's stream.  Establish the
+            # producer->consumer edge before launching the independent shared
+            # expert; waiting only after the main MoE branch is too late.
+            current_stream = torch.cuda.current_stream(flat.device)
+            stream.wait_stream(current_stream)
+            flat.record_stream(stream)
             with torch.cuda.stream(stream):
                 shared = self._shared_forward(flat)
                 event.record(stream)
         else:
             shared = None
 
-        indices, weights, aux, z = self._route(flat)
+        indices, weights, aux, z = self._route(flat, flat_mask)
         # Keep all main-stream MoE projections under one delayed-scaling
         # context. Re-entering it for down/dispatch/up forces repeated amax
         # reductions and metadata setup on every layer.
@@ -424,8 +474,15 @@ class LatentMoE(nn.Module):
             routed = self._dispatch(latent, indices, weights, fp8_context=False)
             output = self.up(routed.to(dtype=flat.dtype))
         if event is not None:
-            torch.cuda.current_stream(flat.device).wait_event(event)
+            current_stream = torch.cuda.current_stream(flat.device)
+            current_stream.wait_event(event)
+            # The output was allocated on the private stream and is consumed
+            # on the caller's stream after the event.  Record that lifetime
+            # edge so the caching allocator cannot recycle it early.
+            shared.record_stream(current_stream)
         output = output.float() + shared.float()
+        if flat_mask is not None:
+            output = output.masked_fill(~flat_mask[:, None], 0)
         self.last_aux_loss = aux
         self.last_z_loss = z
         return output.to(dtype=x.dtype).reshape(shape)

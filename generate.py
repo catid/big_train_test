@@ -3,8 +3,6 @@ import json
 import torch
 import argparse
 import sys
-from omegaconf import ListConfig
-
 from hnet.models.mixer_seq import HNetForCausalLM
 from hnet.models.config_hnet import (
     AttnConfig,
@@ -38,13 +36,9 @@ def load_from_pretrained(model_path: str, model_config_path: str):
     model = HNetForCausalLM(hnet_cfg, device=device, dtype=torch.bfloat16)
     model.eval()
 
-    # Load checkpoint
-    major, minor = map(int, torch.__version__.split('.')[:2])
-    if (major, minor) >= (2, 6):
-        with torch.serialization.safe_globals([ListConfig]):
-            state_dict = torch.load(model_path, map_location=device, weights_only=False)
-    else:
-        state_dict = torch.load(model_path, map_location=device)
+    # Load only tensor data from the checkpoint.  The restricted loader avoids
+    # executing arbitrary pickle payloads from downloaded model files.
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
     model.load_state_dict(state_dict)
 
     return model

@@ -49,6 +49,8 @@ class HNet(nn.Module):
         dtype=None,
     ) -> None:
         super().__init__()
+
+        self.config = config
         factory_kwargs = {"device": device, "dtype": dtype}
 
         self.stage_idx = stage_idx
@@ -96,8 +98,13 @@ class HNet(nn.Module):
 
         if not self.is_innermost:
             self.routing_module = RoutingModule(self.d_model, **factory_kwargs)
-            self.chunk_layer = ChunkLayer()
-            self.dechunk_layer = DeChunkLayer(self.d_model)
+            self.chunk_layer = ChunkLayer(
+                static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None)
+            )
+            self.dechunk_layer = DeChunkLayer(
+                self.d_model,
+                static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None),
+            )
 
             # do the residual in fp32
             self.residual_proj = nn.Linear(
@@ -107,6 +114,22 @@ class HNet(nn.Module):
             self.residual_proj.weight._no_reinit = True
 
             self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
+            # Full-bandwidth feedback is attached only at the outer boundary
+            # before the deepest main network. It never changes router masks,
+            # chunk counts, or the encoder/decoder residual path.
+            self.fbt_enabled = bool(getattr(config, "fbt", False) and stage_idx == 0)
+            if self.fbt_enabled:
+                # The recursive H-Net trims its output back to the caller's
+                # width after the padded inner stage, so feedback remains at
+                # the outer stream width.
+                self.fbt_up = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+                self.fbt_gate = nn.Linear(self.d_model, self.d_model, bias=False, **factory_kwargs)
+                nn.init.zeros_(self.fbt_up.weight)
+                nn.init.zeros_(self.fbt_gate.weight)
+                self.fbt_up.weight._no_reinit = True
+                self.fbt_gate.weight._no_reinit = True
+        else:
+            self.fbt_enabled = False
 
         if stage_idx > 0 and self.d_model - config.d_model[stage_idx - 1] > 0:
             self.pad_dimension = nn.Parameter(
@@ -119,30 +142,51 @@ class HNet(nn.Module):
     
 
     def _init_weights(self, initializer_range: float = 0.02, parent_residuals: int = 0) -> None:
+        def init_linear_modules(root: nn.Module, residuals: int) -> None:
+            # Transformer Engine's Linear/GroupedLinear classes are not
+            # subclasses of torch.nn.Linear, so the old isinstance-only pass
+            # silently left every FP8 MoE projection at TE's default scale.
+            # Initialize those modules with the same residual-depth rule while
+            # leaving Mamba state/conv parameters under their kernel defaults.
+            for name, module in root.named_modules():
+                module_name = module.__class__.__module__
+                is_te_linear = (
+                    module_name.startswith("transformer_engine")
+                    and "Linear" in module.__class__.__name__
+                )
+                if not (isinstance(module, nn.Linear) or is_te_linear):
+                    continue
+                if "out_proj" in name or "fc2" in name:
+                    std = initializer_range / (residuals ** 0.5)
+                else:
+                    std = initializer_range
+                if isinstance(module, nn.Linear):
+                    weights = (module.weight,)
+                else:
+                    # TE GroupedLinear stores discrete expert matrices as
+                    # weight0, weight1, ... rather than exposing one
+                    # ``weight`` attribute.  Initialize every registered
+                    # expert parameter through the regular PyTorch API so TE
+                    # metadata stays attached to the same Parameter objects.
+                    weights = tuple(
+                        parameter
+                        for parameter_name, parameter in module.named_parameters(recurse=False)
+                        if "weight" in parameter_name
+                    )
+                with torch.no_grad():
+                    for weight in weights:
+                        if not getattr(weight, "_no_reinit", False):
+                            nn.init.normal_(weight, mean=0.0, std=std)
+
         n_residuals = parent_residuals
         if self.is_innermost:
             n_residuals += self.main_network.height
-            for name, m in self.main_network.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+            init_linear_modules(self.main_network, n_residuals)
 
         else:
             n_residuals += self.encoder.height + self.decoder.height
-            for name, m in self.encoder.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
-            for name, m in self.decoder.named_modules():
-                if isinstance(m, nn.Linear) and not getattr(m.weight, "_no_reinit", False):
-                    if "out_proj" in name or "fc2" in name:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range / (n_residuals ** 0.5))
-                    else:
-                        nn.init.normal_(m.weight, mean=0.0, std=initializer_range)
+            init_linear_modules(self.encoder, n_residuals)
+            init_linear_modules(self.decoder, n_residuals)
                     
             self.main_network._init_weights(initializer_range, n_residuals)
     
@@ -208,11 +252,15 @@ class HNet(nn.Module):
         max_seqlen=None,
         mask=None,
         inference_params=None,
+        fbt_passes=1,
+        return_feedback=False,
         **mixer_kwargs,
     ):
         assert mask is not None or (
             cu_seqlens is not None and max_seqlen is not None
         ), "Either mask or cu_seqlens and max_seqlen must be provided"
+        if fbt_passes > 1 and inference_params is not None:
+            raise ValueError("FBT multi-pass training requires fresh caches; do not combine it with inference_params")
 
         if inference_params is None:
             inference_params = HNetState(main_network_state=None)
@@ -265,39 +313,111 @@ class HNet(nn.Module):
             hidden_states, bpred_output.boundary_mask, cu_seqlens, mask=mask
         )
 
-        hidden_states, prev_boundary_predictions = self.main_network(
-            hidden_states,
-            cu_seqlens=next_cu_seqlens,
-            max_seqlen=next_max_seqlen,
-            mask=next_mask,
-            inference_params=inference_params.main_network_state,
-            **mixer_kwargs,
+        n_passes = max(1, int(fbt_passes)) if self.fbt_enabled else 1
+        # A normal one-pass prefill must populate the allocated recurrent/KV
+        # caches for autoregressive ``step``.  FBT uses fresh inner passes and
+        # is explicitly disallowed with inference caches above.
+        cached_main_state = (
+            inference_params.main_network_state if n_passes == 1 else None
         )
-
-        hidden_states = self.dechunk_layer(
-            hidden_states,
-            bpred_output.boundary_mask,
-            bpred_output.boundary_prob,
-            next_cu_seqlens,
-            mask=mask,
-            inference_params=inference_params.dechunk_state,
+        cached_dechunk_state = (
+            inference_params.dechunk_state if n_passes == 1 else None
         )
-
-        hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, bpred_output.selected_probs
-        ).to(hidden_states.dtype)
-
-        hidden_states = self.decoder(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-            mask=mask,
-            inference_params=inference_params.decoder_state,
-            **mixer_kwargs,
+        cached_decoder_state = (
+            inference_params.decoder_state if n_passes == 1 else None
         )
+        feedback_logits = []
+        base_chunk_states = hidden_states
+        previous_inner = None
+        final_prev_boundary_predictions = []
+        for pass_idx in range(n_passes):
+            pass_input = base_chunk_states
+            if pass_idx > 0:
+                # Shift within each packed document; no cross-document latent
+                # state is allowed to enter a new byte stream.
+                shifted = torch.zeros_like(previous_inner)
+                if next_cu_seqlens is None:
+                    shifted[:, 1:] = previous_inner[:, :-1]
+                else:
+                    starts = next_cu_seqlens[:-1]
+                    ends = next_cu_seqlens[1:]
+                    for start, end in zip(starts.tolist(), ends.tolist()):
+                        if end > start + 1:
+                            shifted[start + 1 : end] = previous_inner[start : end - 1]
+                if self.training and getattr(self.config, "fbt_jitter", 0.0) > 0:
+                    shifted = shifted + torch.empty_like(shifted).uniform_(
+                        -float(self.config.fbt_jitter), float(self.config.fbt_jitter)
+                    )
+                # The projection is kept outside any FP8 region and the gate
+                # is evaluated in FP32 for stable sigmoid gradients.
+                gate = torch.sigmoid(self.fbt_gate(pass_input).float()).to(pass_input.dtype)
+                pass_input = pass_input + self.fbt_up(shifted).to(pass_input.dtype) * gate
+                if getattr(self.config, "fbt_prefix_mixin", False):
+                    # Keep a plain prefix so training matches prompt-prefill
+                    # followed by feedback-conditioned generation.
+                    plain = torch.zeros(pass_input.shape[:-1], dtype=torch.bool, device=pass_input.device)
+                    if next_cu_seqlens is None:
+                        # ChunkLayer packs valid latent tokens at the front and
+                        # pads the remainder when static chunking is enabled.
+                        # Derive the prefix from the per-row valid count so a
+                        # short latent sequence does not make the whole valid
+                        # region plain (which would turn FBT into a no-op).
+                        # All operations stay on device and are graph-safe.
+                        if next_mask is not None:
+                            valid = next_mask.sum(dim=-1)
+                            prefix = (valid + 1) // 2
+                            positions = torch.arange(
+                                pass_input.shape[1], device=pass_input.device
+                            )[None, :]
+                            plain = (positions < prefix[:, None]) & next_mask
+                        else:
+                            # A fixed midpoint is used only when no valid-count
+                            # mask is available (legacy eager packed input).
+                            plain[:, : pass_input.shape[1] // 2] = True
+                    else:
+                        for start, end in zip(next_cu_seqlens[:-1].tolist(), next_cu_seqlens[1:].tolist()):
+                            prefix = int(torch.randint(0, end - start + 1, ()).item())
+                            plain[start : start + prefix] = True
+                    pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
+            inner_out, prev_boundary_predictions = self.main_network(
+                pass_input,
+                cu_seqlens=next_cu_seqlens,
+                max_seqlen=next_max_seqlen,
+                mask=next_mask,
+                inference_params=cached_main_state,
+                **mixer_kwargs,
+            )
+            previous_inner = inner_out
+            final_prev_boundary_predictions = prev_boundary_predictions
+
+            decoded = self.dechunk_layer(
+                inner_out,
+                bpred_output.boundary_mask,
+                bpred_output.boundary_prob,
+                next_cu_seqlens,
+                mask=mask,
+                inference_params=cached_dechunk_state,
+            )
+            decoded = self.residual_func(
+                decoded.to(dtype=residual.dtype), residual, bpred_output.selected_probs
+            ).to(decoded.dtype)
+            decoded = self.decoder(
+                decoded,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+                mask=mask,
+                inference_params=cached_decoder_state,
+                **mixer_kwargs,
+            )
+            if return_feedback:
+                feedback_logits.append(decoded)
+        hidden_states = decoded
 
         hidden_states = hidden_states[..., :D]
-        return hidden_states, [bpred_output, *prev_boundary_predictions]
+        result = [bpred_output, *final_prev_boundary_predictions]
+        if return_feedback:
+            return hidden_states, result, feedback_logits
+        return hidden_states, result
 
     def step(self, hidden_states, inference_params):
         D = hidden_states.shape[-1]
