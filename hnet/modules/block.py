@@ -72,8 +72,10 @@ class Mamba3Wrapper(Mamba3):
         out, next_angle, next_state, next_key, next_value = super().step(
             u, angle, state, key, value
         )
+        # Cute updates the recurrent SSM tensor in place, while rotary/K/V
+        # outputs are separate tensors. Keep the stable H-Net cache storage
+        # for those three streams and avoid a redundant fourth device copy.
         angle.copy_(next_angle)
-        state.copy_(next_state)
         key.copy_(next_key)
         value.copy_(next_value)
         return out.unsqueeze(1)

@@ -465,14 +465,21 @@ def _hash_installed_distribution(distribution) -> dict:
             f"installed distribution {distribution.metadata.get('Name')!r} "
             "does not expose a file manifest; cannot record source provenance"
         )
-    install_root = Path(distribution.locate_file("")).resolve()
+    # A wheel may legitimately install a small launcher outside site-packages
+    # (apache-tvm-ffi records ``../../../bin/tvm-ffi-config``).  Keep the
+    # traversal check, but scope it to the active virtualenv/prefix rather than
+    # rejecting that reviewed launcher or allowing an arbitrary filesystem
+    # escape.
+    install_prefix = Path(sys.prefix).resolve()
     records = []
     for package_path in files:
         relative = str(package_path).replace("\\", "/")
         pure = PurePosixPath(relative)
-        # A RECORD entry with traversal or an absolute path is malformed.  Do
-        # not resolve it outside the installed distribution root implicitly.
-        if pure.is_absolute() or ".." in pure.parts:
+        # Absolute RECORD entries are malformed.  Traversal is accepted only
+        # when the resolved file remains inside this interpreter's prefix;
+        # this covers the TVM FFI launcher while failing closed on arbitrary
+        # paths outside the reviewed environment.
+        if pure.is_absolute():
             raise RuntimeError(
                 f"invalid installed-file path for {distribution.metadata.get('Name')!r}: "
                 f"{relative!r}"
@@ -487,10 +494,10 @@ def _hash_installed_distribution(distribution) -> dict:
             )
         resolved_path = path.resolve()
         try:
-            resolved_path.relative_to(install_root)
+            resolved_path.relative_to(install_prefix)
         except ValueError as exc:
             raise RuntimeError(
-                f"installed manifest entry escapes its package root for "
+                f"installed manifest entry escapes its environment prefix for "
                 f"{distribution.metadata.get('Name')!r}: {relative}"
             ) from exc
         try:
