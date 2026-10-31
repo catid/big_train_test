@@ -1021,9 +1021,19 @@ class AnchorMuon(torch.optim.Optimizer):
             [record[3] for record in records],
             alpha=-lr,
         )
+        # The model keeps BF16 parameters with FP32 master state.  A scalar
+        # ``p.copy_(master.to(...))`` launch for every matrix dominated the
+        # optimizer tail once the GramNS banks were batched.  Foreach copy
+        # preserves the exact per-tensor cast while issuing one launch group
+        # for the whole same-shape chunk.
+        copy_params = []
+        copy_masters = []
         for p, master, _anchor, _update, _no_weight_decay in records:
             if master is not p:
-                p.copy_(master.to(dtype=p.dtype))
+                copy_params.append(p)
+                copy_masters.append(master)
+        if copy_params:
+            torch._foreach_copy_(copy_params, copy_masters)
         return len(records)
 
     def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
