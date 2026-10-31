@@ -424,15 +424,20 @@ class DeChunkLayer(nn.Module):
         if cu_seqlens is not None:
             out = out.squeeze(0)
             plug_back_idx = boundary_mask.cumsum(dim=0) - 1
-            out = torch.gather(
-                out, dim=0, index=plug_back_idx.unsqueeze(-1).expand(-1, self.d_model)
-            )
+            # A row lookup has a specialized dense backward in embedding,
+            # avoiding the wide generic gather scatter-add kernel.
+            out = F.embedding(plug_back_idx, out)
         else:
             plug_back_idx = torch.cumsum(boundary_mask, dim=1) - 1  # (B, L)
-            out = torch.gather(
-                out,
-                dim=1,
-                index=plug_back_idx.unsqueeze(-1).expand(-1, -1, self.d_model),
+            B, L = plug_back_idx.shape
+            latent_len = out.shape[1]
+            row_offsets = (
+                torch.arange(B, device=out.device, dtype=plug_back_idx.dtype)
+                * latent_len
+            )
+            flat_idx = (plug_back_idx + row_offsets[:, None]).reshape(-1)
+            out = F.embedding(flat_idx, out.reshape(B * latent_len, self.d_model)).view(
+                B, L, self.d_model
             )
 
         if inference_params is not None:
