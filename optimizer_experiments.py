@@ -1038,7 +1038,10 @@ class AnchorMuon(torch.optim.Optimizer):
 
     def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
         beta_m = float(group["momentum"])
-        entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # Gather matrix records first.  The momentum/source preprocessing below
+        # batches equal-shaped parameters, avoiding one FP32 cast and one
+        # momentum launch per matrix while preserving each matrix's state.
+        raw: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         # Matrix groups also contain skinny controls (norms, biases, router
         # scales) that use AdamATan2.  Keep them out of the matrix bucket
         # collection while gathering them so they can take the same batched
@@ -1062,10 +1065,9 @@ class AnchorMuon(torch.optim.Optimizer):
                 fallback_params.append(p)
                 continue
             anchor = self._soda_anchor(p)
-            source, grad_matrix = self._pre_matrix_source(p, grad, beta_m)
-            entries.append((p, anchor, source, grad_matrix))
+            raw.append((p, anchor, grad))
 
-        if not entries:
+        if not raw:
             fallback_stats = self._step_fallback_params(
                 fallback_params,
                 group,
@@ -1078,9 +1080,15 @@ class AnchorMuon(torch.optim.Optimizer):
                 "soda_weight": float(fallback_stats["soda_weight"]),
             }
 
-        buckets: dict[tuple[torch.device, torch.Size], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = defaultdict(list)
-        for entry in entries:
-            buckets[(entry[2].device, entry[2].shape)].append(entry)
+        # Include original shape as well as effective matrix shape. Singleton
+        # dimensions are removed for GramNS, but must match while stacking.
+        buckets: dict[
+            tuple[torch.device, torch.Size, torch.Size],
+            list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+        ] = defaultdict(list)
+        for record in raw:
+            grad = record[2]
+            buckets[(grad.device, _matrix_view(grad).shape, grad.shape)].append(record)
 
         soda_weight = self._soda_weight(t)
         matrix_count = 0
@@ -1090,12 +1098,42 @@ class AnchorMuon(torch.optim.Optimizer):
             # banks at a time so optimizer work cannot consume the last few
             # GiB after a large CUDA-graph private pool has been captured.
             for start in range(0, len(bucket_entries), MATRIX_BUCKET_CHUNK_SIZE):
-                chunk_entries = bucket_entries[
+                chunk = bucket_entries[
                     start : start + MATRIX_BUCKET_CHUNK_SIZE
                 ]
-                updates = self._transform_matrix_bucket(chunk_entries, group)
+                # Casting the stacked BF16 gradients once is equivalent to
+                # casting each gradient before the elementwise FP32 recurrence.
+                grads_full = torch.stack([record[2].detach() for record in chunk], dim=0)
+                grads = grads_full.to(torch.float32)
+                momentums: list[torch.Tensor] = []
+                for p, _anchor, grad in chunk:
+                    state = self.state[p]
+                    momentum = state.get("momentum_buffer")
+                    if not isinstance(momentum, torch.Tensor) or momentum.shape != grad.shape:
+                        momentum = state["momentum_buffer"] = torch.zeros_like(
+                            grad, dtype=torch.float32
+                        )
+                    elif momentum.device != grad.device or momentum.dtype != torch.float32:
+                        momentum = state["momentum_buffer"] = momentum.to(
+                            device=grad.device, dtype=torch.float32
+                        )
+                    momentums.append(momentum)
+                momentum_stack = torch.stack(momentums, dim=0)
+                momentum_stack.lerp_(grads, 1.0 - beta_m)
+                source_stack = torch.lerp(grads, momentum_stack, beta_m)
+                torch._foreach_copy_(momentums, list(momentum_stack.unbind(0)))
+                entries = [
+                    (
+                        record[0],
+                        record[1],
+                        _matrix_view(source_stack[index]),
+                        _matrix_view(grads[index]),
+                    )
+                    for index, record in enumerate(chunk)
+                ]
+                updates = self._transform_matrix_bucket(entries, group)
                 matrix_count += self._apply_matrix_residual_updates(
-                    chunk_entries,
+                    entries,
                     updates,
                     lr=lr,
                     soda_weight=soda_weight,
