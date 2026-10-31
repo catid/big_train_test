@@ -710,7 +710,12 @@ class Isotropic(nn.Module):
                         # A single mean scale would force all layers to share one
                         # scalar gradient and waste the per-layer parameters.
                         layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
-                        msar_state = layer_input + layer_scale * (raw_state - layer_input)
+                        # Lerp fuses the subtract/multiply/add gate into one
+                        # elementwise kernel while preserving the same
+                        # FP32 residual interpolation.
+                        msar_state = torch.lerp(
+                            layer_input.float(), raw_state, layer_scale.float()
+                        )
                         if packed and msar_state.dim() == 3:
                             msar_state = msar_state.squeeze(0)
                         if (layer_idx + 1) % self.msar_block_size == 0:
