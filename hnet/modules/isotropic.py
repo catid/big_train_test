@@ -886,7 +886,16 @@ class Isotropic(nn.Module):
                     # pre-cast retrieval here makes cached generation follow
                     # a subtly different recurrence from prefill/training.
                     block_input_state = block_input[:, 0]
-                    state = block_input_state + scale * (raw_state - block_input_state)
+                    # Forward/prefill performs the gated MSAR interpolation
+                    # in FP32 before the next block casts its input back to
+                    # parameter dtype. Keep decode on that same recurrence;
+                    # doing the lerp directly in BF16 here makes cached
+                    # generation diverge from the trained/prefilled state.
+                    state = torch.lerp(
+                        block_input_state.float(),
+                        raw_state.float(),
+                        scale.float(),
+                    )
                     layer_outputs.append(state)
                     if (layer_idx + 1) % self.msar_block_size == 0:
                         boundary_currents.append(state)
