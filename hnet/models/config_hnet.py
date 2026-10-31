@@ -69,6 +69,10 @@ class HNetConfig:
     # activation bank in the 600M model; this bounds memory without changing
     # its forward function.
     msar_activation_checkpointing: bool = True
+    # Request checkpointing for compatible mixers. Mamba-3's native fused
+    # autograd path explicitly opts out because checkpoint wrapping violates
+    # its saved-tensor contract; the flag remains part of the canonical
+    # architecture signature so a different kernel cannot be selected silently.
     mamba_activation_checkpointing: bool = True
     # Required DeepSeek/Mixtral-style sparse FFN. Eight routed experts with
     # top-1 dispatch give the requested 1:8 active expert sparsity. The shared

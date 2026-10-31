@@ -117,7 +117,7 @@ def create_block(
     if arch in ("S", "T", "M"):
         if moe_cfg is None or not bool(getattr(moe_cfg, "moe_enabled", False)):
             raise ValueError(
-                "uppercase H-Net layers require the configured sparse MoE/shared expert"
+                "uppercase H-Net layers require the configured LatentMoE/shared expert"
             )
         mlp_cls = partial(
             LatentMoE,
