@@ -111,6 +111,39 @@ class _ExpertMLP(nn.Module):
         return output[:rows] if pad_rows else output
 
 
+class _GroupedExpertMLP(nn.Module):
+    """SwiGLU experts backed by two Transformer Engine grouped GEMMs.
+
+    The split metadata is deliberately supplied as a CPU tensor.  The pinned
+    TE implementation converts splits to a Python tuple internally; keeping
+    that tensor on the host makes the conversion capture-safe while retaining
+    the static device input/output buffers used by CUDA graphs.
+    """
+
+    def __init__(self, num_experts: int, d_in: int, d_hidden: int, *, device, dtype):
+        super().__init__()
+        try:
+            import transformer_engine.pytorch as te
+        except ImportError as exc:  # explicit production dependency
+            raise ImportError("grouped FP8 experts require Transformer Engine") from exc
+        self.fc1 = te.GroupedLinear(
+            num_experts, d_in, 2 * d_hidden, bias=False,
+            device=device, params_dtype=dtype,
+        )
+        self.fc2 = te.GroupedLinear(
+            num_experts, d_hidden, d_in, bias=False,
+            device=device, params_dtype=dtype,
+        )
+
+    def forward(self, x: Tensor, m_splits: Tensor) -> Tensor:
+        a, gate = self.fc1(x, m_splits).chunk(2, dim=-1)
+        activated = F.silu(gate) * a
+        activated = activated - activated.float().mean(dim=-1, keepdim=True).to(
+            dtype=activated.dtype
+        )
+        return self.fc2(activated, m_splits)
+
+
 class LatentMoE(nn.Module):
     """Eight-expert LatentMoE replacement for a normal SwiGLU FFN.
 
@@ -173,12 +206,21 @@ class LatentMoE(nn.Module):
         self.router = nn.Linear(d_model, num_experts, bias=False, **factory)
         self.down = nn.Linear(d_model, self.latent_dim, bias=bias, **factory)
         self.up = nn.Linear(self.latent_dim, d_model, bias=bias, **factory)
-        self.grouped_experts = None
-        self.experts = nn.ModuleList(
-            _ExpertMLP(self.latent_dim, self.routed_intermediate, bias=bias,
-                       device=device, dtype=dtype, fp8=fp8)
-            for _ in range(num_experts)
-        )
+        if fp8:
+            if bias:
+                raise ValueError("grouped FP8 LatentMoE experts require bias=False")
+            self.grouped_experts = _GroupedExpertMLP(
+                num_experts, self.latent_dim, self.routed_intermediate,
+                device=device, dtype=dtype,
+            )
+            self.experts = None
+        else:
+            self.grouped_experts = None
+            self.experts = nn.ModuleList(
+                _ExpertMLP(self.latent_dim, self.routed_intermediate, bias=bias,
+                           device=device, dtype=dtype, fp8=False)
+                for _ in range(num_experts)
+            )
         self.shared_expert = _ExpertMLP(
             d_model, self.shared_intermediate, bias=bias,
             device=device, dtype=dtype, fp8=fp8,
@@ -186,6 +228,7 @@ class LatentMoE(nn.Module):
         self.register_buffer("last_aux_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_z_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self._shared_stream: Optional[torch.cuda.Stream] = None
+        self._graph_grouped_splits: dict[int, Tensor] = {}
         # CUDA graph training sets this on all MoE modules before warmup so
         # autograd never retains dependencies on an uncaptured side stream.
         # Eager training leaves it false to overlap the shared expert with
@@ -228,7 +271,9 @@ class LatentMoE(nn.Module):
         z = self.z_loss_coef * torch.logsumexp(logits, dim=-1).square().mean()
         return indices, weights, aux, z
 
-    def _dispatch(self, latent: Tensor, indices: Tensor, weights: Tensor) -> Tensor:
+    def _dispatch(
+        self, latent: Tensor, indices: Tensor, weights: Tensor, *, fp8_context: bool = True
+    ) -> Tensor:
         # FP32 accumulation is essential: summing several rounded FP8 expert
         # outputs in model dtype introduces a biased gate gradient.
         result = torch.zeros_like(latent, dtype=torch.float32)
@@ -245,19 +290,47 @@ class LatentMoE(nn.Module):
             # avoids padding work and, unlike a fixed-capacity graph buffer,
             # never drops assignments when the router is temporarily skewed.
             counts = torch.bincount(sorted_experts, minlength=self.num_experts)
+            if self.grouped_experts is None:
+                result = torch.zeros_like(latent, dtype=torch.float32)
+                start = 0
+                context = self._fp8_context() if fp8_context else nullcontext()
+                with context:
+                    for expert_id, count in enumerate(counts.tolist()):
+                        end = start + count
+                        if count:
+                            out = self.experts[expert_id](latent[sorted_tokens[start:end]])
+                            result.index_add_(
+                                0,
+                                sorted_tokens[start:end],
+                                out.float() * sorted_weights[start:end, None],
+                            )
+                        start = end
+                return result
+            # Eager grouped dispatch keeps exact variable expert counts, so it
+            # does not pay graph-capacity padding.  The host read is outside
+            # capture and is already required by TE's grouped metadata API.
+            counts_cpu = counts.cpu().tolist()
+            rounded = [((int(c) + 7) // 8) * 8 for c in counts_cpu]
+            offsets = []
+            total = 0
+            for c in rounded:
+                offsets.append(total)
+                total += c
+            starts = counts.cumsum(0) - counts
+            ranks = torch.arange(sorted_experts.numel(), device=latent.device, dtype=torch.int64)
+            ranks = ranks - starts.index_select(0, sorted_experts)
+            destinations = torch.tensor(offsets, device=latent.device, dtype=torch.int64).index_select(
+                0, sorted_experts
+            ) + ranks
+            packed = latent.new_zeros((total, latent.shape[-1]))
+            packed.index_copy_(0, destinations, latent.index_select(0, sorted_tokens))
+            m_splits = torch.tensor(rounded, dtype=torch.int64)
+            context = self._fp8_context() if fp8_context else nullcontext()
+            with context:
+                packed_out = self.grouped_experts(packed, m_splits)
+            selected = packed_out.index_select(0, destinations)
             result = torch.zeros_like(latent, dtype=torch.float32)
-            start = 0
-            with self._fp8_context():
-                for expert_id, count in enumerate(counts.tolist()):
-                    end = start + count
-                    if count:
-                        out = self.experts[expert_id](latent[sorted_tokens[start:end]])
-                        result.index_add_(
-                            0,
-                            sorted_tokens[start:end],
-                            out.float() * sorted_weights[start:end, None],
-                        )
-                    start = end
+            result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
             return result
         # Keep routing entirely on-device. ``torch.bincount`` and converting
         # its result to Python integers are forbidden during CUDA graph
@@ -286,25 +359,32 @@ class LatentMoE(nn.Module):
         packed = latent.new_zeros((self.num_experts * capacity, latent.shape[-1]))
         values = latent.index_select(0, sorted_tokens)
         packed.index_copy_(0, destinations, values)
-        with self._fp8_context():
+        context = self._fp8_context() if fp8_context else nullcontext()
+        with context:
             if self.grouped_experts is not None:
-                # The pinned TE GroupedLinear implementation converts dynamic
-                # split metadata to a host tuple and is therefore not
-                # graph-capturable.  Production uses the fixed expert loop
-                # below until TE's graph-safe grouped op is enabled.
-                raise RuntimeError("GroupedLinear dispatch is not graph-safe in the pinned TE")
-            packed_out = torch.empty_like(packed)
-            for expert_id in range(self.num_experts):
-                start = expert_id * capacity
-                packed_out[start : start + capacity] = self.experts[expert_id](
-                    packed[start : start + capacity]
-                )
+                # A CPU split tensor is safe for TE's internal ``tolist``
+                # conversion during capture and remains constant on replay.
+                m_splits = self._graph_grouped_splits.get(capacity)
+                if m_splits is None:
+                    m_splits = torch.full(
+                        (self.num_experts,), capacity, dtype=torch.int64
+                    )
+                    self._graph_grouped_splits[capacity] = m_splits
+                packed_out = self.grouped_experts(packed, m_splits)
+            else:
+                packed_out = torch.empty_like(packed)
+                for expert_id in range(self.num_experts):
+                    start = expert_id * capacity
+                    packed_out[start : start + capacity] = self.experts[expert_id](
+                        packed[start : start + capacity]
+                    )
             selected = packed_out.index_select(0, destinations)
         result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
         return result
 
-    def _shared_forward(self, x: Tensor) -> Tensor:
-        with self._fp8_context():
+    def _shared_forward(self, x: Tensor, *, fp8_context: bool = True) -> Tensor:
+        context = self._fp8_context() if fp8_context else nullcontext()
+        with context:
             return self.shared_expert(x)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -330,16 +410,21 @@ class LatentMoE(nn.Module):
                 shared = self._shared_forward(flat)
                 event.record(stream)
         else:
-            shared = self._shared_forward(flat)
+            shared = None
 
         indices, weights, aux, z = self._route(flat)
-        with self._fp8_context():
+        # Keep all main-stream MoE projections under one delayed-scaling
+        # context. Re-entering it for down/dispatch/up forces repeated amax
+        # reductions and metadata setup on every layer.
+        main_context = self._fp8_context()
+        with main_context:
+            if shared is None:
+                shared = self.shared_expert(flat)
             latent = self.down(flat)
-        routed = self._dispatch(latent, indices, weights)
+            routed = self._dispatch(latent, indices, weights, fp8_context=False)
+            output = self.up(routed.to(dtype=flat.dtype))
         if event is not None:
             torch.cuda.current_stream(flat.device).wait_event(event)
-        with self._fp8_context():
-            output = self.up(routed.to(dtype=flat.dtype))
         output = output.float() + shared.float()
         self.last_aux_loss = aux
         self.last_z_loss = z
