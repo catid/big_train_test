@@ -238,11 +238,16 @@ class Isotropic(nn.Module):
         for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
             weight = self.msar_conv[kernel_idx].to(dtype=x.dtype)
             grouped_weight = weight.repeat(n_sources, 1).unsqueeze(1)
+            # Symmetric convolution padding produces the same causal prefix
+            # as explicit left padding, while avoiding the full-width F.pad
+            # copy.  Keep only the causal output positions; the slice is a
+            # view and the following reshape/permute preserves graph safety.
             expanded = F.conv1d(
-                F.pad(x, (kernel - 1, 0)),
+                x,
                 grouped_weight,
+                padding=kernel - 1,
                 groups=channels,
-            )
+            )[..., :length]
             streams.append(
                 expanded.reshape(batch, n_sources, width, length)
                 .permute(1, 0, 3, 2)
