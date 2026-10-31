@@ -3,6 +3,7 @@
 from functools import partial
 from typing import Optional
 
+import torch
 from torch import nn, Tensor
 
 from flash_attn.ops.triton.layer_norm import RMSNorm
@@ -10,6 +11,7 @@ from mamba_ssm.modules.mamba3 import Mamba3
 
 from .mha import CausalMHA
 from .latent_moe import LatentMoE
+from hnet.te import make_linear
 
 
 class Mamba3Wrapper(Mamba3):
@@ -23,6 +25,30 @@ class Mamba3Wrapper(Mamba3):
     """
 
     supports_activation_checkpointing = False
+
+    def __init__(self, *args, **kwargs):
+        # Mamba-3's recurrent kernel is already fused, but its two boundary
+        # projections are ordinary PyTorch linears.  Convert those projections
+        # to the same aligned TE FP8 path used by the rest of H-Net while the
+        # native dimensions, dtype, and initialization are still available.
+        super().__init__(*args, **kwargs)
+        for name in ("in_proj", "out_proj"):
+            native = getattr(self, name)
+            if not isinstance(native, nn.Linear):
+                raise TypeError(f"Mamba-3 {name} must be an nn.Linear before TE conversion")
+            projection = make_linear(
+                native.in_features,
+                native.out_features,
+                bias=native.bias is not None,
+                device=native.weight.device,
+                dtype=native.weight.dtype,
+                fp8=True,
+            )
+            with torch.no_grad():
+                projection.linear.weight.copy_(native.weight)
+                if native.bias is not None:
+                    projection.linear.bias.copy_(native.bias)
+            setattr(self, name, projection)
 
     def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
         if inference_params is not None and inference_params.seqlen_offset > 0:
