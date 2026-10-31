@@ -65,7 +65,7 @@ def parse_args():
         "--auto-batch-max",
         type=int,
         default=CANONICAL_MAX_BATCH,
-        help="upper bound for power-calibration candidates (validated maximum is 16)",
+        help="upper bound for power-calibration candidates (validated complete-step cap is 14)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
@@ -1316,10 +1316,11 @@ class CUDAGraphStep:
     We therefore capture only tensor work: inputs are copied into persistent
     device buffers before replay, while clipping, the finite flag reduction, and
     AnchorMuon/AdamATan2 updates remain outside the graph.  Keeping the update
-    outside avoids capturing optimizer state initialization and lets DDP perform
-    its normal synchronization between replays. For DDP, capture runs with
-    reducer synchronization disabled and a flat gradient all-reduce is issued
-    after replay, because DDP's runtime logger is not graph-safe.
+    outside avoids capturing optimizer state initialization. For DDP, capture
+    runs with reducer synchronization disabled; replay reduces retained DDP
+    bucket views directly when possible, and otherwise uses one flat all-reduce
+    per parameter dtype. This keeps the runtime logger out of the graph without
+    creating per-parameter collectives.
     """
 
     def __init__(self, model, optimizer, args, batch, seq, device, world, capture_stream=None):
@@ -1336,7 +1337,7 @@ class CUDAGraphStep:
         # are initialized against the complete parameter set.  Captured
         # replay uses the underlying module after that setup: the wrapper's
         # per-forward logger/DDPSink path is not graph-safe and is redundant
-        # because replay performs the explicit flat gradient all-reduce below.
+        # because replay performs the explicit post-capture gradient reduction.
         self.forward_model = model.module if self.ddp else model
         # DDP's reducer only tracks trainable parameters.  Filtering here keeps
         # the flat post-capture collective aligned with the reducer and avoids
@@ -1403,7 +1404,15 @@ class CUDAGraphStep:
         )
         with warm_stream_context:
             for _ in range(3):
-                self.optimizer.zero_grad(set_to_none=True)
+                # Keep the DDP reducer's gradient-as-bucket views alive.  The
+                # graph replays the underlying module directly (the DDP
+                # wrapper performs host-side logger work that is not capture
+                # safe), so these views are the only way the captured
+                # AccumulateGrad nodes can write directly into coalesced
+                # reducer storage.  Dropping them here makes every parameter
+                # allocate an independent gradient and turns the post-replay
+                # reduction into hundreds of NCCL launches.
+                self.optimizer.zero_grad(set_to_none=False)
                 warm_out = self.model(warm_x, mask=self.static_mask, fbt_passes=FBT_PASSES)
                 warm_loss, _ = loss_for_output(
                     warm_out,
@@ -1426,8 +1435,8 @@ class CUDAGraphStep:
         if self.ddp:
             # DDP's C++ logger performs a host-side runtime-stat call in
             # ``DistributedDataParallel._pre_forward``. Disable reducer sync
-            # for capture and perform a flat gradient all-reduce after replay;
-            # this keeps the captured graph free of logger/NCCL setup calls.
+            # for capture and perform the explicit gradient reduction after
+            # replay; this keeps the captured graph free of logger/NCCL setup.
             self.model.require_backward_grad_sync = False
         hnet_te.set_graph_capture(True)
         # TE's DPA backend key includes its ``cuda_graph`` flag.  A normal
@@ -1461,7 +1470,9 @@ class CUDAGraphStep:
                 # key before entering raw CUDA capture, then discard the
                 # warmup graph.
                 graph_backend_loss.backward()
-                self.optimizer.zero_grad(set_to_none=True)
+                # Preserve the reducer-owned gradient views through the
+                # graph-backend warmup so capture reuses the same storage.
+                self.optimizer.zero_grad(set_to_none=False)
                 del graph_backend_warmup
                 del graph_backend_loss, _graph_backend_metrics
                 torch.cuda.synchronize(self.device)
@@ -1570,6 +1581,13 @@ class CUDAGraphStep:
         dist.all_reduce(meta_min, op=dist.ReduceOp.MIN)
         dist.all_reduce(meta_max, op=dist.ReduceOp.MAX)
         compatible = bool(local_ok) and bool(torch.equal(meta_min, meta_max))
+        # A graph capture that did not preserve reducer views can expose one
+        # storage per parameter.  Treat that layout as incompatible rather
+        # than issuing hundreds of tiny collectives; the flat dtype buckets in
+        # _sync_ddp_grads are slower than direct reducer views but remain one
+        # collective per dtype and preserve the update exactly.
+        if compatible and len(groups) > 16:
+            compatible = False
         self._ddp_direct_storage = compatible
         self._ddp_storage_buckets = groups if compatible else None
 

@@ -27,8 +27,13 @@ Router-selected chunks are left-aligned with trailing padding; causal
 attention cannot see that future padding, and active masks clear padded MLP and
 residual rows. The graph path fails during capture if a TE kernel or DDP setup
 still performs a host shape read. DDP capture uses a dedicated stream and
-averages a flat gradient buffer after replay because DDP's runtime logger is not
-capture-safe.
+disables reducer synchronization inside the graph because DDP's runtime logger
+is not capture-safe. The eager warmup preserves `gradient_as_bucket_view`
+storage through capture, so replay reduces six coalesced reducer storages
+directly; if a runtime does not expose that layout, it falls back to one flat
+reduction per parameter dtype. The exact B=14/S=4096 full step measured 1.78695
+seconds (32,090 tokens/s/GPU) on eight B300 GPUs, versus 1.85275 seconds before
+preserving bucket views; all four measured updates were finite.
 
 The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
@@ -101,7 +106,7 @@ every candidate remains below target, it selects the largest fully validated
 candidate and records that gap rather than pretending the target was reached;
 if every candidate is above target, it selects the smallest. Candidates are
 powers of two plus the explicit upper bound up to `--auto-batch-max` (default
-96). Calibration catches and synchronizes candidate OOMs across DDP ranks,
+14). Calibration catches and synchronizes candidate OOMs across DDP ranks,
 includes DDP synchronization,
 gradient clipping, and the real AnchorMuon update, then restores model and
 optimizer and module-local FP8 scaling tensors before measuring the next
@@ -121,8 +126,10 @@ shared expert. The down/up projections and widened latent experts preserve the
 former dense width-4096 SwiGLU parameter budget while increasing total expert
 capacity; the model has 603,935,652 trainable parameters. Router logits,
 probabilities, auxiliary loss, and routed accumulation remain FP32 around FP8
-GEMMs, and the shared expert runs concurrently with routing on a CUDA side
-stream with explicit event ordering.
+GEMMs. Eager execution schedules the shared expert on a CUDA side stream with
+explicit event ordering; the production CUDA-graph path keeps the shared and
+routed work on its capture stream because the side-stream variant was neutral
+on the complete B=14 benchmark.
 Dispatch uses fixed per-expert capacity and grouped tensor contractions. The
 router auxiliary loss is accumulated in FP32. The chunker keeps a fixed padded
 bound during graph replay; selected boundaries are left-aligned and trailing
