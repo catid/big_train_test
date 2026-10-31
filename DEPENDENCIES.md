@@ -30,6 +30,14 @@ floating Git revisions during a training run.
 Before a long run, record `pip freeze`, the CUDA driver/runtime versions, and
 the exact git SHAs for every source-built package in the run artifact log.
 
+The base wheel metadata reports three intentional conflicts in this reviewed
+runtime: Mamba-SSM declares `apache-tvm-ffi<=0.1.9`, PyTorch declares cuBLAS
+13.1, and PyTorch declares cuDNN 9.15. The canonical Mamba-3 CuteDSL path,
+patched TE grouped MoE, and CroissAttn FP8 kernels require the newer pinned
+versions listed above. `assert_fp8_runtime()` and the dependency manifest fail
+closed on any other loaded binaries; do not resolve these constraints by
+downgrading the reviewed runtime.
+
 The committed `runtime_manifest.json` is the binary trust anchor for the
 canonical environment. It records SHA-256 hashes for the loaded Transformer
 Engine core/torch/NCCL extension, FlashAttention, selective-scan, causal-conv,
