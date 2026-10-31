@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from hnet.te import TEGroupedLinear, make_linear, te, graph_capture_enabled
+from transformer_engine.pytorch.ops.basic.swiglu import SwiGLU
 from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss
 
 
@@ -217,8 +218,11 @@ class LatentMoE(nn.Module):
             self.num_experts, expert_intermediate, self.latent_dim, bias=bias,
             params_dtype=dtype, device=device, use_grouped_tensor=True,
         )
+        self.expert_swiglu = SwiGLU()
         self.shared_fc1 = make_linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
         self.shared_fc2 = make_linear(shared_intermediate, d_model, bias=bias, **factory_kwargs)
+        self.shared_swiglu = SwiGLU()
+        self._glu_parameters_reordered = False
         # Router decisions are discrete and feed the auxiliary loss. Keep the
         # projection in BF16/FP32 even inside an enclosing FP8 expert region so
         # quantization noise cannot flip near-tied top-1 assignments.
@@ -262,6 +266,25 @@ class LatentMoE(nn.Module):
         self.shared_gate.weight._no_reinit = True
         self.shared_gate.bias._no_reinit = True
 
+    @torch.no_grad()
+    def reorder_glu_parameters(self):
+        """Swap FC1 rows to TE's gate/value order once after initialization."""
+        if self._glu_parameters_reordered:
+            return
+        for name, parameter in self.experts_fc1.named_parameters(recurse=False):
+            if not (name.startswith("weight") or name.startswith("bias")):
+                continue
+            half = parameter.shape[0] // 2
+            parameter.copy_(torch.cat((parameter[half:], parameter[:half]), dim=0))
+        weight = self.shared_fc1.linear.weight
+        half = weight.shape[0] // 2
+        weight.copy_(torch.cat((weight[half:], weight[:half]), dim=0))
+        if self.shared_fc1.linear.bias is not None and self.shared_fc1.linear.bias.numel() > 0:
+            bias = self.shared_fc1.linear.bias
+            half = bias.shape[0] // 2
+            bias.copy_(torch.cat((bias[half:], bias[:half]), dim=0))
+        self._glu_parameters_reordered = True
+
     @property
     def aux_loss(self):
         """Mean router load-balancing loss for this model forward.
@@ -291,8 +314,7 @@ class LatentMoE(nn.Module):
         return self._z_loss / max(1, self._aux_loss_count)
 
     def _shared(self, x):
-        y, gate = self.shared_fc1(x).chunk(2, dim=-1)
-        y = F.silu(gate) * y
+        y = self.shared_swiglu(self.shared_fc1(x))
         y = self.shared_fc2(y)
         return y * torch.sigmoid(self.shared_gate(x).float()).to(y.dtype)
 
@@ -578,9 +600,7 @@ class LatentMoE(nn.Module):
             self._m_splits_cache[split_key] = m_splits
         elif getattr(m_splits, "_hnet_static_splits", None) is None:
             m_splits._hnet_static_splits = (capacity,) * self.num_experts
-        expert_hidden = self.experts_fc1(dispatched, m_splits)
-        value, gate = expert_hidden.chunk(2, dim=-1)
-        expert_hidden = F.silu(gate) * value
+        expert_hidden = self.expert_swiglu(self.experts_fc1(dispatched, m_splits))
         expert_out = self.experts_fc2(expert_hidden, m_splits)
         # TE returns a flattened top-1 probability vector. Apply it before
         # unpermute so the custom op receives no narrow [N,1] probability

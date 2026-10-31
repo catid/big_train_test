@@ -220,6 +220,14 @@ class HNet(nn.Module):
                     init_projection(name, m)
                     
             self.main_network._init_weights(initializer_range, n_residuals)
+
+        # TE SwiGLU consumes gate/value FC1 rows. Swap freshly initialized
+        # rows once after recursive projection initialization so the fused
+        # activation preserves the historical value/gate function.
+        for module in self.modules():
+            reorder = getattr(module, "reorder_glu_parameters", None)
+            if reorder is not None:
+                reorder()
     
 
     def _apply_lr_multiplier(self, lr_multiplier: list[float]) -> None:
