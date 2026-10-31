@@ -221,6 +221,34 @@ class Isotropic(nn.Module):
             y.add_(shifted)
         return y.squeeze(0) if original_2d else y
 
+    def _msar_expand_batched(self, sources):
+        """Expand all padded MSAR sources with one grouped convolution per lag.
+
+        The ordinary path invokes the depthwise convolution once per source and
+        lag.  Padded training has no document reset to apply, so source and
+        feature channels can be folded into one grouped convolution while
+        keeping each source/channel independent.  The packed path retains the
+        reset-aware shift implementation in :meth:`_msar_expand`.
+        """
+        source_bank = torch.stack(sources, dim=0)  # [N, B, L, D]
+        n_sources, batch, length, width = source_bank.shape
+        channels = n_sources * width
+        x = source_bank.permute(1, 0, 3, 2).reshape(batch, channels, length)
+        streams = [source_bank]
+        for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+            weight = self.msar_conv[kernel_idx].to(dtype=x.dtype)
+            grouped_weight = weight.repeat(n_sources, 1).unsqueeze(1)
+            expanded = F.conv1d(
+                F.pad(x, (kernel - 1, 0)),
+                grouped_weight,
+                groups=channels,
+            )
+            streams.append(
+                expanded.reshape(batch, n_sources, width, length)
+                .permute(1, 0, 3, 2)
+            )
+        return streams
+
     def _msar_mix(self, sources, layer_idx, cu_seqlens=None):
         # Build and reduce one source at a time.  The former implementation
         # stacked every source and every kernel stream before normalization,
@@ -228,46 +256,58 @@ class Isotropic(nn.Module):
         # streams, batch, length, width] activation bank.  Keeping per-source
         # stream lists preserves the exact MSAR equations while removing that
         # peak allocation and making larger microbatches feasible.
-        source_streams = []
-        source_scores = []
         query = self.msar_queries[layer_idx].float()
-        for source in sources:
-            streams = [source]
-            for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
-                streams.append(
-                    self._msar_expand(
-                        source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+        if cu_seqlens is None:
+            # Padded graph training has no document boundaries to reset. Fold
+            # source identity into grouped-convolution channels, reducing the
+            # three lag convolutions from 3*N launches to three per MSAR call.
+            stream_banks = self._msar_expand_batched(sources)
+            source_scores = []
+            for stream_index, stream_bank in enumerate(stream_banks):
+                stream_f = stream_bank.float()
+                normed = stream_f * torch.rsqrt(
+                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
+                )
+                source_scores.append(
+                    torch.einsum("n...d,d->n...", normed, query[stream_index])
+                    / (self.d_model**0.5)
+                )
+            weights = torch.softmax(torch.stack(source_scores, dim=1), dim=0)
+            retrieved_streams = [
+                (weights[:, stream_index].unsqueeze(-1) * stream_bank).sum(dim=0)
+                for stream_index, stream_bank in enumerate(stream_banks)
+            ]
+        else:
+            source_streams = []
+            source_scores = []
+            for source in sources:
+                streams = [source]
+                for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                    streams.append(
+                        self._msar_expand(
+                            source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+                        )
+                    )
+                stream_bank = torch.stack(streams, dim=0)
+                stream_f = stream_bank.float()
+                normed = stream_f * torch.rsqrt(
+                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
+                )
+                scores = torch.einsum("k...d,kd->k...", normed, query) / (
+                    self.d_model**0.5
+                )
+                source_streams.append(stream_bank)
+                source_scores.append(scores)
+            weights = torch.softmax(torch.stack(source_scores, dim=0), dim=0)
+            retrieved_streams = []
+            for stream_index in range(len(self.msar_kernels)):
+                retrieved_streams.append(
+                    sum(
+                        weights[source_index, stream_index].unsqueeze(-1)
+                        * source_streams[source_index][stream_index]
+                        for source_index in range(len(source_streams))
                     )
                 )
-            # Keep the stream axis together while doing the normalization and
-            # query projection.  The previous per-stream loop launched four
-            # independent FP32 reductions and einsums for every source.  A
-            # temporary [streams, ..., width] view lets PyTorch use one
-            # reduction and one contraction per source, while replacing the
-            # list with this stack releases the individual stream references
-            # immediately.  The MSAR equations are unchanged: normalization
-            # still uses the same mean-square + 1e-6 denominator and each
-            # stream keeps its own learned query vector.
-            stream_bank = torch.stack(streams, dim=0)
-            stream_f = stream_bank.float()
-            normed = stream_f * torch.rsqrt(
-                stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
-            )
-            scores = torch.einsum("k...d,kd->k...", normed, query) / (
-                self.d_model**0.5
-            )
-            source_streams.append(stream_bank)
-            source_scores.append(scores)
-        weights = torch.softmax(torch.stack(source_scores, dim=0), dim=0)
-        retrieved_streams = []
-        for stream_index in range(len(self.msar_kernels)):
-            retrieved_streams.append(
-                sum(
-                    weights[source_index, stream_index].unsqueeze(-1)
-                    * source_streams[source_index][stream_index]
-                    for source_index in range(len(source_streams))
-                )
-            )
         # Apply the MSAR pre-projection one stream at a time. Concatenating
         # all streams into [batch, length, streams*width] creates a large
         # transient copy; splitting the learned matrix gives the identical
