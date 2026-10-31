@@ -364,8 +364,15 @@ class LatentMoE(nn.Module):
         # in FP32 so BF16/FP8 router logits cannot poison the training loss.
         active_f = active.to(dtype=torch.float32)
         active_count = active_f.sum().clamp_min(1.0)
-        active_one_hot = fused_routing_map.to(torch.float32)
-        active_one_hot = active_one_hot * active_f[:, None]
+        # Materialize one int32 route map and reuse it for both capacity
+        # accounting and dispatch.  The previous path cast the bool map to
+        # FP32, multiplied by the active mask, then cast it back to int32;
+        # that pair of conversion kernels is on the hot path for every MoE
+        # invocation.  Integer masking is exact for the binary route and the
+        # single FP32 cast below remains sufficient for the auxiliary loss.
+        routing_map = fused_routing_map.to(torch.int32)
+        routing_map = routing_map * active[:, None].to(torch.int32)
+        active_one_hot = routing_map.to(torch.float32)
         # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
         # this normalization explicit so the Switch/GShard term remains
         # invariant if a future configuration allows top-k > 1 (for the
@@ -488,7 +495,6 @@ class LatentMoE(nn.Module):
             positions = global_positions - offsets.index_select(0, sequence_ids_flat)
             token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
-        routing_map = fused_routing_map.to(torch.int32)
         routing_map = routing_map * valid[:, None].to(torch.int32)
         routing_probs = probs * routing_map.to(probs.dtype)
         if route_counts is not None:
