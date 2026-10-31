@@ -65,15 +65,12 @@ class HNetConfig:
     # router emits more boundaries, the earliest causal boundaries are kept
     # so a future byte cannot change an earlier latent decision.
     chunk_capacity_tokens: int = 512
-    # Recompute MSAR retrieval during backward. MSAR is the largest retained
-    # activation bank in the 600M model; this bounds memory without changing
-    # its forward function.
-    msar_activation_checkpointing: bool = True
-    # Request checkpointing for compatible mixers. Mamba-3's native fused
-    # autograd path explicitly opts out because checkpoint wrapping violates
-    # its saved-tensor contract; the flag remains part of the canonical
-    # architecture signature so a different kernel cannot be selected silently.
-    mamba_activation_checkpointing: bool = True
+    # Keep the complete activation graph for the canonical B=12 CUDA-graph
+    # shape. Recomputing MSAR or compatible mixers saves memory but adds more
+    # work than it removes on B300; the no-checkpoint shape has higher token
+    # throughput while remaining below the device memory limit.
+    msar_activation_checkpointing: bool = False
+    mamba_activation_checkpointing: bool = False
     # Required DeepSeek/Mixtral-style sparse FFN. Eight routed experts with
     # top-1 dispatch give the requested 1:8 active expert sparsity. The shared
     # expert is always evaluated; a disabled dense FFN path is unsupported.
@@ -114,10 +111,8 @@ class HNetConfig:
             raise ValueError("the canonical model requires MSAR stream kernels [1, 4, 8, 12]")
         if int(self.chunk_capacity_tokens) != 512:
             raise ValueError("the canonical model requires a 512-token latent chunk capacity")
-        if not self.msar_activation_checkpointing:
-            raise ValueError("the canonical model requires MSAR activation checkpointing")
-        if not self.mamba_activation_checkpointing:
-            raise ValueError("the canonical model requires Mamba activation checkpointing")
+        if self.msar_activation_checkpointing or self.mamba_activation_checkpointing:
+            raise ValueError("the canonical model disables activation checkpointing for throughput")
         if not (self.moe_enabled and self.moe_num_experts == 8 and self.moe_top_k == 1):
             raise ValueError("the canonical model requires top-1 8-way sparse MoE")
         if not self.attn_cfg.vha_enabled or self.attn_cfg.num_kv_heads != [2, 2]:

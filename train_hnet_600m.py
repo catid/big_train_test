@@ -41,13 +41,11 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
-# B=16 at S=4096 is the largest full-model CUDA-graph shape with comfortable
-# production headroom on a B300: it replays finitely at about 26.5k tokens/s
-# and uses roughly 63 GiB. B=32 can replay in an isolated run, but its graph
-# pool peaks around 250 GiB on the 275 GiB device and leaves too little room
-# for allocator variation or DDP state; calibration must not select it. This
-# is a throughput safety bound, not a smaller model or partial training path.
-CANONICAL_MAX_BATCH = 16
+# With activation recomputation disabled, B=12 at S=4096 is the largest
+# validated full-model CUDA-graph shape with useful throughput and memory
+# headroom on a B300. B=16 exhausts the 275 GiB device during capture. B=32
+# also exceeds the graph pool boundary; calibration must not select either.
+CANONICAL_MAX_BATCH = 12
 
 
 def parse_args():
@@ -1043,15 +1041,15 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     """
     if device.type != "cuda":
         raise RuntimeError("--auto-batch requires CUDA")
-    # Keep a generous memory reserve for the real optimizer, DDP buckets, and
-    # checkpointing. B300's 275 GiB permits candidates through eight for this
-    # model; smaller devices receive a proportionally lower bound.
+    # Keep a generous memory reserve for the real optimizer and DDP buckets.
+    # The canonical no-checkpoint B=12 graph is validated on B300; smaller
+    # devices receive a proportionally lower bound through calibration.
     if int(args.auto_batch_max) < 1:
         raise ValueError("--auto-batch-max must be positive")
-    # The full model has explicit activation checkpointing and the calibration
-    # catches a synchronized OOM before any collective that would deadlock a
-    # DDP rank. Use the requested bound directly; a conservative memory
-    # heuristic would reject the larger validated graph batches on B300.
+    # The full model keeps its activation graph for the canonical B=12 shape;
+    # calibration catches a synchronized OOM before any collective that would
+    # deadlock a DDP rank. Use the requested bound directly; a conservative
+    # memory heuristic would reject the validated graph batch on B300.
     max_batch = min(max(1, int(args.auto_batch_max)), CANONICAL_MAX_BATCH)
     manifest_doc_count = int(getattr(args, "_manifest_doc_count", 0))
     if manifest_doc_count <= 0:
