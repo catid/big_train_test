@@ -591,7 +591,6 @@ class Isotropic(nn.Module):
                             total_length=hidden_states.shape[0],
                         ),
                         "cu_seqlens": cu_seqlens,
-                        "max_seqlen": max_seqlen,
                     }
                 )
                 packed = True
@@ -651,7 +650,6 @@ class Isotropic(nn.Module):
                     # Mamba-3's varlen kernel resets recurrent state from
                     # cu_seqlens; seq_idx is not consumed by that kernel.
                     "cu_seqlens": cu_seqlens.int(),
-                    "max_seqlen": max_seqlen,
                 }
             )
             packed = True
