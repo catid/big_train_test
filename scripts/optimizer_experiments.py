@@ -336,7 +336,13 @@ class AnvilII(torch.optim.Optimizer):
                  momentum_fast=0.85, momentum_slow=0.98, fast_weight=0.4385,
                  engage_step=514, fallback_betas=(0.9, 0.95), eps=1e-8):
         fallback_lr = lr if fallback_lr is None else fallback_lr
-        super().__init__(params, dict(lr=lr, fallback_lr=fallback_lr,
+        # Keep immutable schedule bases in the group.  The trainer updates the
+        # live rates for warmup/decay each step; without these fields a resume
+        # or a custom fallback rate silently resets matrix updates to the
+        # matrix default and loses the requested fallback/matrix ratio.
+        super().__init__(params, dict(lr=lr, base_lr=lr,
+                                      fallback_lr=fallback_lr,
+                                      base_fallback_lr=fallback_lr,
                                       weight_decay=weight_decay,
                                       momentum_fast=momentum_fast,
                                       momentum_slow=momentum_slow,
@@ -692,6 +698,9 @@ class AnchorMuon(torch.optim.Optimizer):
             def apply_defaults(group: dict[str, Any]) -> None:
                 is_matrix = bool(group["use_matrix_update"])
                 group.setdefault("lr", lr if is_matrix else fallback_lr)
+                group.setdefault("base_lr", float(group["lr"]))
+                if "fallback_lr" in group:
+                    group.setdefault("base_fallback_lr", float(group["fallback_lr"]))
                 group.pop("weight_decay", None)
                 if is_matrix:
                     group.setdefault("momentum", momentum)

@@ -238,10 +238,16 @@ class GraphStep:
             self.y.copy_(y)
             self.graph.replay()
         current_stream.wait_stream(self.capture_stream)
-        # Eager optimizer updates preserve the live LR schedule and optimizer
-        # state while the expensive model forward/backward remains graphified.
-        self.optimizer.step()
-        return self.static_loss, self.static_ratio
+        # Keep the eager safety checks from the non-graph path.  CUDA graph
+        # replay only captures forward/backward; clipping and the optimizer
+        # update remain live so a transient FP8/CE overflow cannot mutate all
+        # optimizer state with NaNs.  The scalar finite check is intentionally
+        # after synchronization and therefore does not enter the graph.
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        finite = bool(torch.isfinite(self.static_loss) and torch.isfinite(grad_norm))
+        if finite:
+            self.optimizer.step()
+        return self.static_loss, self.static_ratio, finite
 
 
 def main():
@@ -271,7 +277,9 @@ def main():
         for group in optimizer.param_groups:
             group["lr"] = float(group.get("base_lr", args.lr)) * scale
             if "fallback_lr" in group:
-                group["fallback_lr"] = args.fallback_lr * scale
+                group["fallback_lr"] = float(
+                    group.get("base_fallback_lr", args.fallback_lr)
+                ) * scale
         report_step = step < 3 or step % args.log_every == 0
         should_log = rank == 0 and report_step
         if step_start_event is not None:
@@ -279,7 +287,9 @@ def main():
         else:
             t0 = time.perf_counter()
         if graph_step is not None:
-            loss, ratio = graph_step(x, y)
+            loss, ratio, finite = graph_step(x, y)
+            if not finite:
+                log["nonfinite"].append(step)
         else:
             mask = torch.ones_like(x, dtype=torch.bool)
             out = model(x, mask=mask, fbt_passes=args.fbt_passes)
