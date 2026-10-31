@@ -307,21 +307,32 @@ class Isotropic(nn.Module):
                 # source pays one grouped-convolution call; subsequent layers
                 # reuse that bank while preserving the exact source ordering.
                 source_banks = []
+                source_keys = []
                 for source in sources:
                     source_key = id(source)
+                    source_keys.append(source_key)
                     stream_bank = stream_cache.get(source_key)
                     if stream_bank is None:
                         stream_bank = self._msar_expand_batched([source])
                         stream_cache[source_key] = stream_bank
                     source_banks.append(stream_bank)
                 # Restore the original grouped layout [stream, source, ...]
-                # for the score/retrieval equations.  The concatenations are
-                # small views of already-computed banks; the expensive lag
-                # convolutions are no longer repeated for every layer.
-                stream_banks = [
-                    torch.cat([bank[stream_idx] for bank in source_banks], dim=0)
-                    for stream_idx in range(len(self.msar_kernels))
-                ]
+                # for the score/retrieval equations. The source bank is
+                # unchanged until a configured MSAR boundary, so cache these
+                # aggregate tensors too. This avoids repeating the large
+                # concatenation on every layer while retaining BF16 storage;
+                # do not cache FP32 normalized copies because they can exhaust
+                # the graph pool at the canonical batch.
+                aggregate_key = ("aggregate", tuple(source_keys))
+                stream_banks = stream_cache.get(aggregate_key)
+                if stream_banks is None:
+                    stream_banks = [
+                        torch.cat(
+                            [bank[stream_idx] for bank in source_banks], dim=0
+                        )
+                        for stream_idx in range(len(self.msar_kernels))
+                    ]
+                    stream_cache[aggregate_key] = stream_banks
             source_scores = []
             for stream_index, stream_bank in enumerate(stream_banks):
                 # Use PyTorch's fused RMS normalization kernel.  The former
