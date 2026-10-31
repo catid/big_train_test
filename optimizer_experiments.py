@@ -1018,53 +1018,22 @@ class AnchorMuon(torch.optim.Optimizer):
                     start : start + MATRIX_BUCKET_CHUNK_SIZE
                 ]
                 updates = self._transform_matrix_bucket(chunk_entries, group)
-                # The polar transform is batched above, but the old update
-                # tail launched four pointwise kernels and one dtype copy per
-                # parameter.  Apply the independent residual updates through
-                # foreach kernels, partitioning only where decay or destination
-                # dtype differs.  This preserves the exact per-parameter
-                # equations while substantially reducing launch overhead for
-                # the hundreds of matrix tensors in the 600M model.
-                prepared = []
                 for (p, anchor, _source, _grad), update in zip(
                     chunk_entries, updates.unbind(0), strict=True
                 ):
-                    prepared.append(
-                        (
-                            p,
-                            self._master_param(p),
-                            anchor,
-                            update.reshape_as(p),
-                            bool(getattr(p, "_no_weight_decay", False)),
-                        )
+                    master = self._master_param(p)
+                    master.lerp_(end=anchor, weight=soda_weight)
+                    matrix_decay = (
+                        0.0
+                        if getattr(p, "_no_weight_decay", False)
+                        else self.matrix_weight_decay
                     )
-                for no_decay in (False, True):
-                    subset = [item for item in prepared if item[4] is no_decay]
-                    if not subset:
-                        continue
-                    masters = [item[1] for item in subset]
-                    anchors = [item[2] for item in subset]
-                    updates_view = [item[3] for item in subset]
-                    torch._foreach_lerp_(masters, anchors, soda_weight)
-                    if not no_decay and self.matrix_weight_decay:
-                        torch._foreach_mul_(
-                            masters, 1.0 - lr * self.matrix_weight_decay
-                        )
-                    torch._foreach_add_(masters, updates_view, alpha=-lr)
-                    # The destination is the model's low-precision parameter;
-                    # master tensors remain FP32.  Copy only when needed, so
-                    # FP32 parameters avoid an unnecessary self-copy.
-                    copy_pairs = [
-                        (item[0], item[1])
-                        for item in subset
-                        if item[1] is not item[0]
-                    ]
-                    if copy_pairs:
-                        torch._foreach_copy_(
-                            [pair[0] for pair in copy_pairs],
-                            [pair[1] for pair in copy_pairs],
-                        )
-                    matrix_count += len(subset)
+                    if matrix_decay:
+                        master.mul_(1.0 - lr * matrix_decay)
+                    master.add_(update.reshape_as(master), alpha=-lr)
+                    if master is not p:
+                        p.copy_(master.to(dtype=p.dtype))
+                    matrix_count += 1
 
         return {
             "matrix_count": float(matrix_count),
