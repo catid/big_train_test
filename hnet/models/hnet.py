@@ -19,18 +19,26 @@ from hnet.te import fp8_context, make_linear
 from .config_hnet import HNetConfig
 
 
-class STE(torch.autograd.Function):
+class ResidualSTE(torch.autograd.Function):
+    """Residual gate with a straight-through boundary gradient.
+
+    The old implementation materialized a full ``ones_like(p)`` tensor and
+    multiplied it into the decoded activation.  The forward value is exactly
+    ``out + residual``; only the backward pass needs the gate derivative.  A
+    custom function keeps that derivative while eliminating the wide ones and
+    multiply kernels from every FBT pass.
+    """
+
     @staticmethod
-    def forward(ctx, x):
-        return torch.ones_like(x)
+    def forward(ctx, out, residual, p):
+        ctx.save_for_backward(out, p)
+        return out + residual
 
     @staticmethod
     def backward(ctx, grad_output):
-        grad_x = grad_output
-        return grad_x
-
-def ste_func(x):
-    return STE.apply(x)
+        out, p = ctx.saved_tensors
+        grad_p = (grad_output * out).sum_to_size(p.shape)
+        return grad_output, grad_output, grad_p
 
 
 @dataclass
@@ -130,7 +138,7 @@ class HNet(nn.Module):
             self.residual_proj.weight._no_reinit = True
             self.residual_proj.bias._no_reinit = True
 
-            self.residual_func = lambda out, residual, p: out * ste_func(p) + residual
+            self.residual_func = ResidualSTE.apply
             # Full-bandwidth feedback is attached only at the outer boundary
             # before the deepest main network. It never changes router masks,
             # chunk counts, or the encoder/decoder residual path.
