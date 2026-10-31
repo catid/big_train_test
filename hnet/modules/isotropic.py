@@ -206,9 +206,21 @@ class Isotropic(nn.Module):
         seq_idx = get_seq_idx(
             cu_seqlens, device=x.device, total_length=x.shape[1]
         )
-        y = x * weight[:, kernel - 1].to(dtype=x.dtype)
+        # The padded graph path uses a depthwise conv whose CUDA kernel
+        # accumulates BF16 products in FP32 before narrowing the output.  Use
+        # the same accumulation contract for packed document-boundary
+        # streams; doing each lag in BF16 made prefill and graph training
+        # diverge by several ulps per lag (and up to one BF16 quantization
+        # step after the MSAR router projection).  Keep the final cast at the
+        # public boundary so the mixer still feeds the block in its parameter
+        # dtype.
+        x_work = x.float()
+        weight_work = weight.float()
+        y = x_work * weight_work[:, kernel - 1]
         for lag in range(1, kernel):
-            shifted = torch.cat((torch.zeros_like(x[:, :lag]), x[:, :-lag]), dim=1)
+            shifted = torch.cat(
+                (torch.zeros_like(x_work[:, :lag]), x_work[:, :-lag]), dim=1
+            )
             same_doc = torch.cat(
                 (torch.zeros_like(seq_idx[:, :lag], dtype=torch.bool),
                  seq_idx[:, lag:] == seq_idx[:, :-lag]),
@@ -218,9 +230,10 @@ class Isotropic(nn.Module):
             # shift.  The previous expression materialized two additional
             # [tokens, d_model] tensors per lag; at the full 16-sample batch
             # that transient peak was enough to exhaust a 275-GiB B300.
-            shifted.mul_(same_doc.unsqueeze(-1).to(dtype=x.dtype))
-            shifted.mul_(weight[:, kernel - 1 - lag].to(dtype=x.dtype))
+            shifted.mul_(same_doc.unsqueeze(-1).to(dtype=x_work.dtype))
+            shifted.mul_(weight_work[:, kernel - 1 - lag])
             y.add_(shifted)
+        y = y.to(dtype=x.dtype)
         return y.squeeze(0) if original_2d else y
 
     def _msar_expand_batched(self, sources):
