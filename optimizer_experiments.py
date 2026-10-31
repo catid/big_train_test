@@ -1197,6 +1197,7 @@ class AnchorMuon(torch.optim.Optimizer):
         anchors = []
         grads = []
         states = []
+        active_params = []
         for p in params:
             grad = p.grad
             if grad is None:
@@ -1220,6 +1221,7 @@ class AnchorMuon(torch.optim.Optimizer):
             anchors.append(self._soda_anchor(p))
             grads.append(grad.detach().to(torch.float32))
             states.append(state)
+            active_params.append(p)
 
         if not states:
             return 0
@@ -1246,7 +1248,7 @@ class AnchorMuon(torch.optim.Optimizer):
             if decay:
                 torch._foreach_mul_(masters, 1.0 - lr * decay)
         torch._foreach_add_(masters, updates, alpha=-lr)
-        torch._foreach_copy_(params[: len(states)], masters)
+        torch._foreach_copy_(active_params, masters)
         return len(states)
 
     @torch.no_grad()
