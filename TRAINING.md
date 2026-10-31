@@ -34,7 +34,7 @@ The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
 future byte cannot retroactively evict an earlier latent. The same effective
 boundary set is passed to the inner stack and dechunker.
-The canonical B=12 graph keeps MSAR and compatible mixer activations for the
+The canonical B=15 graph keeps MSAR and compatible mixer activations for the
 backward pass. This removes recomputation overhead and fits within the tested
 B300 memory budget; B=16 without recomputation exhausts the device during
 capture. The fused Mamba-3 SISO kernel keeps its native custom-autograd path.
