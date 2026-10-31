@@ -613,7 +613,15 @@ class Isotropic(nn.Module):
                                 if hidden_states.dim() == 2
                                 else hidden_states.shape[1]
                             ),
-                        )
+                        ),
+                        # Mamba-3's fused varlen kernel uses cu_seqlens to
+                        # reset the recurrent state at document boundaries;
+                        # seq_idx is not consumed by that kernel.  Keep the
+                        # packed B=1 activation paired with the exact offsets
+                        # just as the attention path does, otherwise eager
+                        # masked batches leak state from one document into
+                        # the next.
+                        "cu_seqlens": cu_seqlens,
                     }
                 )
                 packed = True
