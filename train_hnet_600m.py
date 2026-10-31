@@ -41,6 +41,12 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
+# The largest full-model CUDA-graph shape with repeatable finite replay on a
+# B300 is B=16 at S=4096.  Larger captures consumed roughly 190 GiB and did
+# not produce a valid replay, so calibration must not spend time probing an
+# unvalidated shape.  This is a throughput safety bound, not a smaller model
+# or partial training path.
+CANONICAL_MAX_BATCH = 16
 
 
 def parse_args():
@@ -59,8 +65,8 @@ def parse_args():
     p.add_argument(
         "--auto-batch-max",
         type=int,
-        default=96,
-        help="upper bound for power-calibration candidates",
+        default=CANONICAL_MAX_BATCH,
+        help="upper bound for power-calibration candidates (validated maximum is 16)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
@@ -1045,7 +1051,7 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     # catches a synchronized OOM before any collective that would deadlock a
     # DDP rank. Use the requested bound directly; a conservative memory
     # heuristic would reject the larger validated graph batches on B300.
-    max_batch = max(1, int(args.auto_batch_max))
+    max_batch = min(max(1, int(args.auto_batch_max)), CANONICAL_MAX_BATCH)
     manifest_doc_count = int(getattr(args, "_manifest_doc_count", 0))
     if manifest_doc_count <= 0:
         raise RuntimeError("manifest document count must be set before batch calibration")
