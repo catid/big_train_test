@@ -1,3 +1,4 @@
+import math
 import re
 import copy
 from dataclasses import dataclass, field
@@ -257,6 +258,17 @@ class Isotropic(nn.Module):
         # streams, batch, length, width] activation bank.  Keeping per-source
         # stream lists preserves the exact MSAR equations while removing that
         # peak allocation and making larger microbatches feasible.
+        # The recurrent loop intentionally presents the newest source twice:
+        # once as the retained block-boundary stream and once as the current
+        # state. Those are the same tensor at layer 0 and immediately after
+        # each boundary. Two identical logits are equivalent to one source
+        # whose logit is shifted by log(2), so collapse the duplicate before
+        # convolution/normalization and restore its exact routing weight with
+        # that bias. This preserves the original function and its gradients
+        # while removing one complete MSAR source branch.
+        duplicate_last = len(sources) >= 2 and sources[-1] is sources[-2]
+        if duplicate_last:
+            sources = sources[:-1]
         query = self.msar_queries[layer_idx].float()
         if cu_seqlens is None:
             # Padded graph training has no document boundaries to reset. Fold
@@ -279,7 +291,10 @@ class Isotropic(nn.Module):
                     torch.einsum("n...d,d->n...", normed, query[stream_index])
                     / (self.d_model**0.5)
                 )
-            weights = torch.softmax(torch.stack(source_scores, dim=1), dim=0)
+            score_bank = torch.stack(source_scores, dim=1)
+            if duplicate_last:
+                score_bank[-1].add_(math.log(2.0))
+            weights = torch.softmax(score_bank, dim=0)
             retrieved_streams = [
                 (weights[:, stream_index].unsqueeze(-1) * stream_bank).sum(dim=0)
                 for stream_index, stream_bank in enumerate(stream_banks)
@@ -304,7 +319,10 @@ class Isotropic(nn.Module):
                 )
                 source_streams.append(stream_bank)
                 source_scores.append(scores)
-            weights = torch.softmax(torch.stack(source_scores, dim=0), dim=0)
+            score_bank = torch.stack(source_scores, dim=0)
+            if duplicate_last:
+                score_bank[-1].add_(math.log(2.0))
+            weights = torch.softmax(score_bank, dim=0)
             retrieved_streams = []
             for stream_index in range(len(self.msar_kernels)):
                 retrieved_streams.append(
