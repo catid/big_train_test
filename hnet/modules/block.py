@@ -18,8 +18,8 @@ class Mamba3Wrapper(Mamba3):
     Mamba-3's public ``forward`` path calls its low-level ``step`` with a
     ``(B, L, D)`` tensor during cached decode, while the fused Cute kernel
     expects ``(B, D)``.  H-Net also owns the per-layer cache container and
-    advances the outer sequence offset.  This adapter keeps those contracts
-    explicit and has no Mamba-2 compatibility path.
+    advances the outer sequence offset. This adapter keeps those contracts
+    explicit and exposes only the Mamba-3 implementation.
     """
 
     supports_activation_checkpointing = False
