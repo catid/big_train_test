@@ -113,6 +113,13 @@ optimizer and module-local FP8 scaling tensors before measuring the next
 candidate; TE's global registration state remains intact. Power is aggregated
 by the maximum rank draw, so the selected batch is safe for every GPU.
 
+When CUDA-graph capture preserves six direct DDP reducer storages, gradient
+clipping uses the native foreach norm over those storages and scales them in
+place. A full B14 parity run matched the ordinary parameter-wise clip exactly;
+the complete eight-rank timing reduced the clipping phase from about 15.1 ms
+to 1.8 ms and measured 1.767 s per steady step (32,448 tokens/s/GPU). Graph
+replay remains the dominant cost, so this is a small step-level gain.
+
 The run's `loss` field is the plain byte cross-entropy. The combined FBT,
 router, and MoE objective is logged separately as `objective`; `--target-ce`
 (default 4.0) records the first step that reaches the requested CE target.

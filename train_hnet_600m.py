@@ -971,6 +971,25 @@ def read_power_watts(device_index=None):
         return []
 
 
+@torch.no_grad()
+def _clip_direct_ddp_storage(buckets, max_norm: float = 1.0):
+    """Clip gradients in validated contiguous DDP reducer storage."""
+    if not buckets:
+        raise ValueError("direct DDP clipping requires at least one storage bucket")
+    # Match clip_grad_norm_'s foreach path and native dtype rounding. Casting
+    # BF16 buckets to FP32 changes the clip coefficient at model scale.
+    norms = torch.stack(torch._foreach_norm(list(buckets), 2.0))
+    total_norm = torch.linalg.vector_norm(norms, ord=2)
+    clip_coef = torch.clamp(
+        torch.as_tensor(max_norm, dtype=total_norm.dtype, device=total_norm.device)
+        / (total_norm + 1e-6),
+        max=1.0,
+    )
+    for bucket in buckets:
+        bucket.mul_(clip_coef.to(dtype=bucket.dtype))
+    return total_norm
+
+
 def _average_gradients_by_dtype(parameters, world, device, buckets=None):
     """Average gradients with one flat NCCL reduction per parameter dtype.
 
@@ -1898,7 +1917,10 @@ def main():
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.
             loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if graph_step is not None and graph_step._ddp_direct_storage:
+            grad_norm = _clip_direct_ddp_storage(graph_step._ddp_storage_buckets, 1.0)
+        else:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         finite_local = torch.isfinite(loss) & torch.isfinite(grad_norm)
         # A single rank with an invalid batch must not advance its optimizer
         # while the other DDP ranks do.  Reduce the finite flag before any
