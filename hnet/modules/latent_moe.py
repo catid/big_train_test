@@ -173,6 +173,7 @@ class LatentMoE(nn.Module):
         self.router = nn.Linear(d_model, num_experts, bias=False, **factory)
         self.down = nn.Linear(d_model, self.latent_dim, bias=bias, **factory)
         self.up = nn.Linear(self.latent_dim, d_model, bias=bias, **factory)
+        self.grouped_experts = None
         self.experts = nn.ModuleList(
             _ExpertMLP(self.latent_dim, self.routed_intermediate, bias=bias,
                        device=device, dtype=dtype, fp8=fp8)
@@ -185,6 +186,11 @@ class LatentMoE(nn.Module):
         self.register_buffer("last_aux_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_z_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self._shared_stream: Optional[torch.cuda.Stream] = None
+        # CUDA graph training sets this on all MoE modules before warmup so
+        # autograd never retains dependencies on an uncaptured side stream.
+        # Eager training leaves it false to overlap the shared expert with
+        # routing and the selected experts.
+        self.disable_async_shared = False
 
     def _fp8_context(self):
         if not self.fp8:
@@ -233,15 +239,68 @@ class LatentMoE(nn.Module):
         sorted_experts = expert_ids[order]
         sorted_tokens = token_ids[order]
         sorted_weights = slot_weights[order]
-        counts = torch.bincount(sorted_experts, minlength=self.num_experts)
-        start = 0
+        capturing = latent.is_cuda and torch.cuda.is_current_stream_capturing()
+        if not capturing:
+            # Eager execution can use the exact variable-size dispatch.  This
+            # avoids padding work and, unlike a fixed-capacity graph buffer,
+            # never drops assignments when the router is temporarily skewed.
+            counts = torch.bincount(sorted_experts, minlength=self.num_experts)
+            result = torch.zeros_like(latent, dtype=torch.float32)
+            start = 0
+            with self._fp8_context():
+                for expert_id, count in enumerate(counts.tolist()):
+                    end = start + count
+                    if count:
+                        out = self.experts[expert_id](latent[sorted_tokens[start:end]])
+                        result.index_add_(
+                            0,
+                            sorted_tokens[start:end],
+                            out.float() * sorted_weights[start:end, None],
+                        )
+                    start = end
+            return result
+        # Keep routing entirely on-device. ``torch.bincount`` and converting
+        # its result to Python integers are forbidden during CUDA graph
+        # capture.  The fixed-size histogram below has static shape and uses
+        # only capture-safe tensor operations.
+        counts = torch.zeros(
+            (self.num_experts,), dtype=torch.int64, device=latent.device
+        )
+        counts.scatter_add_(
+            0, expert_ids,
+            torch.ones_like(expert_ids, dtype=torch.int64),
+        )
+        # Give every expert a fixed, alignment-padded segment.  The segment
+        # count depends only on the static activation shape, never on routing
+        # data, so this remains valid during CUDA graph capture.
+        align = 8 if self.fp8 else 1
+        slots = sorted_experts.numel()
+        # Graph capture has no variable-shape allocation.  Reserve the exact
+        # worst-case capacity (all top-k assignments may select one expert) so
+        # no routing assignment is silently dropped.
+        capacity = ((latent.shape[0] + align - 1) // align) * align
+        expert_starts = counts.cumsum(0) - counts
+        ranks = torch.arange(slots, device=latent.device, dtype=torch.int64)
+        ranks = ranks - expert_starts.index_select(0, sorted_experts)
+        destinations = sorted_experts * capacity + ranks
+        packed = latent.new_zeros((self.num_experts * capacity, latent.shape[-1]))
+        values = latent.index_select(0, sorted_tokens)
+        packed.index_copy_(0, destinations, values)
         with self._fp8_context():
-            for expert_id, count in enumerate(counts.tolist()):
-                end = start + count
-                if count:
-                    out = self.experts[expert_id](latent[sorted_tokens[start:end]])
-                    result.index_add_(0, sorted_tokens[start:end], out.float() * sorted_weights[start:end, None])
-                start = end
+            if self.grouped_experts is not None:
+                # The pinned TE GroupedLinear implementation converts dynamic
+                # split metadata to a host tuple and is therefore not
+                # graph-capturable.  Production uses the fixed expert loop
+                # below until TE's graph-safe grouped op is enabled.
+                raise RuntimeError("GroupedLinear dispatch is not graph-safe in the pinned TE")
+            packed_out = torch.empty_like(packed)
+            for expert_id in range(self.num_experts):
+                start = expert_id * capacity
+                packed_out[start : start + capacity] = self.experts[expert_id](
+                    packed[start : start + capacity]
+                )
+            selected = packed_out.index_select(0, destinations)
+        result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
         return result
 
     def _shared_forward(self, x: Tensor) -> Tensor:
@@ -257,7 +316,12 @@ class LatentMoE(nn.Module):
         event = None
         # Shared expert is independent of routing. Launch it on a separate CUDA
         # stream so router latency is hidden; event ordering keeps autograd safe.
-        if flat.is_cuda:
+        # CUDA graph capture cannot import an event recorded on a stream that
+        # was not itself captured.  Keep the eager latency-hiding stream, but
+        # execute the shared expert on the capture stream so graph replay has
+        # no cross-capture dependency.
+        capture = flat.is_cuda and torch.cuda.is_current_stream_capturing()
+        if flat.is_cuda and not capture and not self.disable_async_shared:
             if self._shared_stream is None or self._shared_stream.device != flat.device:
                 self._shared_stream = torch.cuda.Stream(device=flat.device)
             stream = self._shared_stream
