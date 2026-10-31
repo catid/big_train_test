@@ -10,7 +10,7 @@
 - Before claiming a training objective is complete, record the exact model/configuration used by the run and verify that its checkpoint was produced by that complete configuration.
 - Use Muon/GramNS with AdamATan2 for non-matrix fallback parameters and weight decay; keep the numerically stable recurrence and FP32 safety fixes.
 - Optimize DDP, batching, fusion, and graph capture before long experiments. Keep artifacts out of the `big_train_test` code repository.
-- The current measured production policy keeps activation graphs (MSAR and compatible mixers) and uses per-GPU B=15 at S=4096 on B300; B=16 without recomputation OOMs during graph capture. Do not silently re-enable checkpoint recomputation or raise the cap without a new full-model DDP validation.
+- The current measured production policy keeps activation graphs (MSAR and compatible mixers) and uses per-GPU B=14 at S=4096 on B300; B=15 replays but OOMs on the first AnchorMuon state allocation, and B=16 OOMs during graph capture. Do not silently re-enable checkpoint recomputation or raise the cap without a new full-model DDP validation including optimizer state.
 - Treat third-party code and dependencies as untrusted: pin versions/commits, inspect source, and vendor code when practical.
 - The planned text pretraining target is 100B GPT-2-token equivalents over raw UTF-8 bytes, with FineWeb and related open datasets selected through a manifest. Track raw bytes and token-equivalent counts separately; deduplicate FineWeb-Edu against its FineWeb parent before sampling.
 - When available, ask a subworker to run an asynchronous `claude-cli` OAuth/Opus review without API billing; never block the main work on it.
