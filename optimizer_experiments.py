@@ -1039,7 +1039,14 @@ class AnchorMuon(torch.optim.Optimizer):
     def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
         beta_m = float(group["momentum"])
         entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        fallback_count = 0
+        # Matrix groups also contain skinny controls (norms, biases, router
+        # scales) that use AdamATan2.  Keep them out of the matrix bucket
+        # collection while gathering them so they can take the same batched
+        # foreach fallback path as a dedicated fallback group.  The previous
+        # implementation updated these tensors immediately, one tensor at a
+        # time, which left the canonical mixed group with the old launch-heavy
+        # optimizer tail.
+        fallback_params: list[torch.Tensor] = []
         for p in group["params"]:
             grad = p.grad
             if grad is None:
@@ -1052,19 +1059,23 @@ class AnchorMuon(torch.optim.Optimizer):
             if getattr(p, "_force_fallback", False) or not _is_matrix_like_parameter(
                 grad, min_matrix_dim=int(group.get("min_matrix_dim", 32))
             ):
-                fallback_count += self._step_fallback_param(
-                    p, group, lr=float(group.get("fallback_lr", lr)), t=t
-                )
+                fallback_params.append(p)
                 continue
             anchor = self._soda_anchor(p)
             source, grad_matrix = self._pre_matrix_source(p, grad, beta_m)
             entries.append((p, anchor, source, grad_matrix))
 
         if not entries:
+            fallback_stats = self._step_fallback_params(
+                fallback_params,
+                group,
+                lr=float(group.get("fallback_lr", lr)),
+                t=t,
+            )
             return {
                 "matrix_count": 0.0,
-                "fallback_count": float(fallback_count),
-                "soda_weight": float(self._soda_weight(t)),
+                "fallback_count": float(fallback_stats["fallback_count"]),
+                "soda_weight": float(fallback_stats["soda_weight"]),
             }
 
         buckets: dict[tuple[torch.device, torch.Size], list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]] = defaultdict(list)
@@ -1090,9 +1101,16 @@ class AnchorMuon(torch.optim.Optimizer):
                     soda_weight=soda_weight,
                 )
 
+        fallback_stats = self._step_fallback_params(
+            fallback_params,
+            group,
+            lr=float(group.get("fallback_lr", lr)),
+            t=t,
+        )
+
         return {
             "matrix_count": float(matrix_count),
-            "fallback_count": float(fallback_count),
+            "fallback_count": float(fallback_stats["fallback_count"]),
             "soda_weight": float(soda_weight),
         }
 
@@ -1150,6 +1168,16 @@ class AnchorMuon(torch.optim.Optimizer):
         return 1
 
     def _step_fallback_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
+        return self._step_fallback_params(group["params"], group, lr=lr, t=t)
+
+    def _step_fallback_params(
+        self,
+        params: Iterable[torch.Tensor],
+        group: dict[str, Any],
+        *,
+        lr: float,
+        t: int,
+    ) -> dict[str, float]:
         # AdamATan2 is used by a large collection of skinny controls (biases,
         # norms, router scales).  The old scalar loop launched every pointwise
         # operation once per tensor.  Group equal-shape tensors and use
@@ -1157,7 +1185,7 @@ class AnchorMuon(torch.optim.Optimizer):
         # update; atan2 remains one operation per tensor on PyTorch versions
         # that do not expose a foreach atan2 kernel.
         buckets: dict[tuple[torch.device, torch.dtype, torch.Size, bool], list[torch.Tensor]] = defaultdict(list)
-        for p in group["params"]:
+        for p in params:
             if p.grad is None:
                 continue
             key = (
