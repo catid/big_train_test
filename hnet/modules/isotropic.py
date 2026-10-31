@@ -264,7 +264,7 @@ class Isotropic(nn.Module):
             )
         return streams
 
-    def _msar_mix(self, sources, layer_idx, cu_seqlens=None):
+    def _msar_mix(self, sources, layer_idx, cu_seqlens=None, stream_cache=None):
         # Build and reduce one source at a time.  The former implementation
         # stacked every source and every kernel stream before normalization,
         # which briefly kept both BF16 and FP32 copies of a full [sources,
@@ -283,11 +283,45 @@ class Isotropic(nn.Module):
         if duplicate_last:
             sources = sources[:-1]
         query = self.msar_queries[layer_idx].float()
+        # Within one recurrent MSAR pass, the source bank is unchanged until
+        # the next configured boundary.  ``msar_block_size`` is four in the
+        # canonical model, so recomputing the lag convolutions independently
+        # for each layer needlessly repeats the same three grouped kernels.
+        # Cache only for the duration of this forward pass: the cache holds
+        # autograd-connected tensors and must never survive into a later
+        # minibatch.  Tensor identities are stable while ``sources`` is live,
+        # and using them avoids value-dependent host reads during graph
+        # capture/replay.  The packed path is cached too; its reset-aware
+        # shifts are pure functions of the same source bank and cu_seqlens.
+        stream_banks = None
         if cu_seqlens is None:
             # Padded graph training has no document boundaries to reset. Fold
             # source identity into grouped-convolution channels, reducing the
             # three lag convolutions from 3*N launches to three per MSAR call.
-            stream_banks = self._msar_expand_batched(sources)
+            if stream_cache is None:
+                stream_banks = self._msar_expand_batched(sources)
+            else:
+                # The newest current-state source changes every layer, so a
+                # cache key for the complete source list would almost never
+                # hit. Cache each source bank independently instead. Each new
+                # source pays one grouped-convolution call; subsequent layers
+                # reuse that bank while preserving the exact source ordering.
+                source_banks = []
+                for source in sources:
+                    source_key = id(source)
+                    stream_bank = stream_cache.get(source_key)
+                    if stream_bank is None:
+                        stream_bank = self._msar_expand_batched([source])
+                        stream_cache[source_key] = stream_bank
+                    source_banks.append(stream_bank)
+                # Restore the original grouped layout [stream, source, ...]
+                # for the score/retrieval equations.  The concatenations are
+                # small views of already-computed banks; the expensive lag
+                # convolutions are no longer repeated for every layer.
+                stream_banks = [
+                    torch.cat([bank[stream_idx] for bank in source_banks], dim=0)
+                    for stream_idx in range(len(self.msar_kernels))
+                ]
             source_scores = []
             for stream_index, stream_bank in enumerate(stream_banks):
                 # Use PyTorch's fused RMS normalization kernel.  The former
@@ -313,24 +347,45 @@ class Isotropic(nn.Module):
                 for stream_index, stream_bank in enumerate(stream_banks)
             ]
         else:
-            source_streams = []
-            source_scores = []
-            for source in sources:
-                streams = [source]
-                for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
-                    streams.append(
-                        self._msar_expand(
-                            source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+            if stream_cache is None:
+                stream_banks = []
+                for source in sources:
+                    streams = [source]
+                    for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                        streams.append(
+                            self._msar_expand(
+                                source, kernel, self.msar_conv[kernel_idx], cu_seqlens
+                            )
                         )
-                    )
-                stream_bank = torch.stack(streams, dim=0)
+                    stream_banks.append(torch.stack(streams, dim=0))
+            else:
+                stream_banks = []
+                for source in sources:
+                    source_key = id(source)
+                    stream_bank = stream_cache.get(source_key)
+                    if stream_bank is None:
+                        streams = [source]
+                        for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
+                            streams.append(
+                                self._msar_expand(
+                                    source,
+                                    kernel,
+                                    self.msar_conv[kernel_idx],
+                                    cu_seqlens,
+                                )
+                            )
+                        stream_bank = torch.stack(streams, dim=0)
+                        stream_cache[source_key] = stream_bank
+                    stream_banks.append(stream_bank)
+            source_streams = stream_banks
+            source_scores = []
+            for stream_bank in source_streams:
                 stream_f = stream_bank.float()
                 with te_autocast(enabled=False):
                     normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
                 scores = torch.einsum("k...d,kd->k...", normed, query) / (
                     self.d_model**0.5
                 )
-                source_streams.append(stream_bank)
                 source_scores.append(scores)
             score_bank = torch.stack(source_scores, dim=0)
             if duplicate_last:
@@ -368,14 +423,27 @@ class Isotropic(nn.Module):
             )
         return fused.to(sources[-1].dtype)
 
-    def _msar_mix_recompute(self, sources, layer_idx, cu_seqlens=None):
+    def _msar_mix_recompute(
+        self, sources, layer_idx, cu_seqlens=None, stream_cache=None
+    ):
         """Run MSAR with backward recomputation to bound activation memory."""
         if not self.training or not self.msar_checkpointing:
-            return self._msar_mix(sources, layer_idx, cu_seqlens=cu_seqlens)
+            return self._msar_mix(
+                sources,
+                layer_idx,
+                cu_seqlens=cu_seqlens,
+                stream_cache=stream_cache,
+            )
 
         def run(*source_tensors):
             return self._msar_mix(
-                list(source_tensors), layer_idx, cu_seqlens=cu_seqlens
+                list(source_tensors),
+                layer_idx,
+                cu_seqlens=cu_seqlens,
+                # Checkpoint recomputation must rebuild the stream bank under
+                # grad; reusing tensors created by the no-grad checkpoint
+                # forward would silently drop their derivative.
+                stream_cache=None,
             )
 
         return activation_checkpoint(
@@ -711,10 +779,16 @@ class Isotropic(nn.Module):
                     msar_state = hidden_states
                     msar_sources = [hidden_states]
                     msar_stream_outputs = [hidden_states]
+                    # Expanded lag streams are reused by all layers until the
+                    # next MSAR boundary adds a new source.  Keep this cache
+                    # local to one loop/forward so autograd graphs from a
+                    # previous minibatch are never retained.
+                    msar_stream_cache = {}
                     for layer_idx, (layer, arch) in enumerate(zip(self.layers, self.arch_full)):
                         layer_input = self._msar_mix_recompute(
                             msar_sources + [msar_state], layer_idx,
                             cu_seqlens=cu_seqlens if packed else None,
+                            stream_cache=msar_stream_cache,
                         )
                         if arch in ("m", "M") and layer_input.dim() == 2:
                             layer_input = layer_input.unsqueeze(0)
