@@ -234,6 +234,11 @@ class LatentMoE(nn.Module):
         self._aux_loss_count = 0
         self._z_loss = None
         self._shared_stream = None
+        # ``expert_starts`` depends only on the static grouped-GEMM capacity.
+        # Cache it per device/capacity so every MoE invocation does not launch
+        # a tiny arange/multiply pair (there are 20 routed blocks and two FBT
+        # passes in the canonical model).
+        self._expert_starts_cache = {}
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -510,12 +515,18 @@ class LatentMoE(nn.Module):
         # routing map, so this remains a fixed-shape, CUDA-graph-safe tensor
         # computation (the values may vary on each replay).
         counts = routing_map.sum(dim=0, dtype=torch.int64)
-        prefix_counts = torch.cat(
-            [torch.zeros(1, dtype=torch.int64, device=flat.device), torch.cumsum(counts, dim=0)[:-1]]
-        )
-        expert_starts = torch.arange(
-            self.num_experts, dtype=torch.int64, device=flat.device
-        ) * capacity
+        # Inclusive cumsum minus the current count is the exclusive prefix.
+        # This avoids the tiny ``cat([zeros, cumsum[:-1]])`` allocation and
+        # copy on every routed layer while preserving int64 offsets expected
+        # by TE's graph-safe permutation primitive.
+        prefix_counts = torch.cumsum(counts, dim=0) - counts
+        starts_key = (flat.device.type, flat.device.index, capacity)
+        expert_starts = self._expert_starts_cache.get(starts_key)
+        if expert_starts is None:
+            expert_starts = torch.arange(
+                self.num_experts, dtype=torch.int64, device=flat.device
+            ) * capacity
+            self._expert_starts_cache[starts_key] = expert_starts
         pad_offsets = expert_starts - prefix_counts
         latent = self.down(flat)
         dispatched, row_id_map, permuted_probs = self.fused_router.permute(
