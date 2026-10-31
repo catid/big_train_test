@@ -239,6 +239,7 @@ class LatentMoE(nn.Module):
         # a tiny arange/multiply pair (there are 20 routed blocks and two FBT
         # passes in the canonical model).
         self._expert_starts_cache = {}
+        self._sequence_ids_cache = {}
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -408,9 +409,18 @@ class LatentMoE(nn.Module):
         if x.dim() >= 3 and not decode:
             num_sequences = x.shape[0]
             tokens_per_sequence = x.shape[1]
-            sequence_ids_flat = torch.arange(
-                num_sequences, device=flat.device, dtype=torch.long
-            ).repeat_interleave(tokens_per_sequence)
+            sequence_key = (
+                flat.device.type,
+                flat.device.index,
+                int(num_sequences),
+                int(tokens_per_sequence),
+            )
+            sequence_ids_flat = self._sequence_ids_cache.get(sequence_key)
+            if sequence_ids_flat is None:
+                sequence_ids_flat = torch.arange(
+                    num_sequences, device=flat.device, dtype=torch.long
+                ).repeat_interleave(tokens_per_sequence)
+                self._sequence_ids_cache[sequence_key] = sequence_ids_flat
         elif sequence_ids is None:
             num_sequences = 1
             tokens_per_sequence = n_tokens
