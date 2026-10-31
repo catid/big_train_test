@@ -316,10 +316,29 @@ class LatentMoE(nn.Module):
         token_ids = torch.arange(latent.shape[0], device=latent.device).repeat_interleave(self.top_k)
         expert_ids = indices.reshape(-1)
         slot_weights = weights.reshape(-1).float()
-        order = torch.argsort(expert_ids)
-        sorted_experts = expert_ids[order]
-        sorted_tokens = token_ids[order]
-        sorted_weights = slot_weights[order]
+        # The pinned TE checkout provides a graph-safe fused index-map
+        # permutation. It replaces the Python-visible argsort/index-select
+        # sequence while preserving the exact token order and autograd path.
+        # Non-FP8 experiments retain the tensor-only reference ordering.
+        permuted_latent = None
+        if latent.is_cuda and self.grouped_experts is not None:
+            import transformer_engine.pytorch as te
+
+            permuted_latent, row_id_map = te.moe_permute(
+                latent,
+                indices.to(dtype=torch.int32),
+                int(expert_ids.numel()),
+                map_type="index",
+            )
+            order = row_id_map.to(dtype=torch.int64)
+            sorted_experts = expert_ids.index_select(0, order)
+            sorted_tokens = order // self.top_k
+            sorted_weights = slot_weights.index_select(0, order)
+        else:
+            order = torch.argsort(expert_ids)
+            sorted_experts = expert_ids[order]
+            sorted_tokens = token_ids[order]
+            sorted_weights = slot_weights[order]
         capturing = latent.is_cuda and torch.cuda.is_current_stream_capturing()
         if not capturing:
             # Eager execution can use the exact variable-size dispatch.  This
@@ -359,7 +378,12 @@ class LatentMoE(nn.Module):
                 0, sorted_experts
             ) + ranks
             packed = latent.new_zeros((total, latent.shape[-1]))
-            packed.index_copy_(0, destinations, latent.index_select(0, sorted_tokens))
+            packed.index_copy_(
+                0,
+                destinations,
+                permuted_latent if permuted_latent is not None
+                else latent.index_select(0, sorted_tokens),
+            )
             # Populate the graph-capacity metadata during eager warmup.  The
             # exact variable-size metadata remains used for this eager call.
             if self.grouped_experts is not None:
@@ -399,7 +423,11 @@ class LatentMoE(nn.Module):
         ranks = ranks - expert_starts.index_select(0, sorted_experts)
         destinations = sorted_experts * capacity + ranks
         packed = latent.new_zeros((self.num_experts * capacity, latent.shape[-1]))
-        values = latent.index_select(0, sorted_tokens)
+        values = (
+            permuted_latent
+            if permuted_latent is not None
+            else latent.index_select(0, sorted_tokens)
+        )
         packed.index_copy_(0, destinations, values)
         context = self._fp8_context() if fp8_context else nullcontext()
         with context:
