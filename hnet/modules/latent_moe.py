@@ -285,7 +285,10 @@ class LatentMoE(nn.Module):
     def z_loss(self):
         if self._z_loss is None:
             return self.router.weight.new_zeros((), dtype=torch.float32)
-        return self._z_loss
+        # Match aux_loss: recurrent loops and FBT invoke the same router
+        # several times per model forward.  Average all calls so the z-loss
+        # coefficient is independent of loop/pass count.
+        return self._z_loss / max(1, self._aux_loss_count)
 
     def _shared(self, x):
         y, gate = self.shared_fc1(x).chunk(2, dim=-1)
@@ -357,7 +360,11 @@ class LatentMoE(nn.Module):
         probs, fused_routing_map = self.fused_router(logits)
         # Keep the router z regularizer in FP32, alongside the load-balancing
         # term. This prevents large logits from destabilizing FP8 expert GEMMs.
-        self._z_loss = 1e-3 * torch.logsumexp(logits, dim=-1).square().mean()
+        current_z_loss = 1e-3 * torch.logsumexp(logits, dim=-1).square().mean()
+        if self._z_loss is None:
+            self._z_loss = current_z_loss
+        else:
+            self._z_loss = self._z_loss + current_z_loss
         # Convert the dense boolean route map once.  Reusing this int32 map
         # for expert selection and the capacity/auxiliary paths avoids a
         # second bool->int64 conversion on every routed invocation.
