@@ -584,11 +584,15 @@ class Isotropic(nn.Module):
                     {"cu_seqlens": cu_seqlens, "max_seqlen": max_seqlen}
                 )
                 ssm_mixer_kwargs.update(
-                    {"seq_idx": get_seq_idx(
-                        cu_seqlens,
-                        device=hidden_states.device,
-                        total_length=hidden_states.shape[0],
-                    )}
+                    {
+                        "seq_idx": get_seq_idx(
+                            cu_seqlens,
+                            device=hidden_states.device,
+                            total_length=hidden_states.shape[0],
+                        ),
+                        "cu_seqlens": cu_seqlens,
+                        "max_seqlen": max_seqlen,
+                    }
                 )
                 packed = True
                 mask = None
@@ -643,7 +647,11 @@ class Isotropic(nn.Module):
                             if hidden_states.dim() == 2
                             else hidden_states.shape[1]
                         ),
-                    )
+                        ),
+                    # Mamba-3's varlen kernel resets recurrent state from
+                    # cu_seqlens; seq_idx is not consumed by that kernel.
+                    "cu_seqlens": cu_seqlens.int(),
+                    "max_seqlen": max_seqlen,
                 }
             )
             packed = True
