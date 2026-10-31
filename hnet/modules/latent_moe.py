@@ -585,9 +585,11 @@ class LatentMoE(nn.Module):
             restore_shape=latent.shape,
             pad_offsets=pad_offsets,
         )
-        # Accumulate the routed result before the latent up projection in FP32;
-        # only the residual-width output is converted back to model dtype.
-        routed = self.up(routed_latent.float().to(dtype=flat.dtype))
+        # ``routed_latent`` already has the model activation dtype produced by
+        # the grouped expert GEMM.  Feeding it directly to the BF16 up
+        # projection avoids an otherwise redundant BF16->FP32->BF16 pair of
+        # full-token copies on every routed layer.
+        routed = self.up(routed_latent)
         if shared_event is not None:
             current_stream = torch.cuda.current_stream(flat.device)
             current_stream.wait_event(shared_event)
