@@ -62,7 +62,8 @@ class HNetConfig:
     static_chunking: bool = True
     # Maximum number of learned latent boundaries retained by one chunking
     # stage.  The tensor remains statically sized for CUDA graphs; when the
-    # router emits more boundaries, its highest-probability boundaries win.
+    # router emits more boundaries, the earliest causal boundaries are kept
+    # so a future byte cannot change an earlier latent decision.
     chunk_capacity_tokens: int = 512
     # Recompute MSAR retrieval during backward. MSAR is the largest retained
     # activation bank in the 600M model; this bounds memory without changing
