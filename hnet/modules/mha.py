@@ -411,7 +411,21 @@ class CausalMHA(nn.Module):
                 x, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen,
                 seqlen_offset=seqlen_offset,
             )
-            if inference_params is None and self.te_attn is not None:
+            # The pinned TE DPA kernel rejects a one-token THD call.  A
+            # singleton latent is valid when the learned chunker emits only
+            # its mandatory first boundary, so keep this shape on the fused
+            # FlashAttention varlen path instead of manufacturing a second
+            # latent or reading a device length on the host.
+            singleton_packed = (
+                inference_params is None
+                and cu_seqlens is not None
+                and int(max_seqlen) == 1
+            )
+            if singleton_packed:
+                context = self.inner_attn.forward_vha(
+                    q, k, v, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+                )
+            elif inference_params is None and self.te_attn is not None:
                 context = self.te_attn(
                     query_layer=q, key_layer=k, value_layer=v,
                     qkv_format="bshd" if cu_seqlens is None else "thd",
@@ -457,7 +471,20 @@ class CausalMHA(nn.Module):
                 #     qkv, seqlen_offset=seqlen_offset, max_seqlen=rotary_max_seqlen
                 # )
                 qkv = self.rotary_emb(qkv, seqlen_offset=seqlen_offset, **kwargs)
-            if inference_params is None and self.te_attn is not None:
+                singleton_packed = (
+                    inference_params is None
+                    and cu_seqlens is not None
+                    and int(max_seqlen) == 1
+                )
+            else:
+                singleton_packed = (
+                    inference_params is None
+                    and cu_seqlens is not None
+                    and int(max_seqlen) == 1
+                )
+            if singleton_packed:
+                context = self.inner_attn.forward(qkv, **kwargs)
+            elif inference_params is None and self.te_attn is not None:
                 # TE's patched DPA selects its CroissAttn backward correction
                 # under the delayed-scaling FP8 recipe.  Keep the packed and
                 # padded layouts explicit so no reference BF16 bmm is used.

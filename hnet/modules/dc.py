@@ -345,7 +345,7 @@ class DeChunkLayer(nn.Module):
         super().__init__()
         self.d_model = d_model
 
-        # Just for Mamba2 kernel.
+            # State-space dechunk path for the fused Mamba-3 kernel.
         self.dtype = dtype
         self.block_size = block_size
         self.headdim = headdim
@@ -400,7 +400,8 @@ class DeChunkLayer(nn.Module):
             )  # (B, M)
 
         original_dtype = hidden_states.dtype
-        # Reuse Mamba2 kernel for EMA Deaggregator.
+        # Reuse the fused Mamba-3-compatible state-space path for EMA
+        # deaggregation.
         dt = torch.log(1 / (1 - p)).to(self.dtype)
         x = (hidden_states / dt[..., None]).to(self.dtype)
         A = -torch.ones(

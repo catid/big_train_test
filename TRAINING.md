@@ -3,19 +3,18 @@
 `train_hnet_600m.py` is the canonical run. It reads a versioned document
 manifest over an immutable raw UTF-8 byte payload, uses the frozen 256-row byte
 code (zero trainable embedding parameters), and
-trains `M4 -> (S3T1)×5 -> M4` with learned routing. Each group starts with
-three sliding-window attention (SWA) layers and ends with one full-attention
-(FA) layer; the first layer is SWA. MSAR remains in the innermost stack,
+trains `S2M3 -> (S3T1)×5 -> S2M3` with learned routing. Each outer group is S2M3: two 128-token sliding-window attention (SWA)
+layers followed by three Mamba-3 layers. The middle stack is (S3T1)×5:
+three SWA layers followed by one global full-attention (FA) layer, repeated five times. MSAR remains in the innermost stack,
 two shared-weight inner executions, chunk-level FBT feedback, FP32 CE/router
 losses, AnchorMuon/GramNS plus its AdamATan2 fallback, weight decay, and DDP.
-The production SWA width is 128 tokens;
-three SWA layers still provide a stacked receptive span above the 4096-byte
-training context before each global FA layer.
+The production SWA width is 128 tokens; the outer stacks do not use FA or
+MSAR because they preserve the byte/chunk boundary interfaces.
 SWA uses 48 rotary dimensions; global FA is NoPE. The stage configuration keeps
 the first (Mamba-only) entry at zero and applies the 48-dimension RoPE only to
 the `S` layers, so FA never allocates or rotates a positional cache.
 
-The public Cartesia posts support the outer Mamba-2 `M4` stacks and the causal
+The public Cartesia posts support the outer state-space stacks and the causal
 adjacent-state router used here. They describe 1024-token SWA in encoder and
 decoder Transformer blocks, while the exact unreleased 2026 internal 600M
 configuration is unspecified. The 128-token SWA width and 3:1 SWA/FA schedule
@@ -108,13 +107,17 @@ The run's `loss` field is the plain byte cross-entropy. The combined FBT,
 router, and MoE objective is logged separately as `objective`; `--target-ce`
 (default 4.0) records the first step that reaches the requested CE target.
 
-The selected FFN path uses a Mixtral/DeepSeek-style sparse layer from the
-BioNeMo `mixtral_native_te` design: eight stacked routed experts with top-1
-dispatch (1:8 active routed sparsity), plus one always-on shared SwiGLU expert.
-Each routed expert has intermediate width 512, so the eight routed experts
-have the same aggregate parameter count as the dense width 4096 FFN; the
-shared expert adds a narrow 256-wide common path. This keeps the direct model
-near 600M parameters (the shared path adds about 22M weights across the FA/SWA blocks).
+The selected FFN path uses LatentMoE (arXiv:2601.18089) with the BioNeMo
+`mixtral_native_te` grouped dispatch design: eight stacked routed experts with
+top-1 dispatch (1:8 active routed sparsity), plus one always-on full-width
+shared expert. For the 1536-wide middle stack, LatentMoE uses a fixed 384-wide
+latent path (`d/4`), 1664 neurons per routed expert, and 512 neurons in the
+shared expert. The down/up projections and widened latent experts preserve the
+former dense width-4096 SwiGLU parameter budget while increasing total expert
+capacity; the model has 603,935,652 trainable parameters. Router logits,
+probabilities, auxiliary loss, and routed accumulation remain FP32 around FP8
+GEMMs, and the shared expert runs concurrently with routing on a CUDA side
+stream with explicit event ordering.
 Dispatch uses fixed per-expert capacity and grouped tensor contractions. The
 router auxiliary loss is accumulated in FP32. The chunker keeps a fixed padded
 bound during graph replay; selected boundaries are left-aligned and trailing
@@ -139,7 +142,7 @@ Transformer Engine FP8 covers every attention projection, the global FA DPA
 shared/router projection, and the FBT feedback projections. SWA keeps its
 fused FlashAttention product path while its QKV/output projections remain TE
 FP8.
-The fixed byte lift, fused Mamba-2 state-space kernel, causal router's Q/K
+The fixed byte lift, fused Mamba-3 state-space kernel, causal router's Q/K
 boundary scores, routing boundary residual projection, RMSNorms, and FP32
 language-model head remain explicitly higher precision for their fixed-code or
 numerical-stability contracts; these are deliberate precision boundaries, not

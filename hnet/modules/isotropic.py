@@ -317,7 +317,12 @@ class Isotropic(nn.Module):
                 active_mask=active_mask,
             )
 
-        if self.training and self.mamba_checkpointing and inference_params is None:
+        if (
+            self.training
+            and self.mamba_checkpointing
+            and inference_params is None
+            and bool(getattr(layer.mixer, "supports_activation_checkpointing", True))
+        ):
             if residual is None:
                 return activation_checkpoint(
                     lambda h: run(h, None),
@@ -686,7 +691,7 @@ class Isotropic(nn.Module):
                             hidden_states = hidden_states.squeeze(0)
                             residual = None if residual is None else residual.squeeze(0)
                     else:
-                        # Currently supporting only Mamba2 and MHA
+                        # Currently supporting Mamba-3 and MHA
                         raise NotImplementedError
                     if arch in ("m", "M"):
                         hidden_states, residual = self._run_mamba_block(
@@ -809,8 +814,8 @@ class Isotropic(nn.Module):
             inference_params.seqlen_offset += 1
             return hidden_states
         if self.loop_count > 1 and any(arch in ("m", "M") for arch in self.arch_full):
-            # Mamba2Wrapper owns one recurrent state per layer; unlike
-            # CausalMHA it does not allocate loop-indexed state slots.
+            # Mamba-3 owns one recurrent state per layer; unlike CausalMHA it
+            # does not allocate loop-indexed state slots.
             raise RuntimeError(
                 "inner recurrent loops with Mamba require per-loop SSM state; "
                 "use attention-only inner blocks"

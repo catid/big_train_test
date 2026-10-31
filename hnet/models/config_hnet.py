@@ -87,9 +87,9 @@ class HNetConfig:
 
     def validate_canonical(self) -> None:
         """Reject partial or ablation configurations at model construction."""
-        expected_layout = ["m4", ["S3T1S3T1S3T1S3T1S3T1"], "m4"]
+        expected_layout = ["s2m3", ["S3T1S3T1S3T1S3T1S3T1"], "s2m3"]
         if self.arch_layout != expected_layout:
-            raise ValueError("the canonical model requires the M4/(S3T1)x5/M4 layout")
+            raise ValueError("the canonical model requires the S2M3/(S3T1)x5/S2M3 layout")
         if self.d_model != [1024, 1536] or self.d_intermediate != [0, 4096]:
             raise ValueError("the canonical model requires d_model=[1024,1536] and d_intermediate=[0,4096]")
         if self.vocab_size != 256:
@@ -124,38 +124,37 @@ class HNetConfig:
             raise ValueError("the canonical model requires 128-token SWA and global FA")
         if self.attn_cfg.num_heads != [16, 16]:
             raise ValueError("the canonical model requires 16 attention heads per stage")
-        # The middle stack uses RoPE only on local SWA.  Global FA uses NoPE
-        # so its long-range logits are not tied to a rotary phase.  The first
-        # stage is Mamba-only; its zero entry keeps the stage mapping explicit.
-        if self.attn_cfg.rotary_emb_dim != [0, 48]:
+        # Both outer SWA and middle SWA use RoPE. Global FA uses NoPE so its
+        # long-range logits are not tied to a rotary phase.
+        if self.attn_cfg.rotary_emb_dim != [48, 48]:
             raise ValueError(
-                "the canonical model requires stage rotary dimensions [0, 48]; "
-                "SWA applies the 48-dim RoPE and FA applies NoPE"
+                "the canonical model requires stage rotary dimensions [48, 48]; "
+                "SWA applies 48-dim RoPE and FA applies NoPE"
             )
         if self.attn_cfg.croissattn_aux != [False, True]:
             raise ValueError(
                 "the canonical model enables patched CroissAttn only on the global FA stage"
             )
         if (
-            int(self.ssm_cfg.chunk_size) != 256
+            int(self.ssm_cfg.chunk_size) != 64
             or int(self.ssm_cfg.d_conv) != 4
             or int(self.ssm_cfg.d_state) != 128
             or int(self.ssm_cfg.expand) != 2
         ):
             raise ValueError(
-                "the canonical model requires SSM settings chunk_size=256, d_conv=4, "
+                "the canonical Mamba-3 model requires SSM settings chunk_size=64, d_conv=4, "
                 "d_state=128, expand=2"
             )
         if (
-            int(self.moe_expert_intermediate) != 512
-            or int(self.moe_shared_intermediate) != 256
+            int(self.moe_expert_intermediate) != 1664
+            or int(self.moe_shared_intermediate) != 512
             or float(self.moe_capacity_factor) != 1.25
             or float(self.moe_aux_loss_weight) != 0.01
             or int(self.moe_capacity_tokens)
             != min(int(self.max_seq_len), int(self.chunk_capacity_tokens))
         ):
             raise ValueError(
-                "the canonical model requires 512-wide routed experts, a 256-wide shared "
+                "the canonical model requires 1664-wide routed experts, a 512-wide shared "
                 "expert, capacity_factor=1.25, aux_loss_weight=0.01, and capacity sized "
                 "to the latent chunk bound"
             )

@@ -532,7 +532,7 @@ def _dependency_provenance() -> dict:
     """Record the installed Python environment used by a checkpoint.
 
     Binary hashes below identify the loaded CUDA extensions, but the Python
-    distribution metadata also matters: a different FlashAttention, Mamba, or
+    distribution metadata also matters: a different FlashAttention, Mamba-3, or
     causal-conv wrapper can select a different ABI or call convention while
     leaving the extension filename unchanged.  Keep the complete normalized
     ``pip freeze`` text and a digest of each required distribution's METADATA.
@@ -552,7 +552,16 @@ def _dependency_provenance() -> dict:
         raise RuntimeError("pip freeze returned an empty dependency manifest")
 
     distributions = {}
-    for requested_name in ("flash-attn", "mamba-ssm", "causal-conv1d"):
+    # Mamba-3's CuteDSL decode wrapper calls the TVM FFI kwargs adapter with
+    # ``map_dataclass_to_tuple``.  Include the adapter in checkpoint
+    # provenance so a resume cannot silently pick an ABI-incompatible 0.1.9
+    # installation (which fails only when the first cached decode compiles).
+    for requested_name in (
+        "flash-attn",
+        "mamba-ssm",
+        "causal-conv1d",
+        "apache-tvm-ffi",
+    ):
         try:
             distribution = importlib.metadata.distribution(requested_name)
         except importlib.metadata.PackageNotFoundError as exc:
@@ -664,7 +673,7 @@ def _runtime_provenance(
         # Record the concrete MoE routing operators used by the canonical
         # trainer.  This prevents a run log from being mistaken for a fused
         # route when only the downstream graph-safe permutation was fused.
-        "moe_router": "hnet.modules.mlp.FusedTokenRouter",
+        "moe_router": "hnet.modules.latent_moe.FusedTokenRouter",
         "moe_router_kernel": (
             "transformer_engine.pytorch.router.fused_compute_score_for_moe_aux_loss"
         ),

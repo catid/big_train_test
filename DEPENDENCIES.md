@@ -7,7 +7,11 @@ floating Git revisions during a training run.
 - PyTorch 2.10.x with the installed CUDA 13.x build
 - Triton 3.6.0
 - FlashAttention 2.8.3.post2 (source-built for this CUDA/Python runtime)
-- Mamba-SSM 2.3.2.post1 (source-built for this CUDA/Python runtime)
+- Mamba-SSM 2.3.2.post1 (source-built for this CUDA/Python runtime; canonical
+  outer stacks use its fused Mamba-3 SISO kernels and CuteDSL decode kernel)
+- apache-tvm-ffi 0.1.11 (the minimum release that supports the
+  `map_dataclass_to_tuple` wrapper used by the Mamba-3 CuteDSL decode path;
+  0.1.9 is ABI-incompatible with nvidia-cutlass-dsl 4.8.1)
 - causal-conv1d 1.7.0
 - einops, optree, regex, omegaconf
 - Transformer Engine from `/home/catid/fp8/TransformerEngine` at commit

@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from hnet.te import TEGroupedLinear, make_linear, te
+from hnet.te import TEGroupedLinear, make_linear, te, graph_capture_enabled
 from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss
 
 
@@ -13,7 +13,7 @@ class FusedTokenRouter(nn.Module):
     """Own the complete TE top-1 routing and dispatch boundary.
 
     TE computes the FP32 softmax scores and the discrete routing map in one
-    CUDA operation.  Capacity remains in :class:`SparseMoESwiGLU` because the
+    CUDA operation.  Capacity remains in :class:`LatentMoE` because the
     model applies causal per-sequence capacity, whereas the generic TE router
     only sees the flattened token stream.  The resulting fixed-capacity map is
     dispatched and restored through this object as well, so callers cannot
@@ -26,6 +26,7 @@ class FusedTokenRouter(nn.Module):
             raise ValueError("FusedTokenRouter currently requires top_k=1")
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
+        self.num_shared_experts = 1
 
     def forward(self, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if not logits.is_cuda:
@@ -133,16 +134,17 @@ class FusedTokenRouter(nn.Module):
         )
 
 
-class SparseMoESwiGLU(nn.Module):
-    """Static-shape top-1 sparse SwiGLU with a DeepSeek-style shared expert.
+class LatentMoE(nn.Module):
+    """Static-shape LatentMoE with eight routed experts and one shared expert.
 
-    The router dispatches each token to one of ``num_experts`` routed FFNs;
-    the shared FFN is evaluated for every token and added through a learned
-    sigmoid gate.  Dispatch uses a fixed capacity tensor and grouped
-    ``einsum`` operations, so it remains CUDA-graph friendly and avoids the
-    Python-side per-expert loops used by reference MoE implementations.  The
-    fixed capacity is also the same contract used by the BioNeMo Mixtral TE
-    recipe (per-expert padding before grouped GEMM).
+    Following arXiv:2601.18089, the router reads the full residual width, then
+    a shared down projection maps routed tokens to ``d_model / 4``. The routed
+    expert width is increased to 1664 so the complete layer stays parameter matched;
+    eight experts therefore carry more total neurons than the dense FFN.
+    routed experts and their grouped GEMMs operate only in that latent width;
+    an up projection restores the residual width before adding the full-width
+    shared expert. Dispatch uses a fixed capacity tensor and TE grouped GEMM,
+    so it remains CUDA-graph friendly and avoids Python permutation paths.
 
     This module intentionally supports top-1 routing only.  ``1:8`` means one
     of eight routed experts is active for each token; enabling top-2 would
@@ -167,19 +169,26 @@ class SparseMoESwiGLU(nn.Module):
     ):
         super().__init__()
         if top_k != 1:
-            raise ValueError("SparseMoESwiGLU requires moe_top_k=1 for 1:8 sparsity")
-        if num_experts < 2:
-            raise ValueError("SparseMoESwiGLU requires at least two routed experts")
+            raise ValueError("LatentMoE requires moe_top_k=1 for 1:8 sparsity")
+        if num_experts != 8:
+            raise ValueError("LatentMoE requires exactly eight routed experts")
         if capacity_factor < 1.0:
             raise ValueError("moe_capacity_factor must be >= 1.0")
-        # Split the dense FFN width across experts.  Configs can override the
-        # rounded width, while retaining a DeepSeek-like narrow shared path.
-        expert_intermediate = int(expert_intermediate or max(1, d_intermediate // num_experts))
-        shared_intermediate = int(shared_intermediate or expert_intermediate)
+        # Canonical widths are explicit. The d/4 latent matrices reduce each
+        # routed FFN matrix, so 1664-wide experts preserve the prior layer
+        # parameter budget while increasing total expert neurons.
+        if int(expert_intermediate) <= 0 or int(shared_intermediate) <= 0:
+            raise ValueError("LatentMoE requires explicit routed/shared intermediate widths")
+        expert_intermediate = int(expert_intermediate)
+        shared_intermediate = int(shared_intermediate)
         expert_intermediate = (expert_intermediate + multiple_of - 1) // multiple_of * multiple_of
         shared_intermediate = (shared_intermediate + multiple_of - 1) // multiple_of * multiple_of
         factory_kwargs = {"device": device, "dtype": dtype}
         self.d_model = int(d_model)
+        self.latent_alpha = 4
+        if self.d_model % self.latent_alpha:
+            raise ValueError("LatentMoE d_model must be divisible by latent_alpha=4")
+        self.latent_dim = self.d_model // self.latent_alpha
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
         self.expert_intermediate = expert_intermediate
@@ -190,14 +199,22 @@ class SparseMoESwiGLU(nn.Module):
             raise ValueError("capacity_tokens must be non-negative")
         self.aux_loss_weight = float(aux_loss_weight)
 
-        # [E, 2I, D] and [E, D, I] are consumed as one grouped GEMM via
+        # W_down/W_up are shared by all experts. Their FP8 GEMMs are kept in
+        # the same TE autocast region as the grouped expert projections.
+        self.down = make_linear(
+            d_model, self.latent_dim, bias=bias, **factory_kwargs
+        )
+        self.up = make_linear(
+            self.latent_dim, d_model, bias=bias, **factory_kwargs
+        )
+        # [E, 2I, latent] and [E, latent, I] are consumed as one grouped GEMM via
         # einsum.  The layout mirrors TE GroupedLinear's stacked experts.
         self.experts_fc1 = TEGroupedLinear(
-            self.num_experts, d_model, 2 * expert_intermediate, bias=bias,
+            self.num_experts, self.latent_dim, 2 * expert_intermediate, bias=bias,
             params_dtype=dtype, device=device, use_grouped_tensor=True,
         )
         self.experts_fc2 = TEGroupedLinear(
-            self.num_experts, expert_intermediate, d_model, bias=bias,
+            self.num_experts, expert_intermediate, self.latent_dim, bias=bias,
             params_dtype=dtype, device=device, use_grouped_tensor=True,
         )
         self.shared_fc1 = make_linear(d_model, 2 * shared_intermediate, bias=bias, **factory_kwargs)
@@ -206,7 +223,8 @@ class SparseMoESwiGLU(nn.Module):
         # projection in BF16/FP32 even inside an enclosing FP8 expert region so
         # quantization noise cannot flip near-tied top-1 assignments.
         self.router = make_linear(
-            d_model, self.num_experts, bias=False, fp8=False, **factory_kwargs
+            d_model, self.num_experts, bias=False, fp8=False,
+            device=device, dtype=torch.float32,
         )
         self.fused_router = FusedTokenRouter(self.num_experts, self.top_k)
         self.shared_gate = make_linear(
@@ -214,6 +232,8 @@ class SparseMoESwiGLU(nn.Module):
         )
         self._aux_loss = None
         self._aux_loss_count = 0
+        self._z_loss = None
+        self._shared_stream = None
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -253,6 +273,13 @@ class SparseMoESwiGLU(nn.Module):
         """Clear per-forward routing statistics before a new model call."""
         self._aux_loss = None
         self._aux_loss_count = 0
+        self._z_loss = None
+
+    @property
+    def z_loss(self):
+        if self._z_loss is None:
+            return self.router.weight.new_zeros((), dtype=torch.float32)
+        return self._z_loss
 
     def _shared(self, x):
         y, gate = self.shared_fc1(x).chunk(2, dim=-1)
@@ -272,6 +299,25 @@ class SparseMoESwiGLU(nn.Module):
     ):
         shape = x.shape
         flat = x.reshape(-1, self.d_model)
+        shared_result = None
+        shared_event = None
+        shared_stream = None
+        if flat.is_cuda and not graph_capture_enabled():
+            current_stream = torch.cuda.current_stream(flat.device)
+            if self._shared_stream is None or self._shared_stream.device != flat.device:
+                self._shared_stream = torch.cuda.Stream(device=flat.device)
+            shared_stream = self._shared_stream
+            # Ensure the side stream sees all writes that produced ``flat``.
+            shared_stream.wait_stream(current_stream)
+            with torch.cuda.stream(shared_stream):
+                shared_result = self._shared(flat)
+                shared_event = torch.cuda.Event()
+                shared_event.record(shared_stream)
+            # ``flat`` and the side-stream result participate in autograd on
+            # the current stream after the event below.
+            flat.record_stream(shared_stream)
+        else:
+            shared_result = self._shared(flat)
         if active_mask is None:
             active = torch.ones(flat.shape[0], device=flat.device, dtype=torch.bool)
         else:
@@ -295,11 +341,17 @@ class SparseMoESwiGLU(nn.Module):
                 raise IndexError(f"MoE loop index {loop_idx} is outside route counter state")
             if not (0 <= int(layer_idx) < route_counts.shape[1]):
                 raise IndexError(f"MoE layer index {layer_idx} is outside route counter state")
-        logits = self.router(flat)
+        # Keep routing logits and all gate math in FP32.  This is also the
+        # CroissAttn-style safeguard against using a rounded FP8 intermediate
+        # for an auxiliary derivative or top-k decision.
+        logits = self.router(flat.float())
         # TE fuses FP32 score computation and top-1 selection. Capacity is
         # applied below because it is causal per sequence, outside the generic
         # flattened-token router's contract.
         probs, fused_routing_map = self.fused_router(logits)
+        # Keep the router z regularizer in FP32, alongside the load-balancing
+        # term. This prevents large logits from destabilizing FP8 expert GEMMs.
+        self._z_loss = 1e-3 * torch.logsumexp(logits, dim=-1).square().mean()
         expert_idx = fused_routing_map.to(dtype=torch.int64).argmax(dim=-1)
 
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
@@ -309,7 +361,11 @@ class SparseMoESwiGLU(nn.Module):
         active_count = active_f.sum().clamp_min(1.0)
         active_one_hot = fused_routing_map.to(torch.float32)
         active_one_hot = active_one_hot * active_f[:, None]
-        dispatch_fraction = active_one_hot.sum(dim=0) / active_count
+        # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
+        # this normalization explicit so the Switch/GShard term remains
+        # invariant if a future configuration allows top-k > 1 (for the
+        # canonical 1:8 route ``top_k == 1`` and this is a no-op).
+        dispatch_fraction = active_one_hot.sum(dim=0) / (active_count * self.top_k)
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
         current_aux_loss = self.aux_loss_weight * self.num_experts * (
             dispatch_fraction * mean_probs
@@ -461,8 +517,9 @@ class SparseMoESwiGLU(nn.Module):
             self.num_experts, dtype=torch.int64, device=flat.device
         ) * capacity
         pad_offsets = expert_starts - prefix_counts
+        latent = self.down(flat)
         dispatched, row_id_map, permuted_probs = self.fused_router.permute(
-            flat,
+            latent,
             routing_map,
             self.num_experts * capacity,
             routing_probs,
@@ -492,11 +549,18 @@ class SparseMoESwiGLU(nn.Module):
         # unpermute so the custom op receives no narrow [N,1] probability
         # tensor (which older TE builds cannot differentiate correctly).
         expert_out = expert_out * permuted_probs.reshape(-1, 1).to(expert_out.dtype)
-        routed = self.fused_router.unpermute(
+        routed_latent = self.fused_router.unpermute(
             expert_out,
             row_id_map,
-            restore_shape=flat.shape,
+            restore_shape=latent.shape,
             pad_offsets=pad_offsets,
         )
-        out = routed + self._shared(flat)
+        # Accumulate the routed result before the latent up projection in FP32;
+        # only the residual-width output is converted back to model dtype.
+        routed = self.up(routed_latent.float().to(dtype=flat.dtype))
+        if shared_event is not None:
+            current_stream = torch.cuda.current_stream(flat.device)
+            current_stream.wait_event(shared_event)
+            shared_result.record_stream(current_stream)
+        out = routed + shared_result
         return out.view(shape)

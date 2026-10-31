@@ -1,10 +1,10 @@
 {
-    "arch_layout": ["m4", ["S3T1S3T1S3T1S3T1S3T1"], "m4"],
+    "arch_layout": ["s2m3", ["S3T1S3T1S3T1S3T1S3T1"], "s2m3"],
     "d_model": [1024, 1536],
     "d_intermediate": [0, 4096],
     "vocab_size": 256,
     "ssm_cfg": {
-        "chunk_size": 256,
+        "chunk_size": 64,
         "d_conv": 4,
         "d_state": 128,
         "expand": 2
@@ -12,7 +12,7 @@
     "attn_cfg": {
         "num_heads": [16, 16],
         "num_kv_heads": [2, 2],
-        "rotary_emb_dim": [0, 48],
+        "rotary_emb_dim": [48, 48],
         "window_size": [128, -1],
         "croissattn_aux": [false, true],
         "vha_enabled": true,
@@ -35,8 +35,8 @@
     "moe_enabled": true,
     "moe_num_experts": 8,
     "moe_top_k": 1,
-    "moe_expert_intermediate": 512,
-    "moe_shared_intermediate": 256,
+    "moe_expert_intermediate": 1664,
+    "moe_shared_intermediate": 512,
     "moe_capacity_factor": 1.25,
     "moe_capacity_tokens": 512,
     "moe_aux_loss_weight": 0.01

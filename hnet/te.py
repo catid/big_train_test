@@ -264,7 +264,7 @@ def set_graph_capture(enabled: bool) -> None:
         # Delayed scaling is intentionally left on TE's split-quantize path:
         # this pinned build has no delayed native grouped quantizer.  Replace
         # only its host ``m_splits.tolist()`` conversion with a tuple supplied
-        # by H-Net's fixed-capacity router (see SparseMoESwiGLU).  The GEMM
+        # by H-Net's fixed-capacity router (see LatentMoE).  The GEMM
         # itself remains TE's fused grouped operation and no device-to-host
         # read occurs during capture.
         def graph_safe_eager(inp, m_splits, fwd_args, weights_and_biases, is_grad_enabled):

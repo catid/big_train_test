@@ -6,50 +6,77 @@ from typing import Optional
 from torch import nn, Tensor
 
 from flash_attn.ops.triton.layer_norm import RMSNorm
-from mamba_ssm.modules.mamba2 import Mamba2
+from mamba_ssm.modules.mamba3 import Mamba3
 
 from .mha import CausalMHA
-from .mlp import SparseMoESwiGLU
+from .latent_moe import LatentMoE
 
 
-class Mamba2Wrapper(Mamba2):
+class Mamba3Wrapper(Mamba3):
+    """Mamba-3 with H-Net's cache and block-step interface.
+
+    Mamba-3's public ``forward`` path calls its low-level ``step`` with a
+    ``(B, L, D)`` tensor during cached decode, while the fused Cute kernel
+    expects ``(B, D)``.  H-Net also owns the per-layer cache container and
+    advances the outer sequence offset.  This adapter keeps those contracts
+    explicit and has no Mamba-2 compatibility path.
     """
-    Mamba2 wrapper class that has the same inference interface as the CausalMHA class.
-    """
 
-    def step(self, hidden_states, conv_state_or_inference, ssm_state=None):
-        """Support Mamba's native cache call and H-Net's cache interface.
+    supports_activation_checkpointing = False
 
-        ``Mamba2.forward`` calls ``self.step(u, conv_state, ssm_state)`` once
-        its cache offset is nonzero, while :class:`Block` calls the mixer as
-        ``step(x, inference_params)``.  The old two-argument override treated
-        the former convolution tensor as an H-Net cache object and raised a
-        ``TypeError`` during outer-stack decode.
-        """
+    def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
+        if inference_params is not None and inference_params.seqlen_offset > 0:
+            if u.ndim != 3 or u.shape[1] != 1:
+                raise ValueError("Mamba-3 cached decode requires a single token")
+            return self.step(u, inference_params)
+        return super().forward(
+            u,
+            seq_idx=seq_idx,
+            cu_seqlens=cu_seqlens,
+            inference_params=inference_params,
+        )
+
+    def step(self, hidden_states, inference_or_angle, ssm_state=None,
+              k_state=None, v_state=None):
+        # The native Mamba-3 call shape is retained for its forward helper;
+        # H-Net's Block calls the two-argument cache form.
         if ssm_state is not None:
-            return super().step(
-                hidden_states, conv_state_or_inference, ssm_state
+            u = hidden_states[:, 0] if hidden_states.ndim == 3 else hidden_states
+            out, angle, state, key, value = super().step(
+                u, inference_or_angle, ssm_state, k_state, v_state
+            )
+            return (
+                (out.unsqueeze(1) if hidden_states.ndim == 3 else out),
+                angle,
+                state,
+                key,
+                value,
             )
 
-        inference_params = conv_state_or_inference
+        inference_params = inference_or_angle
+        if hidden_states.ndim == 3:
+            if hidden_states.shape[1] != 1:
+                raise ValueError("Mamba-3 cached decode requires a single token")
+            u = hidden_states[:, 0]
+        else:
+            u = hidden_states
         try:
-            conv_state, ssm_state = inference_params.key_value_memory_dict[
+            angle, state, key, value = inference_params.key_value_memory_dict[
                 self.layer_idx
             ]
         except (AttributeError, KeyError) as exc:
             raise RuntimeError(
-                f"missing Mamba cache for layer {self.layer_idx}; "
+                f"missing Mamba-3 cache for layer {self.layer_idx}; "
                 "allocate the complete canonical inference cache"
             ) from exc
-        result, conv_state, ssm_state = super().step(
-            hidden_states, conv_state, ssm_state
+        out, next_angle, next_state, next_key, next_value = super().step(
+            u, angle, state, key, value
         )
-
-        # Update the state cache in-place so repeated H-Net decode calls
-        # observe the same state objects allocated during prefill.
-        inference_params.key_value_memory_dict[self.layer_idx][0].copy_(conv_state)
-        inference_params.key_value_memory_dict[self.layer_idx][1].copy_(ssm_state)
-        return result
+        angle.copy_(next_angle)
+        state.copy_(next_state)
+        key.copy_(next_key)
+        value.copy_(next_value)
+        return out.unsqueeze(1)
 
 
 def create_block(
@@ -73,8 +100,13 @@ def create_block(
             CausalMHA, **attn_cfg, **factory_kwargs, layer_idx=layer_idx
         )
     elif arch in ("m", "M"):
+        mamba_cfg = dict(ssm_cfg)
+        # Mamba-3's fused SISO path is tuned for 64-token chunks.  Its
+        # constructor absorbs the legacy d_conv field, which is not part of
+        # Mamba-3's recurrence.
+        mamba_cfg["chunk_size"] = 64
         mixer_cls = partial(
-            Mamba2Wrapper, **ssm_cfg, **factory_kwargs, layer_idx=layer_idx
+            Mamba3Wrapper, **mamba_cfg, **factory_kwargs, layer_idx=layer_idx
         )
     else:
         raise NotImplementedError
@@ -86,7 +118,7 @@ def create_block(
                 "uppercase H-Net layers require the configured sparse MoE/shared expert"
             )
         mlp_cls = partial(
-            SparseMoESwiGLU,
+            LatentMoE,
             d_intermediate=d_intermediate,
             num_experts=int(getattr(moe_cfg, "moe_num_experts", 8)),
             top_k=int(getattr(moe_cfg, "moe_top_k", 1)),
