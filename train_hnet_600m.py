@@ -119,6 +119,11 @@ def parse_args():
 
 def _validate_schedule_args(args):
     """Validate the canonical warmup + WSqD schedule parameters."""
+    if int(args.seq) != 4096:
+        raise ValueError(
+            "the canonical full-system trainer requires --seq=4096; "
+            "shorter sequence shapes are unsupported"
+        )
     if int(args.warmup) < 0:
         raise ValueError("warmup must be non-negative")
     if not (0.0 < float(args.lr_decay_fraction) < 1.0):
@@ -1600,12 +1605,9 @@ def main():
     # rank-aware deterministic partition.
     torch.manual_seed(1729)
     cfg = load_config()
-    cfg.max_seq_len = args.seq
-    # The fixed-capacity MoE contract follows the actual static graph bound.
-    # Keep short diagnostic sequences shape-consistent without changing the
-    # canonical architecture or allowing eager/graph routing semantics to
-    # diverge.
-    cfg.moe_capacity_tokens = min(args.seq, cfg.chunk_capacity_tokens)
+    # The canonical configuration already fixes max_seq_len=4096 and the
+    # corresponding 512-latent MoE capacity.  Keep those values immutable so
+    # a production run cannot quietly become a shorter partial model.
     cfg.validate_canonical()
     minimum_ratio_target = float(args.seq) / float(cfg.chunk_capacity_tokens)
     if float(args.ratio_target) < minimum_ratio_target:
