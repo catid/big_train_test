@@ -157,8 +157,18 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         feedback_logits = [
             self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden[:-1]
         ]
-        moe_losses = [m.aux_loss for m in self.backbone.modules()
-                      if getattr(m, "aux_loss", None) is not None]
+        # The router's z-loss is part of the same FP32 routing regularizer as
+        # load balancing.  Keep it attached to the returned objective; merely
+        # storing it on LatentMoE leaves the computed term dead during training.
+        moe_losses = []
+        for module in self.backbone.modules():
+            aux_loss = getattr(module, "aux_loss", None)
+            if aux_loss is None:
+                continue
+            z_loss = getattr(module, "z_loss", None)
+            if z_loss is not None:
+                aux_loss = aux_loss + z_loss.to(dtype=aux_loss.dtype)
+            moe_losses.append(aux_loss)
         moe_aux_loss = torch.stack(moe_losses).mean() if moe_losses else None
         return CausalLMOutput(
             logits=logits,

@@ -777,10 +777,11 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
                 "resume learning-rate schedule mismatch: "
                 f"checkpoint={saved_schedule!r}, current={expected_schedule!r}"
             )
-        # Preserve the checkpoint's original WSqD horizon when a caller asks
-        # to continue for additional steps. This keeps cooldown monotonic and
-        # avoids a learning-rate jump at the resume boundary.
-        args._lr_horizon_steps = saved_horizon
+        # Keep the original horizon for an ordinary resume, but extend it to
+        # the requested endpoint when a run is deliberately continued.  Using
+        # the old horizon after it has elapsed would make every extension step
+        # receive the cooldown's exact zero scale.
+        args._lr_horizon_steps = max(saved_horizon, int(args.steps))
     saved_cfg = checkpoint.get("config_signature")
     if saved_cfg is None:
         # Older checkpoints stored ``vars(cfg)``.  It is still useful to
@@ -990,14 +991,13 @@ def _clip_direct_ddp_storage(buckets, max_norm: float = 1.0):
     return total_norm
 
 
-def _average_gradients_by_dtype(parameters, world, device, buckets=None):
-    """Average gradients with one flat NCCL reduction per parameter dtype.
+def _pack_gradients_by_dtype(parameters, device, buckets=None):
+    """Pack gradients into persistent flat dtype buckets without collectives.
 
-    Calibration runs outside the captured graph but must measure the same
-    communication shape as production DDP replay. Reducing each parameter
-    separately creates hundreds of tiny NCCL launches and overstates the
-    steady-state step time. The returned bucket state keeps the flat buffers
-    allocated across calibration iterations.
+    Keeping packing separate from the NCCL calls lets calibration put a
+    synchronized OOM gate around every allocation.  A rank that runs out of
+    memory while building a bucket must not leave healthy ranks entering an
+    all-reduce that it can never reach.
     """
     if buckets is None:
         buckets = {
@@ -1032,6 +1032,16 @@ def _average_gradients_by_dtype(parameters, world, device, buckets=None):
             else:
                 view.copy_(parameter.grad.detach().reshape(-1))
             offset += count
+    return buckets
+
+
+def _reduce_packed_gradients_by_dtype(buckets, world):
+    """Average already-packed gradients with one flat NCCL reduction per dtype."""
+    for bucket in buckets.values():
+        params = bucket["params"]
+        if not params:
+            continue
+        flat = bucket["buffer"]
         dist.all_reduce(flat, op=dist.ReduceOp.SUM)
         flat.div_(float(world))
         offset = 0
@@ -1043,6 +1053,19 @@ def _average_gradients_by_dtype(parameters, world, device, buckets=None):
             else:
                 parameter.grad.copy_(view)
             offset += count
+
+
+def _average_gradients_by_dtype(parameters, world, device, buckets=None):
+    """Average gradients with one flat NCCL reduction per parameter dtype.
+
+    Calibration runs outside the captured graph but must measure the same
+    communication shape as production DDP replay. Reducing each parameter
+    separately creates hundreds of tiny NCCL launches and overstates the
+    steady-state step time. The returned bucket state keeps the flat buffers
+    allocated across calibration iterations.
+    """
+    buckets = _pack_gradients_by_dtype(parameters, device, buckets)
+    _reduce_packed_gradients_by_dtype(buckets, world)
     return buckets
 
 
@@ -1183,20 +1206,51 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                             f"non-finite calibration update at candidate batch {candidate}"
                         )
                     if world > 1:
-                        # After every rank passes the OOM gate, explicitly
-                        # average gradients so this remains a complete DDP
-                        # optimizer step for power measurement.  Use the same
-                        # two flat dtype buckets as graph replay rather than
-                        # hundreds of per-parameter NCCL collectives.
-                        calibration_grad_buckets = _average_gradients_by_dtype(
-                            probe_model.parameters(),
-                            world,
-                            device,
-                            calibration_grad_buckets,
+                        # Packing is separate from the NCCL calls so an OOM
+                        # while allocating a flat bucket is reported by every
+                        # rank before any healthy rank enters all_reduce.
+                        pack_oom = False
+                        try:
+                            calibration_grad_buckets = _pack_gradients_by_dtype(
+                                probe_model.parameters(), device, calibration_grad_buckets
+                            )
+                        except RuntimeError as exc:
+                            if "out of memory" not in str(exc).lower():
+                                raise
+                            pack_oom = True
+                            torch.cuda.empty_cache()
+                        pack_flag = torch.tensor(
+                            [int(pack_oom)], device=device, dtype=torch.int32
                         )
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        probe_model.parameters(), 1.0
+                        dist.all_reduce(pack_flag, op=dist.ReduceOp.MAX)
+                        if bool(pack_flag.item()):
+                            oom = True
+                            break
+                        # All ranks have now proved that their packed buffers
+                        # exist, so no rank can strand the others before this
+                        # collective because of a local allocation failure.
+                        _reduce_packed_gradients_by_dtype(
+                            calibration_grad_buckets, world
+                        )
+                    clip_oom = False
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            probe_model.parameters(), 1.0
+                        )
+                    except RuntimeError as exc:
+                        if "out of memory" not in str(exc).lower():
+                            raise
+                        clip_oom = True
+                        grad_norm = torch.zeros((), device=device)
+                        torch.cuda.empty_cache()
+                    clip_flag = torch.tensor(
+                        [int(clip_oom)], device=device, dtype=torch.int32
                     )
+                    if world > 1:
+                        dist.all_reduce(clip_flag, op=dist.ReduceOp.MAX)
+                    if bool(clip_flag.item()):
+                        oom = True
+                        break
                     finite_grad_flag = torch.isfinite(grad_norm).to(dtype=torch.int32)
                     if world > 1:
                         dist.all_reduce(finite_grad_flag, op=dist.ReduceOp.MIN)
@@ -1204,8 +1258,25 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                         raise FloatingPointError(
                             f"non-finite calibration gradient at candidate batch {candidate}"
                         )
-                    optimizer.step()
-                    torch.cuda.synchronize(device)
+                    step_oom = False
+                    try:
+                        optimizer.step()
+                        # Surface asynchronous allocation failures before the
+                        # rank reaches the shared stage gate.
+                        torch.cuda.synchronize(device)
+                    except RuntimeError as exc:
+                        if "out of memory" not in str(exc).lower():
+                            raise
+                        step_oom = True
+                        torch.cuda.empty_cache()
+                    step_flag = torch.tensor(
+                        [int(step_oom)], device=device, dtype=torch.int32
+                    )
+                    if world > 1:
+                        dist.all_reduce(step_flag, op=dist.ReduceOp.MAX)
+                    if bool(step_flag.item()):
+                        oom = True
+                        break
                     if iteration >= 2:
                         power_device = (
                             device.index
