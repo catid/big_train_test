@@ -17,7 +17,7 @@ from hnet.modules.block import create_block
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
-from hnet.te import fp8_context, graph_capture_enabled
+from hnet.te import fp8_context, graph_capture_enabled, te_autocast
 
 
 @dataclass
@@ -270,7 +270,10 @@ class Isotropic(nn.Module):
                 # multiply profile; rms_norm has the same FP32 equation but
                 # performs the reduction and scale in one kernel.
                 stream_f = stream_bank.float()
-                normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
+                # TE's surrounding FP8 autocast otherwise downcasts this
+                # explicitly FP32 normalization before the FP32 router dot.
+                with te_autocast(enabled=False):
+                    normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
                 source_scores.append(
                     torch.einsum("n...d,d->n...", normed, query[stream_index])
                     / (self.d_model**0.5)
@@ -293,7 +296,8 @@ class Isotropic(nn.Module):
                     )
                 stream_bank = torch.stack(streams, dim=0)
                 stream_f = stream_bank.float()
-                normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
+                with te_autocast(enabled=False):
+                    normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
                 scores = torch.einsum("k...d,kd->k...", normed, query) / (
                     self.d_model**0.5
                 )
@@ -479,7 +483,8 @@ class Isotropic(nn.Module):
                 per_kernel.append(value)
             streams.append(torch.stack(per_kernel, dim=0))
         stream_sources = torch.stack(streams, dim=0)  # [sources, streams, batch, D]
-        normed = F.rms_norm(stream_sources.float(), (self.d_model,), eps=1e-6)
+        with te_autocast(enabled=False):
+            normed = F.rms_norm(stream_sources.float(), (self.d_model,), eps=1e-6)
         query = self.msar_queries[layer_idx].float()
         scores = torch.einsum("smbd,md->smb", normed, query) / (self.d_model**0.5)
         weights = torch.softmax(scores, dim=0)
