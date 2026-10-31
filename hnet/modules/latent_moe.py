@@ -330,10 +330,25 @@ class LatentMoE(nn.Module):
                 int(expert_ids.numel()),
                 map_type="index",
             )
-            order = row_id_map.to(dtype=torch.int64)
-            sorted_experts = expert_ids.index_select(0, order)
-            sorted_tokens = order // self.top_k
-            sorted_weights = slot_weights.index_select(0, order)
+            # ``row_id_map`` is indexed by the *source* slot (flattened
+            # token/top-k position) and stores that slot's destination row in
+            # ``permuted_latent``.  It is therefore the inverse of the
+            # gather order.  Sort the destination positions to recover the
+            # source slots in the same order as TE's permuted output.  Using
+            # the map directly would route each expert result back to the
+            # wrong token/top-k slot (a causal data leak).
+            # TE stores this map in [top_k, num_tokens] layout, while our
+            # flattened router tensors use [num_tokens, top_k].  Invert the
+            # destination map and transpose the slot indexing before looking
+            # up expert IDs/weights; using ``order // top_k`` would silently
+            # mix tokens whenever top_k > 1.
+            destination = row_id_map.to(dtype=torch.int64)
+            order = torch.argsort(destination)
+            num_tokens = latent.shape[0]
+            source_slots = (order.remainder(num_tokens) * self.top_k) + (order // num_tokens)
+            sorted_experts = expert_ids.index_select(0, source_slots)
+            sorted_tokens = source_slots // self.top_k
+            sorted_weights = slot_weights.index_select(0, source_slots)
         else:
             order = torch.argsort(expert_ids)
             sorted_experts = expert_ids[order]
