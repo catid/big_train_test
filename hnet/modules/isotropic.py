@@ -264,10 +264,13 @@ class Isotropic(nn.Module):
             stream_banks = self._msar_expand_batched(sources)
             source_scores = []
             for stream_index, stream_bank in enumerate(stream_banks):
+                # Use PyTorch's fused RMS normalization kernel.  The former
+                # square/mean/rsqrt/multiply expression launches four large
+                # elementwise kernels per stream and dominated the generic
+                # multiply profile; rms_norm has the same FP32 equation but
+                # performs the reduction and scale in one kernel.
                 stream_f = stream_bank.float()
-                normed = stream_f * torch.rsqrt(
-                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
-                )
+                normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
                 source_scores.append(
                     torch.einsum("n...d,d->n...", normed, query[stream_index])
                     / (self.d_model**0.5)
@@ -290,9 +293,7 @@ class Isotropic(nn.Module):
                     )
                 stream_bank = torch.stack(streams, dim=0)
                 stream_f = stream_bank.float()
-                normed = stream_f * torch.rsqrt(
-                    stream_f.square().mean(dim=-1, keepdim=True).add(1e-6)
-                )
+                normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
                 scores = torch.einsum("k...d,kd->k...", normed, query) / (
                     self.d_model**0.5
                 )
@@ -478,9 +479,7 @@ class Isotropic(nn.Module):
                 per_kernel.append(value)
             streams.append(torch.stack(per_kernel, dim=0))
         stream_sources = torch.stack(streams, dim=0)  # [sources, streams, batch, D]
-        normed = stream_sources.float() * torch.rsqrt(
-            stream_sources.float().square().mean(dim=-1, keepdim=True).add(1e-6)
-        )
+        normed = F.rms_norm(stream_sources.float(), (self.d_model,), eps=1e-6)
         query = self.msar_queries[layer_idx].float()
         scores = torch.einsum("smbd,md->smb", normed, query) / (self.d_model**0.5)
         weights = torch.softmax(scores, dim=0)
