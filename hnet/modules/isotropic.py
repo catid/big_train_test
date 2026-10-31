@@ -542,7 +542,11 @@ class Isotropic(nn.Module):
             # padding, while the active mask zeros padded residual/MLP rows.
             if graph_capture_enabled():
                 active = mask.unsqueeze(-1)
-                hidden_states = hidden_states * active.to(hidden_states.dtype)
+                # The graph contract places all inactive rows after the valid
+                # prefix. Every canonical mixer (Mamba-3, causal SWA/FA,
+                # MSAR) is causal, so trailing rows cannot affect a valid
+                # query. Avoid the full-width mask multiply here; the graph
+                # still retains ``active`` for router/capacity bookkeeping.
             elif (
                 inference_params is None
                 and hidden_states.shape[1] == 1
@@ -696,7 +700,7 @@ class Isotropic(nn.Module):
                                 moe_loop_idx=_loop_idx,
                                 moe_layer_idx=layer_idx,
                             )
-                        if mask is not None:
+                        if mask is not None and not graph_capture_enabled():
                             active_dtype = active.to(msar_out.dtype)
                             msar_out = msar_out * active_dtype
                             if msar_residual is not None:
@@ -766,7 +770,7 @@ class Isotropic(nn.Module):
                             moe_loop_idx=_loop_idx,
                             moe_layer_idx=layer_idx,
                         )
-                    if mask is not None:
+                    if mask is not None and not graph_capture_enabled():
                         active_dtype = active.to(hidden_states.dtype)
                         hidden_states = hidden_states * active_dtype
                         if residual is not None:
