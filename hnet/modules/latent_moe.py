@@ -84,9 +84,19 @@ class _ExpertMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         a, gate = self.fc1(x).chunk(2, dim=-1)
-        # Keep the nonlinear reduction in the input dtype; the caller performs
-        # the routed weighted sum in FP32 before converting back to model dtype.
-        return self.fc2(F.silu(gate) * a)
+        # Center the post-activation features per token.  The activation-bias
+        # study (arXiv:2610.14500) uses this adaptive shift in its scale-up
+        # language-model experiments: it removes the current feature mean
+        # instead of relying on a fixed initialization-time scalar.  Compute
+        # the statistic in FP32 so BF16/FP8 rounding cannot leave a systematic
+        # offset, then return to the TE linear's input dtype.
+        activated = F.silu(gate) * a
+        activated = activated - activated.float().mean(dim=-1, keepdim=True).to(
+            dtype=activated.dtype
+        )
+        # The caller performs the routed weighted sum in FP32 before converting
+        # back to model dtype.
+        return self.fc2(activated)
 
 
 class LatentMoE(nn.Module):
