@@ -1699,11 +1699,30 @@ class CUDAGraphStep:
                 self.graph.replay()
             current_stream.wait_stream(self.capture_stream)
         # Delayed scaling updates are deliberately outside the captured region;
-        # the next replay consumes the histories produced by this one.
-        hnet_te.update_fp8_scaling(forward=True)
-        hnet_te.update_fp8_scaling(forward=False)
-        if self.ddp:
-            self._sync_ddp_grads()
+        # the next replay consumes the histories produced by this one.  Direct
+        # DDP storage uses a fixed, small set of contiguous buckets.  Launch
+        # those NCCL reductions asynchronously before the TE amax reductions:
+        # FP8 scaling only reads/writes TE's amax and scale buffers, so it is
+        # independent of the parameter-gradient buckets and can overlap the
+        # communication.  Wait before returning so clipping and the optimizer
+        # always see averaged gradients.  The conservative flat-buffer path
+        # keeps the original ordering because its host copies are not safely
+        # overlappable with the scaling updates.
+        if self.ddp and self._ddp_direct_storage:
+            pending = [
+                (dist.all_reduce(flat, op=dist.ReduceOp.SUM, async_op=True), flat)
+                for flat in self._ddp_storage_buckets
+            ]
+            hnet_te.update_fp8_scaling(forward=True)
+            hnet_te.update_fp8_scaling(forward=False)
+            for work, flat in pending:
+                work.wait()
+                flat.div_(float(self.world))
+        else:
+            hnet_te.update_fp8_scaling(forward=True)
+            hnet_te.update_fp8_scaling(forward=False)
+            if self.ddp:
+                self._sync_ddp_grads()
         return self.loss, self.metrics
 
     def _sync_ddp_grads(self):
