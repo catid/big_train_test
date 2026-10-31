@@ -11,7 +11,6 @@ corrections.
 
 from __future__ import annotations
 
-import math
 from contextlib import nullcontext
 from typing import Optional
 
@@ -29,7 +28,7 @@ def matched_expert_width(
     dense_intermediate: int,
     *,
     num_experts: int = 8,
-    latent_alpha: int = 2,
+        latent_alpha: int = 2,
     multiple: int = 64,
 ) -> int:
     """Return a shared hidden width under the dense SwiGLU budget.
