@@ -1313,7 +1313,7 @@ class AnchorMuon(torch.optim.Optimizer):
         exp_avg = []
         masters = []
         anchors = []
-        grads = []
+        grad_inputs = []
         states = []
         active_params = []
         for p in params:
@@ -1337,12 +1337,23 @@ class AnchorMuon(torch.optim.Optimizer):
             exp_avg.append(first)
             masters.append(self._master_param(p))
             anchors.append(self._soda_anchor(p))
-            grads.append(grad.detach().to(torch.float32))
+            # Defer BF16/FP32 conversion until the complete equal-shape
+            # fallback bucket is collected.  A single stacked foreach copy
+            # replaces one allocator and conversion launch per tensor while
+            # preserving the exact per-tensor conversion values.
+            grad_inputs.append(grad.detach())
             states.append(state)
             active_params.append(p)
 
         if not states:
             return 0
+        grad_stack = torch.empty(
+            (len(grad_inputs), *grad_inputs[0].shape),
+            device=grad_inputs[0].device,
+            dtype=torch.float32,
+        )
+        torch._foreach_copy_(list(grad_stack.unbind(0)), grad_inputs)
+        grads = list(grad_stack.unbind(0))
         torch._foreach_mul_(exp_avg_sq, beta2)
         torch._foreach_addcmul_(exp_avg_sq, grads, grads, value=1.0 - beta2)
         denoms = torch._foreach_div(
