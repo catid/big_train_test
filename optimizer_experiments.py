@@ -1155,7 +1155,13 @@ class AnchorMuon(torch.optim.Optimizer):
                             device=grad.device, dtype=torch.float32
                         )
                     momentums.append(momentum)
-                momentum_stack = torch.stack(momentums, dim=0)
+                # Copy momentum states into a pre-shaped bank.  This mirrors
+                # the direct FP32 gradient-bank path above and avoids the
+                # stack kernel's extra temporary/allocator work.
+                momentum_stack = torch.empty_like(grads)
+                torch._foreach_copy_(
+                    list(momentum_stack.unbind(0)), momentums
+                )
                 momentum_stack.lerp_(grads, 1.0 - beta_m)
                 source_stack = torch.lerp(grads, momentum_stack, beta_m)
                 torch._foreach_copy_(momentums, list(momentum_stack.unbind(0)))
