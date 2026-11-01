@@ -533,3 +533,73 @@ def causal_depthwise_conv1d(x: torch.Tensor, weight: torch.Tensor) -> torch.Tens
 
     return _CausalDepthwiseFunction.apply(x, weight)
 
+
+@triton.jit
+def _msar_gate_forward(
+    start_ptr, output_ptr, residual_ptr, result_ptr, scale_ptr, elements,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < elements
+    start = tl.load(start_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    output = tl.load(output_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    residual = tl.load(residual_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    scale = tl.load(scale_ptr).to(tl.float32)
+    tl.store(result_ptr + offsets, start + (output + residual - start) * scale, mask=mask)
+
+
+@triton.jit
+def _msar_gate_backward(
+    grad_result_ptr, start_ptr, output_ptr, residual_ptr, scale_ptr,
+    grad_start_ptr, grad_output_ptr, grad_residual_ptr, elements,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < elements
+    grad_result = tl.load(grad_result_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    scale = tl.load(scale_ptr).to(tl.float32)
+    grad_output = grad_result * scale
+    tl.store(grad_start_ptr + offsets, grad_result * (1.0 - scale), mask=mask)
+    tl.store(grad_output_ptr + offsets, grad_output, mask=mask)
+    tl.store(grad_residual_ptr + offsets, grad_output, mask=mask)
+
+
+class _MSARGate(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, start, output, residual, scale):
+        if not (start.is_cuda and output.is_cuda and residual.is_cuda and scale.is_cuda):
+            raise RuntimeError("MSAR gate requires CUDA tensors")
+        if start.shape != output.shape or start.shape != residual.shape:
+            raise ValueError("MSAR gate tensors must have matching shapes")
+        start, output, residual, scale = (
+            start.contiguous(), output.contiguous(), residual.contiguous(), scale.contiguous()
+        )
+        result = torch.empty_like(start, dtype=torch.float32)
+        elements = start.numel()
+        _msar_gate_forward[(triton.cdiv(elements, 256),)](
+            start, output, residual, result, scale, elements, BLOCK=256, num_warps=4
+        )
+        ctx.save_for_backward(start, output, residual, scale)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_result):
+        start, output, residual, scale = ctx.saved_tensors
+        elements = start.numel()
+        grad_result = grad_result.contiguous().float()
+        grad_start, grad_output, grad_residual = (
+            torch.empty_like(start), torch.empty_like(output), torch.empty_like(residual)
+        )
+        _msar_gate_backward[(triton.cdiv(elements, 256),)](
+            grad_result, start, output, residual, scale,
+            grad_start, grad_output, grad_residual, elements, BLOCK=256, num_warps=4
+        )
+        grad_scale = (grad_result * (output.float() + residual.float() - start.float())).sum()
+        return grad_start, grad_output, grad_residual, grad_scale
+
+
+def fused_msar_gate(start, output, residual, scale):
+    """Fuse FP32 MSAR residual addition and gated interpolation."""
+    return _MSARGate.apply(start, output, residual, scale)

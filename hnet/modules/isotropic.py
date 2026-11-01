@@ -15,7 +15,11 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from flash_attn.ops.triton.layer_norm import RMSNorm
 
 from hnet.modules.block import create_block
-from hnet.modules.msar_triton import causal_depthwise_conv1d, weighted_source_reduce
+from hnet.modules.msar_triton import (
+    causal_depthwise_conv1d,
+    fused_msar_gate,
+    weighted_source_reduce,
+)
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
@@ -872,17 +876,19 @@ class Isotropic(nn.Module):
                             msar_out = msar_out * active_dtype
                             if msar_residual is not None:
                                 msar_residual = msar_residual * active_dtype
-                        raw_state = msar_out if msar_residual is None else msar_out + msar_residual
                         # Gate each layer's multi-scale residual independently.
                         # A single mean scale would force all layers to share one
                         # scalar gradient and waste the per-layer parameters.
-                        layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(raw_state.dtype)
-                        # Lerp fuses the subtract/multiply/add gate into one
-                        # elementwise kernel while preserving the same
-                        # FP32 residual interpolation.
-                        msar_state = torch.lerp(
-                            layer_input.float(), raw_state, layer_scale.float()
-                        )
+                        scale_dtype = msar_residual.dtype if msar_residual is not None else msar_out.dtype
+                        layer_scale = torch.tanh(self.msar_scale[layer_idx]).to(scale_dtype)
+                        if msar_residual is None:
+                            msar_state = torch.lerp(
+                                layer_input.float(), msar_out, layer_scale.float()
+                            )
+                        else:
+                            msar_state = fused_msar_gate(
+                                layer_input.float(), msar_out, msar_residual, layer_scale.float()
+                            )
                         if packed and msar_state.dim() == 3:
                             msar_state = msar_state.squeeze(0)
                         if (layer_idx + 1) % self.msar_block_size == 0:
