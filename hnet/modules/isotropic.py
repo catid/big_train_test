@@ -15,7 +15,7 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from flash_attn.ops.triton.layer_norm import RMSNorm
 
 from hnet.modules.block import create_block
-from hnet.modules.msar_triton import causal_depthwise_conv1d
+from hnet.modules.msar_triton import causal_depthwise_conv1d, weighted_source_reduce
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
 from hnet.models.config_hnet import HNetConfig
@@ -354,7 +354,7 @@ class Isotropic(nn.Module):
                 score_bank[-1].add_(math.log(2.0))
             weights = torch.softmax(score_bank, dim=0)
             retrieved_streams = [
-                (weights[:, stream_index].unsqueeze(-1) * stream_bank).sum(dim=0)
+                weighted_source_reduce(weights[:, stream_index], stream_bank)
                 for stream_index, stream_bank in enumerate(stream_banks)
             ]
         else:

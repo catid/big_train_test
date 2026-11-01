@@ -13,6 +13,242 @@ import triton.language as tl
 
 
 @triton.jit
+def _weighted_reduce_forward(
+    weights_ptr,
+    bank_ptr,
+    output_ptr,
+    batch,
+    length,
+    width,
+    weights_stride_n,
+    weights_stride_b,
+    weights_stride_l,
+    bank_stride_n,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Reduce a fixed MSAR source bank without a source-sized temporary."""
+
+    pid = tl.program_id(0)
+    blocks_d = tl.cdiv(width, BLOCK_D)
+    token_pid = pid // blocks_d
+    d_pid = pid % blocks_d
+    batch_index = token_pid // length
+    token = token_pid % length
+    d = d_pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d < width
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for source in range(N):
+        weight = tl.load(
+            weights_ptr
+            + source * weights_stride_n
+            + batch_index * weights_stride_b
+            + token * weights_stride_l
+        ).to(tl.float32)
+        value = tl.load(
+            bank_ptr
+            + source * bank_stride_n
+            + batch_index * bank_stride_b
+            + token * bank_stride_l
+            + d * bank_stride_d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        acc += weight * value
+    tl.store(
+        output_ptr + (batch_index * length + token) * width + d,
+        acc,
+        mask=d_mask,
+    )
+
+
+@triton.jit
+def _weighted_reduce_grad_bank(
+    grad_output_ptr,
+    weights_ptr,
+    grad_bank_ptr,
+    batch,
+    length,
+    width,
+    weights_stride_n,
+    weights_stride_b,
+    weights_stride_l,
+    bank_stride_n,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    grad_bank_stride_n,
+    grad_bank_stride_b,
+    grad_bank_stride_l,
+    grad_bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Gradient of the weighted source reduction with one launch."""
+
+    pid = tl.program_id(0)
+    blocks_d = tl.cdiv(width, BLOCK_D)
+    token_pid = pid // blocks_d
+    d_pid = pid % blocks_d
+    batch_index = token_pid // length
+    token = token_pid % length
+    d = d_pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d < width
+    grad_output = tl.load(
+        grad_output_ptr + (batch_index * length + token) * width + d,
+        mask=d_mask,
+        other=0,
+    ).to(tl.float32)
+    for source in range(N):
+        weight = tl.load(
+            weights_ptr
+            + source * weights_stride_n
+            + batch_index * weights_stride_b
+            + token * weights_stride_l
+        ).to(tl.float32)
+        tl.store(
+            grad_bank_ptr
+            + (source * grad_bank_stride_n + batch_index * grad_bank_stride_b
+               + token * grad_bank_stride_l + d * grad_bank_stride_d),
+            grad_output * weight,
+            mask=d_mask,
+        )
+
+
+@triton.jit
+def _weighted_reduce_grad_weights(
+    grad_output_ptr,
+    bank_ptr,
+    grad_weights_ptr,
+    batch,
+    length,
+    width,
+    bank_stride_n,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    """Gradient of the source weights, accumulated in FP32."""
+
+    pid = tl.program_id(0)
+    tokens = batch * length
+    source = pid // tokens
+    token_pid = pid % tokens
+    batch_index = token_pid // length
+    token = token_pid % length
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    # BLOCK_D is also the reduction tile.  Keep a scalar accumulator per
+    # program so the output ordering follows the source-major PyTorch sum.
+    total = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, width, BLOCK_D):
+        d = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d < width
+        grad_output = tl.load(
+            grad_output_ptr + (batch_index * length + token) * width + d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        value = tl.load(
+            bank_ptr
+            + source * bank_stride_n
+            + batch_index * bank_stride_b
+            + token * bank_stride_l
+            + d * bank_stride_d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        total += tl.sum(grad_output * value, axis=0)
+    tl.store(
+        grad_weights_ptr + source * batch * length + batch_index * length + token,
+        total,
+    )
+
+
+class _WeightedSourceReduce(torch.autograd.Function):
+    """FP32 MSAR weighted reduction with fused forward and backward maps."""
+
+    @staticmethod
+    def forward(ctx, weights: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
+        if not weights.is_cuda or not bank.is_cuda:
+            raise RuntimeError("MSAR weighted reduction requires CUDA tensors")
+        if weights.ndim != 3 or bank.ndim != 4:
+            raise ValueError("expected weights=(N,B,L) and bank=(N,B,L,D)")
+        if weights.shape[:3] != bank.shape[:3]:
+            raise ValueError("MSAR source and weight shapes do not match")
+        if weights.dtype != torch.float32 or bank.dtype not in (
+            torch.bfloat16,
+            torch.float32,
+        ):
+            raise TypeError("MSAR weighted reduction expects FP32 weights and BF16/FP32 bank")
+        n, batch, length, width = bank.shape
+        output = torch.empty((batch, length, width), device=bank.device, dtype=torch.float32)
+        grid = (batch * length * triton.cdiv(width, 256),)
+        _weighted_reduce_forward[grid](
+            weights,
+            bank,
+            output,
+            batch,
+            length,
+            width,
+            *weights.stride(),
+            *bank.stride(),
+            BLOCK_D=256,
+            N=n,
+            num_warps=4,
+        )
+        ctx.save_for_backward(weights, bank)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        weights, bank = ctx.saved_tensors
+        n, batch, length, width = bank.shape
+        grad_output = grad_output.contiguous().float()
+        grad_bank = torch.empty_like(bank)
+        _weighted_reduce_grad_bank[(batch * length * triton.cdiv(width, 256),)](
+            grad_output,
+            weights,
+            grad_bank,
+            batch,
+            length,
+            width,
+            *weights.stride(),
+            *bank.stride(),
+            *grad_bank.stride(),
+            BLOCK_D=256,
+            N=n,
+            num_warps=4,
+        )
+        grad_weights = torch.empty_like(weights)
+        _weighted_reduce_grad_weights[(n * batch * length,)](
+            grad_output,
+            bank,
+            grad_weights,
+            batch,
+            length,
+            width,
+            *bank.stride(),
+            BLOCK_D=256,
+            N=n,
+            num_warps=4,
+        )
+        return grad_weights, grad_bank
+
+
+def weighted_source_reduce(weights: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
+    """Reduce ``weights[:,B,L] * bank[:,B,L,D]`` in FP32 without a temporary."""
+
+    if not weights.is_cuda or not bank.is_cuda:
+        return (weights.unsqueeze(-1) * bank).sum(dim=0)
+    return _WeightedSourceReduce.apply(weights, bank)
+
+
+@triton.jit
 def _causal_depthwise_dx(
     grad_y_ptr,
     weight_ptr,
