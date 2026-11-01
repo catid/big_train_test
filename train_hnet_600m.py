@@ -1711,16 +1711,25 @@ class CUDAGraphStep:
         # overlappable with the scaling updates.
         if self.ddp and self._ddp_direct_storage:
             # The reducer exposes six large contiguous views (five BF16 and
-            # one FP32 in the canonical model).  A coalescing manager emits
-            # one NCCL group operation instead of six Python-side launches;
-            # async_ops lets the host enqueue the group before the independent
-            # TE FP8 amax work while the stream preserves collective ordering.
-            with dist._coalescing_manager(async_ops=True) as ddp_work:
-                for flat in self._ddp_storage_buckets:
-                    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+            # one FP32 in the canonical model). NCCL coalesced all-reduce
+            # requires one dtype per group, so coalesce each dtype separately
+            # rather than passing mixed BF16/FP32 tensors to one group.
+            pending = []
+            by_dtype = {}
+            for flat in self._ddp_storage_buckets:
+                by_dtype.setdefault(flat.dtype, []).append(flat)
+            for flats in by_dtype.values():
+                if len(flats) == 1:
+                    pending.append(dist.all_reduce(flats[0], op=dist.ReduceOp.SUM, async_op=True))
+                else:
+                    with dist._coalescing_manager(async_ops=True) as ddp_work:
+                        for flat in flats:
+                            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
+                    pending.append(ddp_work)
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
-            ddp_work.wait()
+            for work in pending:
+                work.wait()
             for flat in self._ddp_storage_buckets:
                 flat.div_(float(self.world))
         else:
