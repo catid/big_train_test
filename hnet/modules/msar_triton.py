@@ -571,7 +571,7 @@ def _msar_gate_backward(
 
 class _MSARGate(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, start, output, residual, scale):
+    def forward(ctx, start, output, residual, scale, result_dtype=None):
         if not (start.is_cuda and output.is_cuda and residual.is_cuda and scale.is_cuda):
             raise RuntimeError("MSAR gate requires CUDA tensors")
         if start.shape != output.shape or start.shape != residual.shape:
@@ -579,7 +579,13 @@ class _MSARGate(torch.autograd.Function):
         start, output, residual, scale = (
             start.contiguous(), output.contiguous(), residual.contiguous(), scale.contiguous()
         )
-        result = torch.empty_like(start, dtype=torch.float32)
+        # The gate accumulates in FP32, but the recurrent MSAR state is stored
+        # at the block parameter precision.  Let the kernel narrow directly
+        # into its final destination when requested, avoiding a second full
+        # activation cast immediately after the fused gate.
+        result = torch.empty_like(
+            start, dtype=torch.float32 if result_dtype is None else result_dtype
+        )
         elements = start.numel()
         _msar_gate_forward[(triton.cdiv(elements, 256),)](
             start, output, residual, result, scale, elements, BLOCK=256, num_warps=4
@@ -600,9 +606,9 @@ class _MSARGate(torch.autograd.Function):
             grad_start, grad_output, grad_residual, elements, BLOCK=256, num_warps=4
         )
         grad_scale = (grad_result * (output.float() + residual.float() - start.float())).sum()
-        return grad_start, grad_output, grad_residual, grad_scale
+        return grad_start, grad_output, grad_residual, grad_scale, None
 
 
-def fused_msar_gate(start, output, residual, scale):
+def fused_msar_gate(start, output, residual, scale, result_dtype=None):
     """Fuse FP32 MSAR residual addition and gated interpolation."""
-    return _MSARGate.apply(start, output, residual, scale)
+    return _MSARGate.apply(start, output, residual, scale, result_dtype)

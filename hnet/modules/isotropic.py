@@ -887,14 +887,17 @@ class Isotropic(nn.Module):
                             )
                         else:
                             msar_state = fused_msar_gate(
-                                layer_input.float(), msar_out, msar_residual, layer_scale.float()
+                                layer_input.float(),
+                                msar_out,
+                                msar_residual,
+                                layer_scale.float(),
+                                result_dtype=layer.norm1.weight.dtype,
                             )
-                        # Keep the router/gate arithmetic in FP32, then store
-                        # the recurrent MSAR state at the mixer parameter
-                        # precision.  This avoids carrying a full FP32 source
-                        # bank through the next depthwise expansion and makes
-                        # the following block boundary cast a no-op.
-                        msar_state = msar_state.to(dtype=layer.norm1.weight.dtype)
+                        # The fused gate already stores the recurrent state at
+                        # mixer precision; the no-residual path retains the
+                        # same explicit narrowing contract.
+                        if msar_residual is None:
+                            msar_state = msar_state.to(dtype=layer.norm1.weight.dtype)
                         if packed and msar_state.dim() == 3:
                             msar_state = msar_state.squeeze(0)
                         if (layer_idx + 1) % self.msar_block_size == 0:
