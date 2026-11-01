@@ -228,11 +228,12 @@ class _WeightedSourceReduce(torch.autograd.Function):
             raise TypeError("MSAR weighted reduction expects FP32 weights and BF16/FP32 bank")
         n, batch, length, width = bank.shape
         output = torch.empty((batch, length, width), device=bank.device, dtype=torch.float32)
-        # The production MSAR width is 1536.  A 512-wide tile reduces the
-        # launch count for the wide feature reduction without changing the
-        # source accumulation order.  Keep the weight-gradient tile at 256
-        # below so its FP32 reduction order remains the canonical one.
-        block_d = 512
+        # The production MSAR width is 1536.  A 1024-wide tile uses two
+        # feature tiles instead of three and is faster on the B300 shape.
+        # This dimension only partitions independent output features; the
+        # source accumulation order is unchanged. Keep the weight-gradient
+        # tile at 256 below so its FP32 reduction order remains canonical.
+        block_d = 1024
         grid = (batch * length * triton.cdiv(width, block_d),)
         _weighted_reduce_forward[grid](
             weights,
@@ -256,7 +257,10 @@ class _WeightedSourceReduce(torch.autograd.Function):
         n, batch, length, width = bank.shape
         grad_output = grad_output.contiguous().float()
         grad_bank = torch.empty_like(bank)
-        block_d = 512
+        # Match the forward feature tiling. The gradient writes are
+        # independent across feature tiles, so this changes launch count only
+        # and preserves the per-element/source arithmetic.
+        block_d = 1024
         _weighted_reduce_grad_bank[(batch * length * triton.cdiv(width, block_d),)](
             grad_output,
             weights,
