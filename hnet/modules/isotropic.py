@@ -278,7 +278,14 @@ class Isotropic(nn.Module):
         keeping each source/channel independent.  The packed path retains the
         reset-aware shift implementation in :meth:`_msar_expand`.
         """
-        source_bank = torch.stack(sources, dim=0)  # [N, B, L, D]
+        # Cached sources are expanded independently in the recurrent path.
+        # ``stack([source])`` copies the full activation even though the
+        # desired singleton bank is just a leading-dimension view.
+        source_bank = (
+            sources[0].unsqueeze(0)
+            if len(sources) == 1
+            else torch.stack(sources, dim=0)
+        )  # [N, B, L, D]
         n_sources, batch, length, width = source_bank.shape
         channels = n_sources * width
         # Materialize the BCHL layout explicitly once.  ``reshape`` currently
@@ -429,10 +436,20 @@ class Isotropic(nn.Module):
                                 scores_all = _msar_score(
                                     source_bank[stream_index], query_all
                                 )
-                                stream_cache[scores_key] = (score_start, scores_all)
+                                # Keep independent column views rather than
+                                # indexing ``scores_all[..., k]`` on every
+                                # layer. SelectBackward materializes and
+                                # zero-fills a full gradient bank before
+                                # scattering one column; unbind gives
+                                # disjoint views and avoids those launches.
+                                score_columns = scores_all.unbind(-1)
+                                stream_cache[scores_key] = (
+                                    score_start,
+                                    score_columns,
+                                )
                             else:
-                                score_start, scores_all = scores_entry
-                            score_sources.append(scores_all[..., layer_idx - score_start])
+                                score_start, score_columns = scores_entry
+                            score_sources.append(score_columns[layer_idx - score_start])
                         else:
                             score_sources.append(
                                 _msar_score(
@@ -445,8 +462,15 @@ class Isotropic(nn.Module):
             if duplicate_last:
                 score_bank[-1].add_(math.log(2.0))
             weights = torch.softmax(score_bank, dim=0)
+            # Unbind the stream axis once. Repeated two-axis indexing creates
+            # SelectBackward nodes that allocate zero-filled source banks;
+            # these views preserve source ordering without a stack/copy.
+            weights_by_stream = weights.unbind(1)
             retrieved_streams = [
-                weighted_source_reduce(weights[:, stream_index], stream_bank)
+                weighted_source_reduce(
+                    weights_by_stream[stream_index],
+                    stream_bank,
+                )
                 for stream_index, stream_bank in enumerate(stream_banks)
             ]
         else:
