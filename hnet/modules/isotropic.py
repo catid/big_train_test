@@ -18,6 +18,7 @@ from hnet.modules.block import create_block
 from hnet.modules.msar_triton import (
     causal_depthwise_conv1d,
     fused_msar_gate,
+    fused_msar_mix,
     weighted_source_reduce,
 )
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
@@ -252,7 +253,12 @@ class Isotropic(nn.Module):
         source_bank = torch.stack(sources, dim=0)  # [N, B, L, D]
         n_sources, batch, length, width = source_bank.shape
         channels = n_sources * width
-        x = source_bank.permute(1, 0, 3, 2).reshape(batch, channels, length)
+        # Materialize the BCHL layout explicitly once.  ``reshape`` currently
+        # performs this copy implicitly because the source-major permutation
+        # is not view-compatible; spelling it out lets the allocator reuse the
+        # stable graph-pool destination and avoids a second defensive copy in
+        # the Triton autograd wrapper.
+        x = source_bank.permute(1, 0, 3, 2).contiguous().view(batch, channels, length)
         streams = [source_bank]
         for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
             weight = self.msar_conv[kernel_idx].to(dtype=x.dtype)
@@ -467,12 +473,7 @@ class Isotropic(nn.Module):
         # exact multiply/add ordering for that stream while removing one
         # graph replay FillFunctor launch and its write bandwidth.  The
         # remaining streams retain the in-place addcmul path.
-        fused = retrieved_streams[0] * mix[..., 0].unsqueeze(-1)
-        for stream_index, stream in enumerate(retrieved_streams[1:], start=1):
-            fused.addcmul_(
-                mix[..., stream_index].unsqueeze(-1),
-                stream,
-            )
+        fused = fused_msar_mix(mix, retrieved_streams)
         return fused.to(sources[-1].dtype)
 
     def _msar_mix_recompute(

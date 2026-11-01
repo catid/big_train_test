@@ -304,6 +304,123 @@ def weighted_source_reduce(weights: torch.Tensor, bank: torch.Tensor) -> torch.T
 
 
 @triton.jit
+def _msar_mix_forward(
+    mix_ptr, s0_ptr, s1_ptr, s2_ptr, s3_ptr, out_ptr,
+    tokens, width, BLOCK_D: tl.constexpr,
+):
+    """Fuse the four-stream MSAR weighted sum into one launch."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    token = pid // tl.cdiv(width, BLOCK_D)
+    d = offsets % width
+    mask = (token < tokens) & (offsets < (token + 1) * width)
+    base = token * width
+    m0 = tl.load(mix_ptr + token * 4 + 0).to(tl.float32)
+    m1 = tl.load(mix_ptr + token * 4 + 1).to(tl.float32)
+    m2 = tl.load(mix_ptr + token * 4 + 2).to(tl.float32)
+    m3 = tl.load(mix_ptr + token * 4 + 3).to(tl.float32)
+    x0 = tl.load(s0_ptr + base + d, mask=mask, other=0).to(tl.float32)
+    x1 = tl.load(s1_ptr + base + d, mask=mask, other=0).to(tl.float32)
+    x2 = tl.load(s2_ptr + base + d, mask=mask, other=0).to(tl.float32)
+    x3 = tl.load(s3_ptr + base + d, mask=mask, other=0).to(tl.float32)
+    out = x0 * m0 + x1 * m1
+    out += x2 * m2
+    out += x3 * m3
+    tl.store(out_ptr + base + d, out, mask=mask)
+
+
+@triton.jit
+def _msar_mix_grad_mix(
+    grad_ptr, s0_ptr, s1_ptr, s2_ptr, s3_ptr, grad_mix_ptr,
+    tokens, width, BLOCK_D: tl.constexpr,
+):
+    """Gradient of the fused MSAR stream sum with respect to its gates."""
+    token = tl.program_id(0)
+    d = tl.arange(0, BLOCK_D)
+    acc0 = tl.zeros((), dtype=tl.float32)
+    acc1 = tl.zeros((), dtype=tl.float32)
+    acc2 = tl.zeros((), dtype=tl.float32)
+    acc3 = tl.zeros((), dtype=tl.float32)
+    base = token * width
+    for start in range(0, width, BLOCK_D):
+        idx = start + d
+        mask = (token < tokens) & (idx < width)
+        grad = tl.load(grad_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        acc0 += tl.sum(grad * tl.load(s0_ptr + base + idx, mask=mask, other=0).to(tl.float32))
+        acc1 += tl.sum(grad * tl.load(s1_ptr + base + idx, mask=mask, other=0).to(tl.float32))
+        acc2 += tl.sum(grad * tl.load(s2_ptr + base + idx, mask=mask, other=0).to(tl.float32))
+        acc3 += tl.sum(grad * tl.load(s3_ptr + base + idx, mask=mask, other=0).to(tl.float32))
+    tl.store(grad_mix_ptr + token * 4 + 0, acc0)
+    tl.store(grad_mix_ptr + token * 4 + 1, acc1)
+    tl.store(grad_mix_ptr + token * 4 + 2, acc2)
+    tl.store(grad_mix_ptr + token * 4 + 3, acc3)
+
+
+@triton.jit
+def _msar_mix_grad_streams(
+    grad_ptr, mix_ptr, g0_ptr, g1_ptr, g2_ptr, g3_ptr,
+    tokens, width, BLOCK_D: tl.constexpr,
+):
+    """Gradient of the fused MSAR stream sum with respect to its streams."""
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    token = pid // tl.cdiv(width, BLOCK_D)
+    d = offsets % width
+    mask = (token < tokens) & (offsets < (token + 1) * width)
+    base = token * width
+    grad = tl.load(grad_ptr + base + d, mask=mask, other=0).to(tl.float32)
+    m0 = tl.load(mix_ptr + token * 4 + 0).to(tl.float32)
+    m1 = tl.load(mix_ptr + token * 4 + 1).to(tl.float32)
+    m2 = tl.load(mix_ptr + token * 4 + 2).to(tl.float32)
+    m3 = tl.load(mix_ptr + token * 4 + 3).to(tl.float32)
+    tl.store(g0_ptr + base + d, grad * m0, mask=mask)
+    tl.store(g1_ptr + base + d, grad * m1, mask=mask)
+    tl.store(g2_ptr + base + d, grad * m2, mask=mask)
+    tl.store(g3_ptr + base + d, grad * m3, mask=mask)
+
+
+class _MSARMix(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, mix, s0, s1, s2, s3):
+        if not all(x.is_cuda for x in (mix, s0, s1, s2, s3)):
+            raise RuntimeError("MSAR mix requires CUDA tensors")
+        mix, s0, s1, s2, s3 = (x.contiguous() for x in (mix, s0, s1, s2, s3))
+        shape = s0.shape
+        if mix.shape != shape[:-1] + (4,) or any(x.shape != shape for x in (s1, s2, s3)):
+            raise ValueError("expected mix=(B,L,4) and four matching streams")
+        # Padded training uses [B,L,D], while packed/chunked calls use
+        # [tokens,D].  The flattened storage contract is identical.
+        width = shape[-1]
+        tokens = s0.numel() // width
+        out = torch.empty_like(s0)
+        grid = (tokens * triton.cdiv(width, 256),)
+        _msar_mix_forward[grid](mix, s0, s1, s2, s3, out, tokens, width, BLOCK_D=256, num_warps=4)
+        ctx.save_for_backward(mix, s0, s1, s2, s3)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        mix, s0, s1, s2, s3 = ctx.saved_tensors
+        width = s0.shape[-1]
+        tokens = s0.numel() // width
+        grad_out = grad_out.contiguous().float()
+        grad_mix = torch.empty_like(mix)
+        _msar_mix_grad_mix[(tokens,)](grad_out, s0, s1, s2, s3, grad_mix, tokens, width, BLOCK_D=256, num_warps=4)
+        grads = [torch.empty_like(s0) for _ in range(4)]
+        _msar_mix_grad_streams[(tokens * triton.cdiv(width, 256),)](
+            grad_out, mix, *grads, tokens, width, BLOCK_D=256, num_warps=4
+        )
+        return (grad_mix, *grads)
+
+
+def fused_msar_mix(mix: torch.Tensor, streams):
+    """Fuse the canonical four-stream MSAR weighted sum."""
+    if len(streams) != 4:
+        raise ValueError(f"production MSAR expects four streams, got {len(streams)}")
+    return _MSARMix.apply(mix, *streams)
+
+
+@triton.jit
 def _causal_depthwise_dx(
     grad_y_ptr,
     weight_ptr,
