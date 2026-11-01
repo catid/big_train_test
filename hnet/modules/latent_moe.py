@@ -5,9 +5,67 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 from hnet.te import TEGroupedLinear, make_linear, te, graph_capture_enabled
 from transformer_engine.pytorch.ops.basic.swiglu import SwiGLU
 from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss
+
+
+@triton.jit
+def _top1_capacity_rank_kernel(
+    expert_idx_ptr,
+    active_ptr,
+    valid_ptr,
+    tokens_per_sequence,
+    num_experts,
+    row_capacity,
+    BLOCK_T: tl.constexpr,
+):
+    """Compute stable per-sequence top-1 expert ranks without a dense scan."""
+    pid = tl.program_id(0)
+    sequence = pid // num_experts
+    expert = pid - sequence * num_experts
+    offsets = tl.arange(0, BLOCK_T)
+    mask = offsets < tokens_per_sequence
+    token_offsets = sequence * tokens_per_sequence + offsets
+    expert_ids = tl.load(expert_idx_ptr + token_offsets, mask=mask, other=-1)
+    active_values = tl.load(active_ptr + token_offsets, mask=mask, other=0)
+    selected = mask & (active_values != 0) & (expert_ids == expert)
+    ranks = tl.cumsum(selected.to(tl.int32), axis=0) - 1
+    accepted = selected & (ranks < row_capacity)
+    tl.store(valid_ptr + token_offsets, accepted, mask=selected)
+
+
+def _top1_capacity_positions(
+    expert_idx: torch.Tensor,
+    active: torch.Tensor,
+    num_sequences: int,
+    tokens_per_sequence: int,
+    num_experts: int,
+    row_capacity: int,
+) -> torch.Tensor:
+    """Return the causal capacity acceptance mask for top-1 routes."""
+    if expert_idx.ndim != 1 or active.ndim != 1:
+        raise ValueError("top-1 capacity inputs must be flattened vectors")
+    expected = int(num_sequences) * int(tokens_per_sequence)
+    if expert_idx.numel() != expected or active.numel() != expected:
+        raise ValueError("top-1 expert indices do not match the static sequence shape")
+    if not expert_idx.is_cuda or not active.is_cuda:
+        raise ValueError("top-1 capacity positions require CUDA vectors")
+    valid = torch.zeros_like(active, dtype=torch.bool)
+    block_t = triton.next_power_of_2(int(tokens_per_sequence))
+    _top1_capacity_rank_kernel[(int(num_sequences) * int(num_experts),)](
+        expert_idx,
+        active,
+        valid,
+        int(tokens_per_sequence),
+        int(num_experts),
+        int(row_capacity),
+        BLOCK_T=block_t,
+        num_warps=4,
+    )
+    return valid
 
 
 class FusedTokenRouter(nn.Module):
@@ -508,12 +566,17 @@ class LatentMoE(nn.Module):
             token_pos = prior_positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
         elif tokens_per_sequence is not None:
-            positions = torch.cumsum(
-                active_one_hot.reshape(num_sequences, tokens_per_sequence, self.num_experts),
-                dim=1,
-            ).reshape(-1, self.num_experts) - 1
-            token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
-            valid = (token_pos < row_capacity) & active
+            # The canonical rank-3 path is top-1. A fused Triton scan over
+            # selected experts avoids materializing/scanning dense [B,T,E]
+            # route counts for every MoE invocation.
+            valid = _top1_capacity_positions(
+                expert_idx,
+                active,
+                num_sequences,
+                tokens_per_sequence,
+                self.num_experts,
+                row_capacity,
+            )
         else:
             # Packed rows are grouped by sequence. Compute each sequence's
             # local expert rank without a Python loop; sequence_ids are sorted,
