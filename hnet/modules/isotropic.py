@@ -55,6 +55,21 @@ _msar_score = torch.compile(
 )
 
 
+def _msar_score_dispatch(source, query):
+    """Use the compiled score only on the training graph path.
+
+    Validation and decoding run under ``no_grad`` and can present latent
+    counts different from the representative capture shape. Sending those
+    shapes through the fullgraph compiler causes repeated specialization and
+    eventually hits TorchDynamo's recompile limit. The eager implementation is
+    algebraically identical and keeps evaluation from perturbing the captured
+    training graph's compiler cache.
+    """
+    if torch.is_grad_enabled():
+        return _msar_score(source, query)
+    return _msar_score_impl(source, query)
+
+
 @dataclass
 class IsotropicInferenceParams:
     """Inference parameters that are passed to the main model in order
@@ -392,7 +407,7 @@ class Isotropic(nn.Module):
                     # Fuse FP32 RMS normalization and the score contraction;
                     # the singleton query dimension is removed after the
                     # compiled kernel so the routing equations are unchanged.
-                    scores = _msar_score(
+                    scores = _msar_score_dispatch(
                         stream_bank,
                         query[stream_index : stream_index + 1],
                     )
@@ -433,7 +448,7 @@ class Isotropic(nn.Module):
                                 # selected scalar scores are retained by the
                                 # layer's routing path.  The compiled helper
                                 # also fuses the source normalization.
-                                scores_all = _msar_score(
+                                scores_all = _msar_score_dispatch(
                                     source_bank[stream_index], query_all
                                 )
                                 # Keep independent column views rather than
@@ -452,7 +467,7 @@ class Isotropic(nn.Module):
                             score_sources.append(score_columns[layer_idx - score_start])
                         else:
                             score_sources.append(
-                                _msar_score(
+                                _msar_score_dispatch(
                                     source_bank[stream_index],
                                     query[stream_index : stream_index + 1],
                                 )[..., 0]
@@ -507,7 +522,7 @@ class Isotropic(nn.Module):
             source_streams = stream_banks
             source_scores = []
             for stream_bank in source_streams:
-                scores = _msar_score(stream_bank, query)
+                scores = _msar_score_dispatch(stream_bank, query)
                 # The fused helper computes the KxK contraction for the
                 # packed stream bank; retain its diagonal (each stream uses
                 # its matching query) and restore [K, B, L] ordering.
