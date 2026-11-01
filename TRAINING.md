@@ -78,6 +78,19 @@ torchrun --nproc_per_node=8 train_hnet_600m.py \
   --seq 4096
 ```
 
+The trainer emits UTC, step-numbered pretraining telemetry in the same shape as
+the production dashboards: `loss`, `lr`, `lr_phase`, `grad_norm`, aggregate
+`tokens/s`, cluster MFU, `moe_balance_loss`, and `expert_gini`. It runs a
+complete-model held-out byte evaluation every 40 optimizer steps by default
+(`--eval-every 40`); set `--eval-manifest` to a separate manifest to keep the
+evaluation documents disjoint from training. Optional JSONL multiple-choice
+suites can be supplied with `--mmlu-data`, `--arc-challenge-data`, and
+`--hellaswag-data`; missing suites are reported as `null` rather than guessed.
+Use `--eval-batches` and `--eval-max-items` to bound evaluation work, and
+`--peak-tflops` to set the per-GPU FP8 peak used for the aggregate-DP MFU
+estimate. Evaluation records, including duration and item counts, are written
+to the run JSON alongside the step metrics.
+
 Each manifest entry identifies one document byte range and its source,
 license, language, quality metadata, SHA-256, and token-equivalent count. The
 sampler chooses one document-local window per fixed-shape batch row and pads
