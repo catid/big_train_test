@@ -976,6 +976,9 @@ def loss_for_output(out, target, args, loss_mask=None, active_mask=None):
     target_ratio = getattr(args, "_target_ratio_tensor", None)
     if target_ratio is None or target_ratio.device != standard_ce.device:
         target_ratio = standard_ce.new_tensor(1.0 / float(args.ratio_target))
+    expert_load_value = getattr(out, "moe_expert_load", None)
+    if expert_load_value is None:
+        expert_load_value = out.logits.new_zeros((8,), dtype=torch.float32)
     metrics = {
         "objective": objective,
         "standard_ce": standard_ce,
@@ -983,11 +986,7 @@ def loss_for_output(out, target, args, loss_mask=None, active_mask=None):
         "router_loss": ratio,
         "moe_aux": moe_aux,
         "moe_balance_loss": moe_balance,
-        "moe_expert_load": getattr(
-            out,
-            "moe_expert_load",
-            out.logits.new_zeros((8,), dtype=torch.float32),
-        ).float(),
+        "moe_expert_load": expert_load_value.float(),
         "routing_ratio": routing_ratio,
         "soft_routing_ratio": soft_routing_ratio,
         "ratio_target_error": (routing_ratio - target_ratio).abs(),
@@ -2409,7 +2408,15 @@ def main():
         reduced = metric_values[0]
         reduced_metrics = dict(zip(metric_names, metric_values))
         expert_load = metrics["moe_expert_load"].detach().float()
-        if world > 1:
+        report_requested = (
+            step < 3
+            or step % int(args.log_every) == 0
+            or (int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0)
+        )
+        # Expert utilization is telemetry rather than an optimization term.
+        # Reduce its eight counters only on report steps so normal graph
+        # replay does not pay an extra NCCL collective every update.
+        if world > 1 and report_requested:
             dist.all_reduce(expert_load)
             expert_load.div_(float(world))
         expert_load_values = expert_load.cpu().tolist()
@@ -2423,11 +2430,7 @@ def main():
         mfu = (6.0 * float(n_params) * tokens_per_second) / (
             float(args.peak_tflops) * 1e12
         )
-        report_step = rank == 0 and (
-            step < 3
-            or step % int(args.log_every) == 0
-            or (int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0)
-        )
+        report_step = rank == 0 and report_requested
         expert_gini = (
             float(_expert_gini(model.module if world > 1 else model).item())
             if report_step
