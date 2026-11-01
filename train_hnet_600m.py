@@ -1059,7 +1059,12 @@ def _read_jsonl_records(path: str | os.PathLike[str], limit: int = 0) -> list[di
 def _normalize_mcq_record(record: dict, benchmark: str) -> tuple[str, list[str], int] | None:
     """Normalize MMLU, ARC, and HellaSwag records to prompt/choices/answer."""
     if benchmark == "hellaswag":
-        prompt = str(record.get("ctx", record.get("context", "")))
+        prompt_value = record.get("ctx", record.get("context"))
+        if prompt_value is None:
+            prompt_value = " ".join(
+                str(record.get(key, "")) for key in ("ctx_a", "ctx_b") if record.get(key)
+            )
+        prompt = str(prompt_value or "")
         choices = record.get("endings", record.get("choices"))
         answer = record.get("label", record.get("answer"))
     else:
@@ -2427,8 +2432,10 @@ def main():
         # A conservative dense-equivalent estimate keeps MFU comparable across
         # runs while the model's actual sparse expert balance is reported
         # separately. The estimate is telemetry only and never affects updates.
+        # ``tokens_per_second`` is the aggregate DDP rate, so scale the
+        # per-GPU peak by world size when converting it to a cluster MFU.
         mfu = (6.0 * float(n_params) * tokens_per_second) / (
-            float(args.peak_tflops) * 1e12
+            float(args.peak_tflops) * float(world) * 1e12
         )
         report_step = rank == 0 and report_requested
         expert_gini = (
@@ -2488,11 +2495,15 @@ def main():
                 eval_stream,
                 args,
                 device,
-                {
+                ({
                     "mmlu": args.mmlu_data,
                     "arc_challenge": args.arc_challenge_data,
                     "hellaswag": args.hellaswag_data,
-                },
+                } if rank == 0 else {
+                    "mmlu": None,
+                    "arc_challenge": None,
+                    "hellaswag": None,
+                }),
             )
             eval_loss_tensor = torch.tensor(
                 [float(eval_result["loss"])], device=device, dtype=torch.float32
