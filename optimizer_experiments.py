@@ -340,7 +340,13 @@ def _normuon_row_normalize(
             f"!= {(update.shape[-2], 1)}"
         )
     dtype = update.dtype
-    eps_t = torch.tensor(eps, dtype=dtype, device=update.device)
+    # Keep epsilon as a Python scalar.  Materializing ``torch.tensor(eps)``
+    # here launches a tiny device allocation on every optimizer step and is
+    # illegal while capturing the optimizer into a CUDA graph.  PyTorch's
+    # scalar promotion keeps the operation in ``dtype`` for these tensors,
+    # so the arithmetic is unchanged while the graph path remains capture
+    # safe.
+    eps_t = eps
     old_norm = update.norm(dim=(-2, -1), keepdim=True)
     try:
         row_power = update.square().mean(dim=-1, keepdim=True, dtype=dtype)
