@@ -295,6 +295,15 @@ class LatentMoE(nn.Module):
         self._aux_loss = None
         self._aux_loss_count = 0
         self._z_loss = None
+        # Last accepted top-1 route counts are retained for inexpensive,
+        # out-of-graph utilization telemetry. This buffer is overwritten by
+        # each forward and is not part of checkpoints.
+        self.register_buffer(
+            "_expert_counts",
+            torch.zeros(self.num_experts, device=device, dtype=torch.float32),
+            persistent=False,
+        )
+        self._expert_load = None
         self._shared_stream = None
         # ``expert_starts`` depends only on the static grouped-GEMM capacity.
         # Cache it per device/capacity so every MoE invocation does not launch
@@ -361,6 +370,15 @@ class LatentMoE(nn.Module):
         self._aux_loss = None
         self._aux_loss_count = 0
         self._z_loss = None
+        self._expert_load = None
+        self._expert_counts.zero_()
+
+    @property
+    def expert_load(self):
+        """Accepted top-1 route fraction for each expert in this forward."""
+        if self._expert_load is None:
+            return self.router.weight.new_zeros((self.num_experts,), dtype=torch.float32)
+        return self._expert_load
 
     @property
     def z_loss(self):
@@ -606,6 +624,7 @@ class LatentMoE(nn.Module):
             token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
         routing_map = routing_map * valid[:, None].to(torch.int32)
+        self._expert_counts.copy_(routing_map.sum(dim=0, dtype=torch.float32))
         routing_probs = probs * routing_map.to(probs.dtype)
         if route_counts is not None:
             route_state = route_counts[loop_idx, layer_idx]
@@ -631,6 +650,10 @@ class LatentMoE(nn.Module):
         # routing map, so this remains a fixed-shape, CUDA-graph-safe tensor
         # computation (the values may vary on each replay).
         counts = routing_map.sum(dim=0, dtype=torch.int64)
+        # Retain the accepted route histogram for telemetry. This reuses the
+        # capacity-trimmed map already required to build the graph-safe pad
+        # offsets and adds no routing pass.
+        self._expert_load = counts.to(torch.float32) / active_count
         # Inclusive cumsum minus the current count is the exclusive prefix.
         # This avoids the tiny ``cat([zeros, cumsum[:-1]])`` allocation and
         # copy on every routed layer while preserving int64 offsets expected

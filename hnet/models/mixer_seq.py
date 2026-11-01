@@ -42,6 +42,11 @@ class CausalLMOutput:
     inference_params: HNetState
     feedback_logits: list[torch.Tensor] | None = None
     moe_aux_loss: torch.Tensor | None = None
+    moe_balance_loss: torch.Tensor | None = None
+    # Mean accepted top-1 route fraction per expert for the current forward.
+    # This is a graph-owned tensor so the trainer can report expert balance
+    # without running a second routing pass.
+    moe_expert_load: torch.Tensor | None = None
 
 
 def _flatten_causal_output(value):
@@ -51,6 +56,8 @@ def _flatten_causal_output(value):
         value.inference_params,
         value.feedback_logits,
         value.moe_aux_loss,
+        value.moe_balance_loss,
+        value.moe_expert_load,
     ), None
 
 
@@ -161,6 +168,8 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         # load balancing.  Keep it attached to the returned objective; merely
         # storing it on LatentMoE leaves the computed term dead during training.
         moe_losses = []
+        moe_balance_losses = []
+        expert_loads = []
         for module in self.backbone.modules():
             aux_loss = getattr(module, "aux_loss", None)
             if aux_loss is None:
@@ -169,13 +178,30 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             if z_loss is not None:
                 aux_loss = aux_loss + z_loss.to(dtype=aux_loss.dtype)
             moe_losses.append(aux_loss)
+            balance = getattr(module, "aux_loss", None)
+            if balance is not None:
+                moe_balance_losses.append(balance.float())
+            load = getattr(module, "expert_load", None)
+            if load is not None:
+                expert_loads.append(load.float())
         moe_aux_loss = torch.stack(moe_losses).mean() if moe_losses else None
+        moe_balance_loss = (
+            torch.stack(moe_balance_losses).mean()
+            if moe_balance_losses else logits.new_zeros((), dtype=torch.float32)
+        )
+        moe_expert_load = (
+            torch.stack(expert_loads).mean(dim=0)
+            if expert_loads
+            else logits.new_zeros((8,), dtype=torch.float32)
+        )
         return CausalLMOutput(
             logits=logits,
             bpred_output=bpred_output,
             inference_params=inference_params,
             feedback_logits=feedback_logits,
             moe_aux_loss=moe_aux_loss,
+            moe_balance_loss=moe_balance_loss,
+            moe_expert_load=moe_expert_load,
         )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
@@ -189,4 +215,11 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         hidden_states = self.byte_features(input_ids, self.input_dtype)
         hidden_states, bpred = self.backbone.step(hidden_states, inference_params)
         logits = self.lm_head(hidden_states.float())
-        return CausalLMOutput(logits=logits, bpred_output=bpred, inference_params=inference_params, feedback_logits=[])
+        return CausalLMOutput(
+            logits=logits,
+            bpred_output=bpred,
+            inference_params=inference_params,
+            feedback_logits=[],
+            moe_balance_loss=logits.new_zeros((), dtype=torch.float32),
+            moe_expert_load=logits.new_zeros((8,), dtype=torch.float32),
+        )

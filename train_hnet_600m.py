@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import datetime
 import hashlib
 import importlib.metadata
 import json
@@ -101,6 +102,50 @@ def parse_args():
     )
     p.add_argument("--log-every", type=int, default=10)
     p.add_argument(
+        "--eval-every",
+        type=int,
+        default=40,
+        help="run the complete-model held-out evaluation every N optimizer steps (0 disables)",
+    )
+    p.add_argument(
+        "--eval-batches",
+        type=int,
+        default=1,
+        help="number of fixed-shape held-out byte batches per evaluation",
+    )
+    p.add_argument(
+        "--eval-manifest",
+        default=None,
+        help="optional held-out document manifest; training manifest is used when omitted",
+    )
+    p.add_argument(
+        "--mmlu-data",
+        default=None,
+        help="optional JSONL multiple-choice file with question/choices/answer fields",
+    )
+    p.add_argument(
+        "--arc-challenge-data",
+        default=None,
+        help="optional JSONL ARC-Challenge file (question/choices/answerKey fields)",
+    )
+    p.add_argument(
+        "--hellaswag-data",
+        default=None,
+        help="optional JSONL HellaSwag file (ctx/endings/label fields)",
+    )
+    p.add_argument(
+        "--eval-max-items",
+        type=int,
+        default=0,
+        help="maximum multiple-choice items per benchmark (0 means all records)",
+    )
+    p.add_argument(
+        "--peak-tflops",
+        type=float,
+        default=1000.0,
+        help="per-GPU FP8 peak used for the reported model-FLOP utilization estimate",
+    )
+    p.add_argument(
         "--power-every",
         type=int,
         default=100,
@@ -138,6 +183,14 @@ def _validate_schedule_args(args):
         raise ValueError("lr-shift must be non-negative")
     if float(args.lr) <= 0.0:
         raise ValueError("lr must be positive")
+    if int(args.eval_every) < 0:
+        raise ValueError("eval-every must be non-negative")
+    if int(args.eval_batches) < 1:
+        raise ValueError("eval-batches must be positive")
+    if int(args.eval_max_items) < 0:
+        raise ValueError("eval-max-items must be non-negative")
+    if float(args.peak_tflops) <= 0.0:
+        raise ValueError("peak-tflops must be positive")
 
 
 def _wsqd_scale(step: int, args) -> float:
@@ -906,6 +959,9 @@ def loss_for_output(out, target, args, loss_mask=None, active_mask=None):
     moe_aux_value = getattr(out, "moe_aux_loss", None)
     moe_aux = (moe_aux_value.float() if moe_aux_value is not None
                else out.logits.new_zeros((), dtype=torch.float32))
+    moe_balance_value = getattr(out, "moe_balance_loss", None)
+    moe_balance = (moe_balance_value.float() if moe_balance_value is not None
+                   else out.logits.new_zeros((), dtype=torch.float32))
     objective = objective + args.ratio_weight * ratio + moe_aux
     routing_ratio = (
         torch.stack(boundary_ratios).mean()
@@ -926,11 +982,190 @@ def loss_for_output(out, target, args, loss_mask=None, active_mask=None):
         "feedback_ce": feedback_ce,
         "router_loss": ratio,
         "moe_aux": moe_aux,
+        "moe_balance_loss": moe_balance,
+        "moe_expert_load": getattr(
+            out,
+            "moe_expert_load",
+            out.logits.new_zeros((8,), dtype=torch.float32),
+        ).float(),
         "routing_ratio": routing_ratio,
         "soft_routing_ratio": soft_routing_ratio,
         "ratio_target_error": (routing_ratio - target_ratio).abs(),
     }
     return objective, metrics
+
+
+def _lr_phase(step: int, args) -> str:
+    """Name the active WSqD phase for human-readable training telemetry."""
+    warmup = int(args.warmup)
+    if int(step) < warmup:
+        return "warmup"
+    horizon = max(1, int(getattr(args, "_lr_horizon_steps", args.steps)) - warmup)
+    t = max(1, int(step) - warmup + 1)
+    stable_horizon = max(
+        1, int(math.floor((1.0 - float(args.lr_decay_fraction)) * horizon))
+    )
+    return "stable" if t <= stable_horizon else "decay"
+
+
+@torch.no_grad()
+def _expert_gini(model) -> torch.Tensor:
+    """Return mean accepted-route Gini coefficient across LatentMoE layers.
+
+    LatentMoE records the static-shape accepted route counts during its normal
+    forward.  Reading those tensors after a graph replay is capture-safe; the
+    sort and reduction happen only on the logging stream, outside the graph.
+    A perfectly balanced eight-expert layer is zero and a single active expert
+    approaches one.  Missing statistics are reported as a zero scalar so a
+    fresh graph warmup cannot make logging fail.
+    """
+    values = []
+    for module in model.modules():
+        counts = getattr(module, "_expert_counts", None)
+        if not isinstance(counts, torch.Tensor) or counts.numel() < 2:
+            continue
+        counts = counts.detach().float().reshape(-1)
+        total = counts.sum()
+        if not bool(torch.isfinite(total).item()) or float(total.item()) <= 0.0:
+            continue
+        ordered = torch.sort(counts).values
+        n = ordered.numel()
+        rank = torch.arange(1, n + 1, device=ordered.device, dtype=ordered.dtype)
+        numerator = ((2.0 * rank - n - 1.0) * ordered).sum()
+        values.append(numerator / (float(n) * total).clamp_min(1.0))
+    if not values:
+        return torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
+    return torch.stack(values).mean()
+
+
+def _read_jsonl_records(path: str | os.PathLike[str], limit: int = 0) -> list[dict]:
+    """Read a bounded benchmark JSONL file without importing benchmark code."""
+    records = []
+    with Path(path).expanduser().open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if limit and len(records) >= int(limit):
+                break
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid benchmark JSONL at {path}:{line_number}") from exc
+            if not isinstance(record, dict):
+                raise ValueError(f"benchmark record at {path}:{line_number} is not an object")
+            records.append(record)
+    return records
+
+
+def _normalize_mcq_record(record: dict, benchmark: str) -> tuple[str, list[str], int] | None:
+    """Normalize MMLU, ARC, and HellaSwag records to prompt/choices/answer."""
+    if benchmark == "hellaswag":
+        prompt = str(record.get("ctx", record.get("context", "")))
+        choices = record.get("endings", record.get("choices"))
+        answer = record.get("label", record.get("answer"))
+    else:
+        prompt = str(record.get("question", record.get("prompt", "")))
+        choices = record.get("choices")
+        answer = record.get("answer", record.get("answerKey", record.get("label")))
+        if isinstance(choices, dict):
+            choices = choices.get("text", choices.get("texts"))
+    if not prompt or not isinstance(choices, list) or len(choices) < 2:
+        return None
+    choices = [str(choice.get("text", "")) if isinstance(choice, dict) else str(choice) for choice in choices]
+    if isinstance(answer, str):
+        value = answer.strip()
+        if len(value) == 1 and value.upper() in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            answer = ord(value.upper()) - ord("A")
+        else:
+            try:
+                answer = int(value)
+            except ValueError:
+                return None
+    try:
+        answer = int(answer)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= answer < len(choices):
+        return None
+    return prompt, choices, answer
+
+
+@torch.no_grad()
+def _score_mcq_records(model, records: list[dict], benchmark: str, device, seq: int) -> tuple[float | None, int]:
+    """Score byte-level multiple-choice records with the complete H-Net model."""
+    if not records:
+        return None, 0
+    correct = 0
+    count = 0
+    for raw in records:
+        normalized = _normalize_mcq_record(raw, benchmark)
+        if normalized is None:
+            continue
+        prompt, choices, answer = normalized
+        prompt_bytes = prompt.encode("utf-8")
+        candidate_bytes = [choice.encode("utf-8") for choice in choices]
+        if not prompt_bytes or any(not choice for choice in candidate_bytes):
+            continue
+        if any(len(prompt_bytes) + len(choice) > int(seq) for choice in candidate_bytes):
+            continue
+        batch = len(candidate_bytes)
+        inputs = torch.zeros((batch, seq), dtype=torch.uint8, device=device)
+        masks = torch.zeros((batch, seq), dtype=torch.bool, device=device)
+        positions = []
+        for row, choice in enumerate(candidate_bytes):
+            payload = torch.tensor(list(prompt_bytes + choice), dtype=torch.uint8, device=device)
+            inputs[row, : payload.numel()].copy_(payload)
+            masks[row, : payload.numel()].fill_(True)
+            positions.append((len(prompt_bytes) - 1, len(choice)))
+        output = model(inputs, mask=masks, fbt_passes=FBT_PASSES)
+        scores = []
+        for row, (start, length) in enumerate(positions):
+            logits = output.logits[row, start : start + length].float()
+            target = inputs[row, start + 1 : start + length + 1].long()
+            scores.append(F.cross_entropy(logits, target, reduction="sum").neg())
+        if int(torch.stack(scores).argmax().item()) == answer:
+            correct += 1
+        count += 1
+    return (float(correct) / count if count else None), count
+
+
+@torch.no_grad()
+def evaluate_model(model, eval_stream, args, device, benchmark_paths: dict[str, str | None]):
+    """Run held-out byte loss and configured MCQ suites on the full model."""
+    was_training = model.training
+    model.eval()
+    previous_graph = hnet_te.graph_capture_enabled()
+    # Keep the graph-mode TE flag during evaluation when training uses CUDA
+    # graphs.  Besides selecting the same fixed-capacity grouped route, this
+    # prevents an eager eval autocast from mutating delayed-scaling histories
+    # that the captured training graph consumes on its next replay.
+    started = time.perf_counter()
+    byte_losses = []
+    try:
+        for batch_index in range(int(args.eval_batches)):
+            x, y, active, loss_mask = eval_stream.get(batch_index, device)
+            out = model(x, mask=active, fbt_passes=FBT_PASSES)
+            byte_losses.append(float(ce(out.logits, y, loss_mask).item()))
+        benchmark_scores = {}
+        for name, path in benchmark_paths.items():
+            if path is None:
+                benchmark_scores[name] = (None, 0)
+                continue
+            records = _read_jsonl_records(path, int(args.eval_max_items))
+            benchmark_scores[name] = _score_mcq_records(
+                model, records, name, device, int(args.seq)
+            )
+    finally:
+        hnet_te.set_graph_capture(previous_graph)
+        if was_training:
+            model.train()
+    return {
+        "loss": sum(byte_losses) / max(1, len(byte_losses)),
+        "mmlu": benchmark_scores.get("mmlu", (None, 0)),
+        "arc_challenge": benchmark_scores.get("arc_challenge", (None, 0)),
+        "hellaswag": benchmark_scores.get("hellaswag", (None, 0)),
+        "eval_took": time.perf_counter() - started,
+    }
 
 
 def _physical_gpu_index(logical_index):
@@ -1982,6 +2217,10 @@ def main():
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(manifest, args.seq, args.batch, rank, world, seed=args.data_seed)
+    eval_manifest = manifest if args.eval_manifest is None else _load_manifest(args.eval_manifest)
+    eval_stream = ByteStream(
+        eval_manifest, args.seq, args.batch, rank, world, seed=args.data_seed + 1_000_003
+    )
     graph_step = None
     if CANONICAL_CUDA_GRAPHS:
         graph_step = CUDAGraphStep(
@@ -2016,9 +2255,18 @@ def main():
         "feedback_ce": [],
         "router_loss": [],
         "moe_aux": [],
+        "moe_balance_loss": [],
         "routing_ratio": [],
         "soft_routing_ratio": [],
         "ratio_target_error": [],
+        "learning_rate": [],
+        "lr_phase": [],
+        "grad_norm": [],
+        "tokens_per_second": [],
+        "mfu": [],
+        "expert_gini": [],
+        "expert_load": [],
+        "eval": [],
         "time_ms": [],
         "power_w": [],
         "power_target_w": float(args.target_power_w),
@@ -2041,6 +2289,8 @@ def main():
             graph_step is not None and graph_step._ddp_direct_storage
         ),
         "nonfinite": [],
+        "eval_manifest_sha256": eval_manifest.manifest_sha256,
+        "eval_every": int(args.eval_every),
     }
     if rank == 0:
         print(
@@ -2140,6 +2390,7 @@ def main():
             "feedback_ce",
             "router_loss",
             "moe_aux",
+            "moe_balance_loss",
             "routing_ratio",
             "soft_routing_ratio",
             "ratio_target_error",
@@ -2157,13 +2408,44 @@ def main():
         metric_values = metric_vector.cpu().tolist()
         reduced = metric_values[0]
         reduced_metrics = dict(zip(metric_names, metric_values))
+        expert_load = metrics["moe_expert_load"].detach().float()
+        if world > 1:
+            dist.all_reduce(expert_load)
+            expert_load.div_(float(world))
+        expert_load_values = expert_load.cpu().tolist()
         standard_ce_value = reduced_metrics["standard_ce"]
+        step_number = int(step) + 1
+        current_lr = float(args.lr) * float(lr_scale)
+        tokens_per_second = float(args.batch * args.seq * world) / max(elapsed / 1000.0, 1e-9)
+        # A conservative dense-equivalent estimate keeps MFU comparable across
+        # runs while the model's actual sparse expert balance is reported
+        # separately. The estimate is telemetry only and never affects updates.
+        mfu = (6.0 * float(n_params) * tokens_per_second) / (
+            float(args.peak_tflops) * 1e12
+        )
+        report_step = rank == 0 and (
+            step < 3
+            or step % int(args.log_every) == 0
+            or (int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0)
+        )
+        expert_gini = (
+            float(_expert_gini(model.module if world > 1 else model).item())
+            if report_step
+            else None
+        )
         log["loss"].append(standard_ce_value)
         for name, value in reduced_metrics.items():
             log[name].append(float(value))
         if log["target_reached_step"] is None and standard_ce_value <= float(args.target_ce):
             log["target_reached_step"] = int(step)
         log["time_ms"].append(elapsed)
+        log["learning_rate"].append(current_lr)
+        log["lr_phase"].append(_lr_phase(step, args))
+        log["grad_norm"].append(float(grad_norm.detach().float().item()))
+        log["tokens_per_second"].append(tokens_per_second)
+        log["mfu"].append(mfu)
+        log["expert_gini"].append(expert_gini)
+        log["expert_load"].append([float(value) for value in expert_load_values])
         if rank == 0 and args.power_every > 0 and (
             step == start_step or step % args.power_every == 0
         ):
@@ -2177,17 +2459,69 @@ def main():
             else:
                 log["power_gap_w"].append([])
         if rank == 0 and (step < 3 or step % args.log_every == 0):
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            ).replace("+00:00", "Z")
             print(
-                f"step={step} objective={float(reduced):.6f} "
-                f"ce={standard_ce_value:.6f} "
-                f"fb_ce={float(reduced_metrics['feedback_ce']):.6f} "
-                f"router={float(reduced_metrics['router_loss']):.6f} "
-                f"moe={float(reduced_metrics['moe_aux']):.6f} "
-                f"route_ratio={float(reduced_metrics['routing_ratio']):.6f} "
-                f"time_ms={elapsed:.1f} "
-                f"power_w={','.join(f'{x:.0f}' for x in latest_power) or 'n/a'}",
+                f"[{timestamp} step {step_number}] "
+                f"loss={standard_ce_value:.4f} lr={current_lr:.8g} "
+                f"lr_phase={_lr_phase(step, args)} grad_norm={float(grad_norm.detach().float().item()):.3f} "
+                f"tokens/s={tokens_per_second / 1e6:.2f}M mfu={100.0 * mfu:.1f}% "
+                f"moe_balance_loss={float(reduced_metrics['moe_balance_loss']):.4f} expert_gini={float(expert_gini):.4f} "
+                f"objective={float(reduced):.6f} fb_ce={float(reduced_metrics['feedback_ce']):.6f} "
+                f"router={float(reduced_metrics['router_loss']):.6f} route_ratio={float(reduced_metrics['routing_ratio']):.6f} "
+                f"time_ms={elapsed:.1f} power_w={','.join(f'{x:.0f}' for x in latest_power) or 'n/a'}",
                 flush=True,
             )
+        if int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0:
+            if world > 1:
+                dist.barrier()
+            eval_result = evaluate_model(
+                model.module if world > 1 else model,
+                eval_stream,
+                args,
+                device,
+                {
+                    "mmlu": args.mmlu_data,
+                    "arc_challenge": args.arc_challenge_data,
+                    "hellaswag": args.hellaswag_data,
+                },
+            )
+            eval_loss_tensor = torch.tensor(
+                [float(eval_result["loss"])], device=device, dtype=torch.float32
+            )
+            if world > 1:
+                dist.all_reduce(eval_loss_tensor)
+                eval_loss_tensor.div_(float(world))
+            eval_result["loss"] = float(eval_loss_tensor.item())
+            eval_record = {
+                "step": step_number,
+                "loss": float(eval_result["loss"]),
+                "mmlu": (None if eval_result["mmlu"][0] is None else float(eval_result["mmlu"][0])),
+                "mmlu_n": int(eval_result["mmlu"][1]),
+                "arc_challenge": (None if eval_result["arc_challenge"][0] is None else float(eval_result["arc_challenge"][0])),
+                "arc_challenge_n": int(eval_result["arc_challenge"][1]),
+                "hellaswag": (None if eval_result["hellaswag"][0] is None else float(eval_result["hellaswag"][0])),
+                "hellaswag_n": int(eval_result["hellaswag"][1]),
+                "eval_took": float(eval_result["eval_took"]),
+            }
+            if rank == 0:
+                log["eval"].append(eval_record)
+                timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(
+                    timespec="seconds"
+                ).replace("+00:00", "Z")
+                benchmark_text = " ".join(
+                    f"{name}={eval_record[name] if eval_record[name] is not None else 'null'}(n={eval_record[name + '_n']})"
+                    for name in ("mmlu", "arc_challenge", "hellaswag")
+                )
+                print(
+                    f"[{timestamp} step {step_number}] eval(step {step_number}). "
+                    f"loss={eval_record['loss']:.4f} {benchmark_text} "
+                    f"eval_took={eval_record['eval_took']:.1f}s",
+                    flush=True,
+                )
+            if world > 1:
+                dist.barrier()
         if args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             if graph_optimizer_step is not None:
                 graph_optimizer_step.sync_python_state()
