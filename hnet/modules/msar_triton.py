@@ -379,6 +379,53 @@ def _msar_mix_grad_streams(
     tl.store(g3_ptr + base + d, grad * m3, mask=mask)
 
 
+@triton.jit
+def _msar_mix_grad_fused(
+    grad_ptr, mix_ptr, s0_ptr, s1_ptr, s2_ptr, s3_ptr,
+    g0_ptr, g1_ptr, g2_ptr, g3_ptr, grad_mix_ptr,
+    tokens, width, BLOCK_D: tl.constexpr,
+):
+    """Fuse MSAR mix stream and gate gradients in one token program.
+
+    The stream-gradient map and gate-gradient map both read ``grad`` and the
+    four source streams.  Keeping one program per token lets the loop write
+    each stream gradient while accumulating the four FP32 dot products in the
+    same tile order as the previous two kernels.  The output stream dtype is
+    preserved by the stores; only the gate derivatives remain FP32.
+    """
+    token = tl.program_id(0)
+    d = tl.arange(0, BLOCK_D)
+    base = token * width
+    m0 = tl.load(mix_ptr + token * 4 + 0).to(tl.float32)
+    m1 = tl.load(mix_ptr + token * 4 + 1).to(tl.float32)
+    m2 = tl.load(mix_ptr + token * 4 + 2).to(tl.float32)
+    m3 = tl.load(mix_ptr + token * 4 + 3).to(tl.float32)
+    acc0 = tl.zeros((), dtype=tl.float32)
+    acc1 = tl.zeros((), dtype=tl.float32)
+    acc2 = tl.zeros((), dtype=tl.float32)
+    acc3 = tl.zeros((), dtype=tl.float32)
+    for start in range(0, width, BLOCK_D):
+        idx = start + d
+        mask = (token < tokens) & (idx < width)
+        grad = tl.load(grad_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        s0 = tl.load(s0_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        s1 = tl.load(s1_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        s2 = tl.load(s2_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        s3 = tl.load(s3_ptr + base + idx, mask=mask, other=0).to(tl.float32)
+        tl.store(g0_ptr + base + idx, grad * m0, mask=mask)
+        tl.store(g1_ptr + base + idx, grad * m1, mask=mask)
+        tl.store(g2_ptr + base + idx, grad * m2, mask=mask)
+        tl.store(g3_ptr + base + idx, grad * m3, mask=mask)
+        acc0 += tl.sum(grad * s0, axis=0)
+        acc1 += tl.sum(grad * s1, axis=0)
+        acc2 += tl.sum(grad * s2, axis=0)
+        acc3 += tl.sum(grad * s3, axis=0)
+    tl.store(grad_mix_ptr + token * 4 + 0, acc0)
+    tl.store(grad_mix_ptr + token * 4 + 1, acc1)
+    tl.store(grad_mix_ptr + token * 4 + 2, acc2)
+    tl.store(grad_mix_ptr + token * 4 + 3, acc3)
+
+
 class _MSARMix(torch.autograd.Function):
     @staticmethod
     def forward(ctx, mix, s0, s1, s2, s3):
@@ -405,10 +452,20 @@ class _MSARMix(torch.autograd.Function):
         tokens = s0.numel() // width
         grad_out = grad_out.contiguous().float()
         grad_mix = torch.empty_like(mix)
-        _msar_mix_grad_mix[(tokens,)](grad_out, s0, s1, s2, s3, grad_mix, tokens, width, BLOCK_D=256, num_warps=4)
         grads = [torch.empty_like(s0) for _ in range(4)]
-        _msar_mix_grad_streams[(tokens * triton.cdiv(width, 256),)](
-            grad_out, mix, *grads, tokens, width, BLOCK_D=256, num_warps=4
+        _msar_mix_grad_fused[(tokens,)](
+            grad_out,
+            mix,
+            s0,
+            s1,
+            s2,
+            s3,
+            *grads,
+            grad_mix,
+            tokens,
+            width,
+            BLOCK_D=256,
+            num_warps=4,
         )
         return (grad_mix, *grads)
 
