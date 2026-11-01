@@ -27,6 +27,34 @@ from hnet.models.config_hnet import HNetConfig
 from hnet.te import fp8_context, graph_capture_enabled, te_autocast
 
 
+def _msar_score_impl(source, query):
+    """Fuse the FP32 RMS normalization and MSAR query contraction.
+
+    MSAR's router scores are numerically defined in FP32, but the source bank
+    is stored in mixer precision.  The unfused spelling materializes an FP32
+    normalized bank and then launches a second contraction for every source
+    and stream.  Inductor can generate one graph-safe kernel for the complete
+    operation, including its backward, while preserving the same FP32 math.
+    ``query`` is always [K, D] so one compiled function handles both the
+    single-query and cached multi-query paths without host shape reads.
+    """
+    normalized = F.rms_norm(source.float(), (source.shape[-1],), eps=1e-6)
+    return torch.einsum("n...d,kd->n...k", normalized, query) / (
+        source.shape[-1] ** 0.5
+    )
+
+
+# Compile before CUDA-graph capture on the first representative warmup call.
+# Disable Inductor's nested CUDA-graph manager: H-Net owns the outer graph and
+# the generated Triton kernels must be ordinary capture-safe launches.
+_msar_score = torch.compile(
+    _msar_score_impl,
+    fullgraph=True,
+    dynamic=True,
+    options={"triton.cudagraphs": False},
+)
+
+
 @dataclass
 class IsotropicInferenceParams:
     """Inference parameters that are passed to the main model in order
@@ -354,16 +382,14 @@ class Isotropic(nn.Module):
             source_scores = []
             if stream_cache is None:
                 for stream_index, stream_bank in enumerate(stream_banks):
-                    # Use PyTorch's fused RMS normalization kernel.  The
-                    # explicitly FP32 normalization keeps router score math
-                    # stable while avoiding any enclosing FP8 autocast.
-                    stream_f = stream_bank.float()
-                    with te_autocast(enabled=False):
-                        normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
-                    source_scores.append(
-                        torch.einsum("n...d,d->n...", normed, query[stream_index])
-                        / (self.d_model**0.5)
+                    # Fuse FP32 RMS normalization and the score contraction;
+                    # the singleton query dimension is removed after the
+                    # compiled kernel so the routing equations are unchanged.
+                    scores = _msar_score(
+                        stream_bank,
+                        query[stream_index : stream_index + 1],
                     )
+                    source_scores.append(scores[..., 0])
             else:
                 # The aggregate source tensor changes whenever the current
                 # MSAR state changes, so normalizing it repeats the old
@@ -386,15 +412,6 @@ class Isotropic(nn.Module):
                     for source_index, (source_key, source_bank) in enumerate(
                         zip(source_keys, source_banks)
                     ):
-                        norm_key = ("rms_norm_source", source_key, stream_index)
-                        normed = stream_cache.get(norm_key)
-                        if normed is None:
-                            stream_f = source_bank[stream_index].float()
-                            with te_autocast(enabled=False):
-                                normed = F.rms_norm(
-                                    stream_f, (self.d_model,), eps=1e-6
-                                )
-                            stream_cache[norm_key] = normed
                         if source_index < batch_source_count:
                             scores_key = ("rms_scores_source", source_key, stream_index)
                             scores_entry = stream_cache.get(scores_key)
@@ -407,20 +424,21 @@ class Isotropic(nn.Module):
                                 query_all = self.msar_queries[score_start:, stream_index].float()
                                 # Keep the contraction in FP32; only the
                                 # selected scalar scores are retained by the
-                                # layer's routing path.
-                                scores_all = torch.matmul(
-                                    normed.reshape(-1, self.d_model), query_all.transpose(0, 1)
-                                ).reshape(
-                                    normed.shape[0], normed.shape[1], normed.shape[2], -1
-                                ) / (self.d_model**0.5)
+                                # layer's routing path.  The compiled helper
+                                # also fuses the source normalization.
+                                scores_all = _msar_score(
+                                    source_bank[stream_index], query_all
+                                )
                                 stream_cache[scores_key] = (score_start, scores_all)
                             else:
                                 score_start, scores_all = scores_entry
                             score_sources.append(scores_all[..., layer_idx - score_start])
                         else:
                             score_sources.append(
-                                torch.matmul(normed, query[stream_index])
-                                / (self.d_model**0.5)
+                                _msar_score(
+                                    source_bank[stream_index],
+                                    query[stream_index : stream_index + 1],
+                                )[..., 0]
                             )
                     source_scores.append(torch.cat(score_sources, dim=0))
             score_bank = torch.stack(source_scores, dim=1)
@@ -465,12 +483,11 @@ class Isotropic(nn.Module):
             source_streams = stream_banks
             source_scores = []
             for stream_bank in source_streams:
-                stream_f = stream_bank.float()
-                with te_autocast(enabled=False):
-                    normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
-                scores = torch.einsum("k...d,kd->k...", normed, query) / (
-                    self.d_model**0.5
-                )
+                scores = _msar_score(stream_bank, query)
+                # The fused helper computes the KxK contraction for the
+                # packed stream bank; retain its diagonal (each stream uses
+                # its matching query) and restore [K, B, L] ordering.
+                scores = scores.diagonal(dim1=0, dim2=-1).movedim(-1, 0)
                 source_scores.append(scores)
             score_bank = torch.stack(source_scores, dim=0)
             if duplicate_last:
