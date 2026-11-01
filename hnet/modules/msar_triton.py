@@ -231,8 +231,9 @@ class _WeightedSourceReduce(torch.autograd.Function):
         # The production MSAR width is 1536.  A 1024-wide tile uses two
         # feature tiles instead of three and is faster on the B300 shape.
         # This dimension only partitions independent output features; the
-        # source accumulation order is unchanged. Keep the weight-gradient
-        # tile at 256 below so its FP32 reduction order remains canonical.
+        # source accumulation order is unchanged. The weight-gradient path
+        # uses a 1024-wide reduction tile below, which cuts its six feature
+        # passes to two at the production width while retaining FP32 math.
         block_d = 1024
         grid = (batch * length * triton.cdiv(width, block_d),)
         _weighted_reduce_forward[grid](
@@ -417,7 +418,11 @@ def _depthwise_dw(
         batch,
         channels,
         length,
-        BLOCK_T=256,
+        # Weight-gradient reduction is bandwidth-bound.  A 512-token tile halves the
+        # launch grid at the canonical B16/S4096 shape and benchmarks faster
+        # across the source-bank sizes while retaining the same FP32
+        # accumulation and causal indexing.
+        BLOCK_T=512,
         KERNEL=kernel,
         K_PAD=16,
         num_warps=4,
@@ -438,7 +443,10 @@ def _depthwise_dx(grad_y: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         raise ValueError("depthwise weight channel count must match grad_y")
     kernel = weight.shape[-1]
     grad_x = torch.empty_like(grad_y)
-    block_t = 256
+    # Match the larger backward tile used by the input-gradient kernel.  The
+    # weight-gradient reduction is especially launch-bound because each
+    # program owns one channel and streams the full batch/sequence.
+    block_t = 512
     _causal_depthwise_dx[(batch * channels,)](
         grad_y,
         weight,
