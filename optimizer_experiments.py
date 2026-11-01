@@ -891,7 +891,20 @@ class AnchorMuon(torch.optim.Optimizer):
             master = state["master_param"] = master.to(device=p.device, dtype=torch.float32)
         return master
 
-    def _soda_weight(self, t: int) -> float:
+    def _soda_weight(self, t: int | torch.Tensor) -> float | torch.Tensor:
+        # Graph replay cannot read a device scalar through ``float``/``item``.
+        # Keep the eager path bit-for-bit unchanged while allowing the graph
+        # optimizer wrapper to drive the step counter from a CUDA tensor.
+        if isinstance(t, torch.Tensor):
+            soda_scale = getattr(self, "_graph_soda_scale", None)
+            if soda_scale is None or soda_scale.device != t.device:
+                raise RuntimeError(
+                    "graph optimizer scalars must be initialized with set_graph_scalars"
+                )
+            return (
+                soda_scale
+                / (t.to(dtype=torch.float32) + 1.0).pow(self.soda_lambda_power)
+            ).clamp_max(1.0)
         return min(1.0, self.soda_lambda_scale / float(t + 1) ** self.soda_lambda_power)
 
     def _pre_matrix_source(self, p: torch.Tensor, grad: torch.Tensor, momentum_beta: float) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1030,7 +1043,13 @@ class AnchorMuon(torch.optim.Optimizer):
 
         masters = [record[1] for record in records]
         anchors = [record[2] for record in records]
-        torch._foreach_lerp_(masters, anchors, soda_weight)
+        if isinstance(soda_weight, torch.Tensor):
+            # CUDA-scalar foreach lerp is not capture-safe on this build.
+            scaled_anchors = torch._foreach_mul(anchors, soda_weight)
+            torch._foreach_mul_(masters, 1.0 - soda_weight)
+            torch._foreach_add_(masters, scaled_anchors)
+        else:
+            torch._foreach_lerp_(masters, anchors, soda_weight)
 
         if self.matrix_weight_decay:
             decay_records = [record for record in records if not record[4]]
@@ -1040,11 +1059,12 @@ class AnchorMuon(torch.optim.Optimizer):
                     1.0 - lr * self.matrix_weight_decay,
                 )
 
-        torch._foreach_add_(
-            masters,
-            [record[3] for record in records],
-            alpha=-lr,
-        )
+        updates = [record[3] for record in records]
+        if isinstance(lr, torch.Tensor):
+            scaled_updates = torch._foreach_mul(updates, -lr)
+            torch._foreach_add_(masters, scaled_updates)
+        else:
+            torch._foreach_add_(masters, updates, alpha=-lr)
         # The model keeps BF16 parameters with FP32 master state.  A scalar
         # ``p.copy_(master.to(...))`` launch for every matrix dominated the
         # optimizer tail once the GramNS banks were batched.  Foreach copy
@@ -1060,7 +1080,14 @@ class AnchorMuon(torch.optim.Optimizer):
             torch._foreach_copy_(copy_params, copy_masters)
         return len(records)
 
-    def _step_matrix_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
+    def _step_matrix_group(
+        self,
+        group: dict[str, Any],
+        *,
+        lr: float | torch.Tensor,
+        t: int | torch.Tensor,
+        graph_step: torch.Tensor | None = None,
+    ) -> dict[str, float | torch.Tensor]:
         beta_m = float(group["momentum"])
         # Gather matrix records first.  The momentum/source preprocessing below
         # batches equal-shaped parameters, avoiding one FP32 cast and one
@@ -1092,16 +1119,24 @@ class AnchorMuon(torch.optim.Optimizer):
             raw.append((p, anchor, grad))
 
         if not raw:
+            fallback_lr = group.get("fallback_lr", lr)
+            if isinstance(graph_step, torch.Tensor):
+                # The fallback rate is fixed relative to the matrix rate.  Keep
+                # that ratio in Python while the scheduled scalar itself stays
+                # on device for graph replay.
+                base_lr = float(group.get("lr", 1.0))
+                fallback_lr = lr * (float(fallback_lr) / base_lr)
             fallback_stats = self._step_fallback_params(
                 fallback_params,
                 group,
-                lr=float(group.get("fallback_lr", lr)),
+                lr=fallback_lr,
                 t=t,
+                graph_step=graph_step,
             )
             return {
                 "matrix_count": 0.0,
                 "fallback_count": float(fallback_stats["fallback_count"]),
-                "soda_weight": float(fallback_stats["soda_weight"]),
+                "soda_weight": fallback_stats["soda_weight"],
             }
 
         # Include original shape as well as effective matrix shape. Singleton
@@ -1191,17 +1226,22 @@ class AnchorMuon(torch.optim.Optimizer):
                     soda_weight=soda_weight,
                 )
 
+        fallback_lr = group.get("fallback_lr", lr)
+        if isinstance(graph_step, torch.Tensor):
+            base_lr = float(group.get("lr", 1.0))
+            fallback_lr = lr * (float(fallback_lr) / base_lr)
         fallback_stats = self._step_fallback_params(
             fallback_params,
             group,
-            lr=float(group.get("fallback_lr", lr)),
+            lr=fallback_lr,
             t=t,
+            graph_step=graph_step,
         )
 
         return {
             "matrix_count": float(matrix_count),
             "fallback_count": float(fallback_stats["fallback_count"]),
-            "soda_weight": float(soda_weight),
+            "soda_weight": soda_weight,
         }
 
     def _step_fallback_param(
@@ -1257,17 +1297,27 @@ class AnchorMuon(torch.optim.Optimizer):
             p.copy_(master.to(dtype=p.dtype))
         return 1
 
-    def _step_fallback_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
-        return self._step_fallback_params(group["params"], group, lr=lr, t=t)
+    def _step_fallback_group(
+        self,
+        group: dict[str, Any],
+        *,
+        lr: float | torch.Tensor,
+        t: int | torch.Tensor,
+        graph_step: torch.Tensor | None = None,
+    ) -> dict[str, float | torch.Tensor]:
+        return self._step_fallback_params(
+            group["params"], group, lr=lr, t=t, graph_step=graph_step
+        )
 
     def _step_fallback_params(
         self,
         params: Iterable[torch.Tensor],
         group: dict[str, Any],
         *,
-        lr: float,
-        t: int,
-    ) -> dict[str, float]:
+        lr: float | torch.Tensor,
+        t: int | torch.Tensor,
+        graph_step: torch.Tensor | None = None,
+    ) -> dict[str, float | torch.Tensor]:
         # AdamATan2 is used by a large collection of skinny controls (biases,
         # norms, router scales).  The old scalar loop launched every pointwise
         # operation once per tensor.  Group equal-shape tensors and use
@@ -1289,12 +1339,16 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_count = 0
         for bucket in buckets.values():
             fallback_count += self._step_fallback_bucket(
-                bucket, group, lr=lr, t=t
+                bucket, group, lr=lr, t=t, graph_step=graph_step
             )
         return {
             "matrix_count": 0.0,
             "fallback_count": float(fallback_count),
-            "soda_weight": float(self._soda_weight(t)),
+            "soda_weight": (
+                self._soda_weight(t)
+                if isinstance(graph_step, torch.Tensor)
+                else float(self._soda_weight(t))
+            ),
         }
 
     def _step_fallback_bucket(
@@ -1302,8 +1356,9 @@ class AnchorMuon(torch.optim.Optimizer):
         params: list[torch.Tensor],
         group: dict[str, Any],
         *,
-        lr: float,
-        t: int,
+        lr: float | torch.Tensor,
+        t: int | torch.Tensor,
+        graph_step: torch.Tensor | None = None,
     ) -> int:
         if not params:
             return 0
@@ -1332,7 +1387,8 @@ class AnchorMuon(torch.optim.Optimizer):
                 first = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
             elif first.device != p.device or first.dtype != torch.float32:
                 first = state["exp_avg"] = first.to(device=p.device, dtype=torch.float32)
-            state["step"] = int(state.get("step", 0)) + 1
+            if not isinstance(graph_step, torch.Tensor):
+                state["step"] = int(state.get("step", 0)) + 1
             exp_avg_sq.append(second)
             exp_avg.append(first)
             masters.append(self._master_param(p))
@@ -1356,27 +1412,44 @@ class AnchorMuon(torch.optim.Optimizer):
         grads = list(grad_stack.unbind(0))
         torch._foreach_mul_(exp_avg_sq, beta2)
         torch._foreach_addcmul_(exp_avg_sq, grads, grads, value=1.0 - beta2)
-        denoms = torch._foreach_div(
-            exp_avg_sq,
-            [max(1.0 - beta2 ** int(state["step"]), 1e-16) for state in states],
-        )
+        if isinstance(graph_step, torch.Tensor):
+            beta_tensors = getattr(self, "_graph_beta_tensors", {})
+            beta2_tensor = beta_tensors.get(beta2)
+            beta1_tensor = beta_tensors.get(beta1)
+            if beta1_tensor is None or beta2_tensor is None:
+                raise RuntimeError(
+                    "graph optimizer beta scalars must be initialized with set_graph_scalars"
+                )
+            bias2 = (1.0 - beta2_tensor**graph_step).clamp_min(1e-16)
+            bias1 = (1.0 - beta1_tensor**graph_step).clamp_min(1e-16)
+        else:
+            bias2 = [max(1.0 - beta2 ** int(state["step"]), 1e-16) for state in states]
+            bias1 = [max(1.0 - beta1 ** int(state["step"]), 1e-16) for state in states]
+        denoms = torch._foreach_div(exp_avg_sq, bias2)
         denoms = torch._foreach_sqrt(denoms)
         denoms = torch._foreach_add(denoms, eps)
 
         torch._foreach_mul_(exp_avg, beta1)
         torch._foreach_add_(exp_avg, grads, alpha=1.0 - beta1)
-        numerators = torch._foreach_div(
-            exp_avg,
-            [max(1.0 - beta1 ** int(state["step"]), 1e-16) for state in states],
-        )
+        numerators = torch._foreach_div(exp_avg, bias1)
         updates = [torch.atan2(numerator, denom) for numerator, denom in zip(numerators, denoms, strict=True)]
 
-        torch._foreach_lerp_(masters, anchors, self._soda_weight(t))
+        soda_weight = self._soda_weight(t)
+        if isinstance(soda_weight, torch.Tensor):
+            scaled_anchors = torch._foreach_mul(anchors, soda_weight)
+            torch._foreach_mul_(masters, 1.0 - soda_weight)
+            torch._foreach_add_(masters, scaled_anchors)
+        else:
+            torch._foreach_lerp_(masters, anchors, soda_weight)
         if not bool(getattr(params[0], "_no_weight_decay", False)):
             decay = float(group.get("fallback_weight_decay", 0.0))
             if decay:
                 torch._foreach_mul_(masters, 1.0 - lr * decay)
-        torch._foreach_add_(masters, updates, alpha=-lr)
+        if isinstance(lr, torch.Tensor):
+            scaled_updates = torch._foreach_mul(updates, -lr)
+            torch._foreach_add_(masters, scaled_updates)
+        else:
+            torch._foreach_add_(masters, updates, alpha=-lr)
         torch._foreach_copy_(active_params, masters)
         return len(states)
 
@@ -1387,31 +1460,109 @@ class AnchorMuon(torch.optim.Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        graph_mode = isinstance(getattr(self, "_graph_lr", None), torch.Tensor)
+        if graph_mode:
+            if not isinstance(getattr(self, "_graph_step", None), torch.Tensor):
+                raise RuntimeError("graph optimizer step requires a device step tensor")
+            # Increment exactly once per replay.  All parameter groups share
+            # the trainer's global schedule, even when their fallback rate is
+            # a fixed ratio of the matrix rate.
+            graph_t = self._graph_step.add_(1)
+            graph_lr = self._graph_lr
+        else:
+            graph_t = None
+            graph_lr = None
+
         stats = {
             "matrix_count": 0.0,
             "fallback_count": 0.0,
             "soda_weight_sum": 0.0,
             "group_count": 0.0,
         }
-        for group in self.param_groups:
-            k = int(group.get("k", 0))
-            t = k + 1
-            lr = float(group["lr"])
+        for group_index, group in enumerate(self.param_groups):
+            if graph_mode:
+                t = graph_t
+                # ``_graph_group_lr_ratios`` is fixed when capture starts and
+                # preserves each group's configured schedule ratio on replay.
+                # In particular, the fallback-only group normally runs at a
+                # lower AdamATan2 rate than the matrix group.
+                lr = graph_lr * self._graph_group_lr_ratios[group_index]
+            else:
+                k = int(group.get("k", 0))
+                t = k + 1
+                lr = float(group["lr"])
 
             if group.get("use_matrix_update", False):
-                group_stats = self._step_matrix_group(group, lr=lr, t=t)
+                group_stats = self._step_matrix_group(
+                    group, lr=lr, t=t, graph_step=graph_t
+                )
             else:
-                group_stats = self._step_fallback_group(group, lr=lr, t=t)
-            stats["matrix_count"] += group_stats["matrix_count"]
-            stats["fallback_count"] += group_stats["fallback_count"]
-            stats["soda_weight_sum"] += group_stats["soda_weight"]
-            stats["group_count"] += 1.0
-            group["k"] = t
-
-        stats["soda_weight"] = stats["soda_weight_sum"] / max(stats["group_count"], 1.0)
-        del stats["soda_weight_sum"]
-        self.last_stats = stats
+                group_stats = self._step_fallback_group(
+                    group, lr=lr, t=t, graph_step=graph_t
+                )
+            if not graph_mode:
+                stats["matrix_count"] += group_stats["matrix_count"]
+                stats["fallback_count"] += group_stats["fallback_count"]
+                stats["soda_weight_sum"] += group_stats["soda_weight"]
+                stats["group_count"] += 1.0
+                group["k"] = t
+            else:
+                # Python state must not be mutated by a replay.  The device
+                # step tensor above is the authoritative counter in graph
+                # mode; this branch is executed only during capture.
+                pass
+        if graph_mode:
+            self.last_stats = {}
+        else:
+            stats["soda_weight"] = stats["soda_weight_sum"] / max(stats["group_count"], 1.0)
+            del stats["soda_weight_sum"]
+            self.last_stats = stats
         return loss
+
+    def set_graph_scalars(
+        self, lr: torch.Tensor, step: torch.Tensor
+    ) -> None:
+        """Select device scalars for a CUDA-graph optimizer capture/replay.
+
+        ``lr`` is overwritten by the trainer before each replay. ``step`` is
+        incremented by the captured update itself, so Adam bias correction and
+        SODA anchoring continue to evolve without Python reads during replay.
+        """
+        if lr.ndim != 0 or step.ndim != 0 or not lr.is_cuda or not step.is_cuda:
+            raise ValueError("graph optimizer scalars must be CUDA scalar tensors")
+        self._graph_lr = lr
+        self._graph_step = step
+        # The trainer schedules the matrix rate and keeps fallback groups at a
+        # fixed ratio (0.5x for AdamATan2).  Capture that ratio as a constant;
+        # reading Python param-group state during graph replay would be stale
+        # and the old path accidentally applied the matrix rate to fallback
+        # groups.
+        base_group_lr = float(lr.item())
+        if base_group_lr <= 0.0:
+            raise ValueError("graph optimizer learning rate must be positive")
+        self._graph_group_lr_ratios = tuple(
+            1.0
+            if group.get("use_matrix_update", False)
+            else float(group.get("lr", base_group_lr)) / base_group_lr
+            for group in self.param_groups
+        )
+        self._graph_soda_scale = torch.tensor(
+            self.soda_lambda_scale, device=lr.device, dtype=torch.float32
+        )
+        beta_values = set()
+        for group in self.param_groups:
+            beta_values.update(float(v) for v in group.get("betas", ()))
+        self._graph_beta_tensors = {
+            beta: torch.tensor(beta, device=lr.device, dtype=torch.float32)
+            for beta in beta_values
+        }
+
+    def clear_graph_scalars(self) -> None:
+        self._graph_lr = None
+        self._graph_step = None
+        self._graph_soda_scale = None
+        self._graph_beta_tensors = {}
+        self._graph_group_lr_ratios = ()
 
 
 def build_param_groups(
