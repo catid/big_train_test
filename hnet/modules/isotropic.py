@@ -374,8 +374,8 @@ class Isotropic(nn.Module):
                 # every layer and exhaust the canonical CUDA graph pool.
                 # Every source except the final current state remains fixed
                 # until the next MSAR boundary.  Contract those immutable
-                # banks against all layer queries once, then select the
-                # current layer's column below.  The final source changes on
+                # banks against the remaining layer queries once, then select
+                # the current layer's column below.  The final source changes on
                 # every layer, so keep its single-query contraction to avoid
                 # computing unused columns.
                 batch_source_count = len(source_keys)
@@ -397,20 +397,26 @@ class Isotropic(nn.Module):
                             stream_cache[norm_key] = normed
                         if source_index < batch_source_count:
                             scores_key = ("rms_scores_source", source_key, stream_index)
-                            scores_all = stream_cache.get(scores_key)
-                            if scores_all is None:
-                                # [N,B,L,D] @ [D,Layers] -> [N,B,L,Layers].
+                            scores_entry = stream_cache.get(scores_key)
+                            if scores_entry is None:
+                                # [N,B,L,D] @ [D,RemainingLayers] ->
+                                # [N,B,L,RemainingLayers].  Do not compute
+                                # columns for layers before this source first
+                                # appeared; those queries are never used.
+                                score_start = layer_idx
+                                query_all = self.msar_queries[score_start:, stream_index].float()
                                 # Keep the contraction in FP32; only the
                                 # selected scalar scores are retained by the
                                 # layer's routing path.
-                                query_all = self.msar_queries[:, stream_index].float()
                                 scores_all = torch.matmul(
                                     normed.reshape(-1, self.d_model), query_all.transpose(0, 1)
                                 ).reshape(
                                     normed.shape[0], normed.shape[1], normed.shape[2], -1
                                 ) / (self.d_model**0.5)
-                                stream_cache[scores_key] = scores_all
-                            score_sources.append(scores_all[..., layer_idx])
+                                stream_cache[scores_key] = (score_start, scores_all)
+                            else:
+                                score_start, scores_all = scores_entry
+                            score_sources.append(scores_all[..., layer_idx - score_start])
                         else:
                             score_sources.append(
                                 torch.matmul(normed, query[stream_index])
