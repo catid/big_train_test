@@ -668,8 +668,32 @@ class LatentMoE(nn.Module):
             self._m_splits_cache[split_key] = m_splits
         elif getattr(m_splits, "_hnet_static_splits", None) is None:
             m_splits._hnet_static_splits = (capacity,) * self.num_experts
-        expert_hidden = self.expert_swiglu(self.experts_fc1(dispatched, m_splits))
-        expert_out = self.experts_fc2(expert_hidden, m_splits)
+        # The canonical graph executes each MoE layer four times before its
+        # optimizer update (two inner-loop iterations and two FBT passes).
+        # TE can cache the FP8 expert weights after the first captured call;
+        # the first call is present in every replay and therefore refreshes
+        # the cache after each update, while later calls reuse it.  Keep eager
+        # and backend-warmup calls uncached.
+        # Keep one cache epoch per TE module.  FC1 and FC2 have independent
+        # FP8 weight workspaces; sharing one flag would make FC2 skip its
+        # first quantization during graph capture.
+        is_first_microbatch = None
+        if graph_capture_enabled() and torch.cuda.is_current_stream_capturing():
+            is_first_microbatch = not getattr(self, "_hnet_fc1_graph_seen", False)
+            self._hnet_fc1_graph_seen = True
+        expert_hidden = self.expert_swiglu(
+            self.experts_fc1(
+                dispatched, m_splits, is_first_microbatch=is_first_microbatch
+            )
+        )
+        if graph_capture_enabled() and torch.cuda.is_current_stream_capturing():
+            is_first_microbatch_fc2 = not getattr(self, "_hnet_fc2_graph_seen", False)
+            self._hnet_fc2_graph_seen = True
+        else:
+            is_first_microbatch_fc2 = None
+        expert_out = self.experts_fc2(
+            expert_hidden, m_splits, is_first_microbatch=is_first_microbatch_fc2
+        )
         # TE returns a flattened top-1 probability vector. Apply it before
         # unpermute so the custom op receives no narrow [N,1] probability
         # tensor (which older TE builds cannot differentiate correctly).

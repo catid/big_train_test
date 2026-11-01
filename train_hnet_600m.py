@@ -1567,6 +1567,11 @@ class CUDAGraphStep:
                 del graph_backend_warmup
                 del graph_backend_loss, _graph_backend_metrics
                 torch.cuda.synchronize(self.device)
+            # A model may be recaptured after a restore or allocator reset.
+            # Clear the per-module first-microbatch markers so this capture
+            # refreshes every FP8 weight workspace once before replaying the
+            # remaining recurrent/FBT executions with cached weights.
+            hnet_te.reset_graph_weight_cache_flags(self.forward_model)
             # Capture on the same non-default stream used for DDP construction
             # and warmup. Keep TE's graph flag active for this raw capture:
             # ending it after backend warmup would let outermost FP8 contexts

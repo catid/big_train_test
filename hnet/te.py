@@ -48,6 +48,26 @@ _CUBLASLT_VERSION = None
 _RUNTIME_MANIFEST = Path(__file__).resolve().parents[1] / "runtime_manifest.json"
 
 
+def reset_graph_weight_cache_flags(model: torch.nn.Module) -> None:
+    """Reset per-capture FP8 weight-cache flags on H-Net TE modules.
+
+    A model can be captured more than once (for example after a checkpoint
+    restore or a graph reallocation).  The first-microbatch marker is Python
+    state used only while constructing a capture; leaving it set from an
+    earlier graph would make the next graph skip its first weight quantization
+    and reuse an FP8 workspace from the previous parameter state.
+    """
+
+    for module in model.modules():
+        for name in (
+            "_hnet_graph_seen",
+            "_hnet_fc1_graph_seen",
+            "_hnet_fc2_graph_seen",
+        ):
+            if hasattr(module, name):
+                setattr(module, name, False)
+
+
 def _preload_pinned_cuda_blas() -> None:
     """Load the cuBLAS ABI used to build the pinned TE checkout.
 
@@ -180,7 +200,19 @@ class AlignedTELinear(torch.nn.Module):
         # has an active autocast region.  Keep this explicit at the module
         # boundary so a caller cannot accidentally quantize those projections.
         if self.fp8:
-            out = self.linear(flat)
+            # During a captured training step the same parameter is consumed
+            # by multiple recurrent/FBT executions before the optimizer runs.
+            # Quantize its FP8 weight once on the first captured call and let
+            # later calls reuse TE's weight workspace.  The first call is
+            # replayed on every graph launch, so weights are refreshed after
+            # each optimizer update while the remaining calls avoid redundant
+            # quantization.  Eager calls and the graph backend warmup retain
+            # TE's uncached behavior.
+            is_first_microbatch = None
+            if _GRAPH_CAPTURE and torch.cuda.is_current_stream_capturing():
+                is_first_microbatch = not getattr(self, "_hnet_graph_seen", False)
+                self._hnet_graph_seen = True
+            out = self.linear(flat, is_first_microbatch=is_first_microbatch)
         else:
             with te_autocast(enabled=False):
                 out = self.linear(flat)
