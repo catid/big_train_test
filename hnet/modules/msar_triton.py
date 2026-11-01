@@ -1,8 +1,9 @@
 """Triton kernels for the padded MSAR depthwise convolution.
 
-The forward MSAR expansion stays on PyTorch's depthwise convolution kernel.
-Its input and weight-gradient kernels are short causal correlations and can be
-computed without the generic grouped-convolution backward launches.
+The MSAR expansion and both gradient correlations use compact causal Triton
+kernels. This avoids the generic grouped-convolution launches selected by
+``torch.conv1d`` at the production batch and channel sizes while preserving
+the zero-left-padding contract.
 """
 
 from __future__ import annotations
@@ -10,6 +11,46 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+
+@triton.jit
+def _causal_depthwise_dy(
+    x_ptr,
+    weight_ptr,
+    output_ptr,
+    batch,
+    channels,
+    length,
+    BLOCK_T: tl.constexpr,
+    KERNEL: tl.constexpr,
+):
+    """Forward causal depthwise correlation for the MSAR stream bank.
+
+    ``torch.conv1d`` was previously used here.  At the production B16/S4096
+    shape it selected the generic depthwise path and accounted for roughly
+    29 ms of every replay.  The kernel keeps the same zero-left-padding and
+    filter orientation, accumulates in FP32, and narrows once at the output.
+    """
+
+    program = tl.program_id(0)
+    batch_index = program // channels
+    channel = program % channels
+    base = (batch_index * channels + channel) * length
+    for tile_start in range(0, length, BLOCK_T):
+        token = tile_start + tl.arange(0, BLOCK_T)
+        token_mask = token < length
+        acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        for coefficient in range(KERNEL):
+            source_token = token - (KERNEL - 1 - coefficient)
+            source_mask = token_mask & (source_token >= 0)
+            source = tl.load(
+                x_ptr + base + source_token,
+                mask=source_mask,
+                other=0,
+            ).to(tl.float32)
+            weight = tl.load(weight_ptr + channel * KERNEL + coefficient).to(tl.float32)
+            acc += source * weight
+        tl.store(output_ptr + base + token, acc, mask=token_mask)
 
 
 @triton.jit
@@ -408,6 +449,35 @@ def _depthwise_dx(grad_y: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return grad_x
 
 
+def _depthwise_dy(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Fused forward path matching the causal grouped-convolution contract."""
+
+    if not x.is_cuda or not weight.is_cuda:
+        raise RuntimeError("MSAR Triton depthwise forward requires CUDA tensors")
+    if x.ndim != 3 or weight.ndim != 3 or weight.shape[1] != 1:
+        raise ValueError(
+            "expected x=(B,C,L) and depthwise weight=(C,1,K), got "
+            f"{tuple(x.shape)} and {tuple(weight.shape)}"
+        )
+    if x.shape[1] != weight.shape[0]:
+        raise ValueError("depthwise weight channel count must match x")
+    batch, channels, length = x.shape
+    kernel = weight.shape[-1]
+    output = torch.empty_like(x)
+    _causal_depthwise_dy[(batch * channels,)](
+        x,
+        weight,
+        output,
+        batch,
+        channels,
+        length,
+        BLOCK_T=256,
+        KERNEL=kernel,
+        num_warps=4,
+    )
+    return output
+
+
 class _CausalDepthwiseFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -424,14 +494,10 @@ class _CausalDepthwiseFunction(torch.autograd.Function):
         weight = weight.contiguous()
         length = x.shape[-1]
         kernel = weight.shape[-1]
-        # Symmetric padding followed by the causal prefix is algebraically
-        # equal to explicit left padding and avoids materializing that pad.
-        output = torch.nn.functional.conv1d(
-            x,
-            weight,
-            padding=kernel - 1,
-            groups=x.shape[1],
-        )[..., :length]
+        # Use the same fused correlation in forward and backward.  This
+        # avoids the generic depthwise-convolution launch selected by
+        # ``torch.conv1d`` for the large grouped MSAR bank.
+        output = _depthwise_dy(x, weight)
         ctx.save_for_backward(x, weight)
         return output
 

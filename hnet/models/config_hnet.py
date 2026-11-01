@@ -29,7 +29,10 @@ class SSMConfig:
     d_conv: int = 4
     expand: int = 2
     d_state: int = 128
-    chunk_size: int = 256
+    # The fused Mamba-3 SISO kernel is register-safe and fastest at 32 tokens
+    # on the production B300 shape.  Keep the tuned geometry in the canonical
+    # config so the validator, checkpoint signature, and runtime agree.
+    chunk_size: int = 32
 
 
 @dataclass
@@ -135,13 +138,13 @@ class HNetConfig:
                 "the canonical model enables patched CroissAttn only on the global FA stage"
             )
         if (
-            int(self.ssm_cfg.chunk_size) != 64
+            int(self.ssm_cfg.chunk_size) != 32
             or int(self.ssm_cfg.d_conv) != 4
             or int(self.ssm_cfg.d_state) != 128
             or int(self.ssm_cfg.expand) != 2
         ):
             raise ValueError(
-                "the canonical Mamba-3 model requires SSM settings chunk_size=64, d_conv=4, "
+                "the canonical Mamba-3 model requires SSM settings chunk_size=32, d_conv=4, "
                 "d_state=128, expand=2"
             )
         if (

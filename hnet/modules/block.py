@@ -129,10 +129,11 @@ def create_block(
         )
     elif arch in ("m", "M"):
         mamba_cfg = dict(ssm_cfg)
-        # Mamba-3's fused SISO path is tuned for 32-token chunks on B300.  Its
-        # constructor absorbs the legacy d_conv field, which is not part of
-        # Mamba-3's recurrence.
-        mamba_cfg["chunk_size"] = 32
+        # Mamba-3's fused SISO path is tuned for 32-token chunks on B300.  The
+        # tuned value is part of the canonical config; reject an accidental
+        # override instead of silently benchmarking a different architecture.
+        if int(mamba_cfg["chunk_size"]) != 32:
+            raise ValueError("the canonical Mamba-3 path requires chunk_size=32")
         mixer_cls = partial(
             Mamba3Wrapper, **mamba_cfg, **factory_kwargs, layer_idx=layer_idx
         )

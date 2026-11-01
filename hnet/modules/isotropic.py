@@ -261,6 +261,14 @@ class Isotropic(nn.Module):
             streams.append(
                 expanded.reshape(batch, n_sources, width, length)
                 .permute(1, 0, 3, 2)
+                # The grouped-convolution view has a feature stride of
+                # ``length`` after the source-major permutation.  Feeding
+                # that strided view to RMSNorm forces TE/PyTorch to make a
+                # hidden contiguous copy on every score pass.  Materialize
+                # the cache-bank layout once here; the bank is reused by all
+                # layers in the MSAR block and the explicit copy is cheaper
+                # than repeating the implicit copy inside every RMSNorm.
+                .contiguous()
             )
         return streams
 

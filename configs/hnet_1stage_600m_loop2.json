@@ -4,7 +4,7 @@
     "d_intermediate": [0, 4096],
     "vocab_size": 256,
     "ssm_cfg": {
-        "chunk_size": 64,
+        "chunk_size": 32,
         "d_conv": 4,
         "d_state": 128,
         "expand": 2
