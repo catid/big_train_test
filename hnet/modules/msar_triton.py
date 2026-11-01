@@ -285,7 +285,10 @@ class _WeightedSourceReduce(torch.autograd.Function):
             length,
             width,
             *bank.stride(),
-            BLOCK_D=256,
+            # The canonical D=1536 path is bandwidth-bound; 1024-wide tiles
+            # reduce the feature loop from six passes to two while retaining
+            # FP32 accumulation and source-major ordering.
+            BLOCK_D=1024,
             N=n,
             num_warps=4,
         )
