@@ -447,8 +447,13 @@ class Isotropic(nn.Module):
         # ``mix[..., None] * retrieved_last`` product doubles the largest
         # [batch, length, streams, width] activation and was the final memory
         # cliff for the high-throughput graph batch.
-        fused = torch.zeros_like(retrieved_streams[0])
-        for stream_index, stream in enumerate(retrieved_streams):
+        # Seed from the first weighted stream instead of zero-filling a full
+        # activation and then adding the first product.  This preserves the
+        # exact multiply/add ordering for that stream while removing one
+        # graph replay FillFunctor launch and its write bandwidth.  The
+        # remaining streams retain the in-place addcmul path.
+        fused = retrieved_streams[0] * mix[..., 0].unsqueeze(-1)
+        for stream_index, stream in enumerate(retrieved_streams[1:], start=1):
             fused.addcmul_(
                 mix[..., stream_index].unsqueeze(-1),
                 stream,
