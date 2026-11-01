@@ -372,9 +372,20 @@ class Isotropic(nn.Module):
                 # scores. Avoid concatenating normalized [N,B,L,D] tensors:
                 # those FP32 temporaries would be retained by autograd for
                 # every layer and exhaust the canonical CUDA graph pool.
+                # Every source except the final current state remains fixed
+                # until the next MSAR boundary.  Contract those immutable
+                # banks against all layer queries once, then select the
+                # current layer's column below.  The final source changes on
+                # every layer, so keep its single-query contraction to avoid
+                # computing unused columns.
+                batch_source_count = len(source_keys)
+                if not duplicate_last:
+                    batch_source_count = max(0, batch_source_count - 1)
                 for stream_index in range(len(self.msar_kernels)):
                     score_sources = []
-                    for source_key, source_bank in zip(source_keys, source_banks):
+                    for source_index, (source_key, source_bank) in enumerate(
+                        zip(source_keys, source_banks)
+                    ):
                         norm_key = ("rms_norm_source", source_key, stream_index)
                         normed = stream_cache.get(norm_key)
                         if normed is None:
@@ -384,12 +395,27 @@ class Isotropic(nn.Module):
                                     stream_f, (self.d_model,), eps=1e-6
                                 )
                             stream_cache[norm_key] = normed
-                        score_sources.append(
-                            torch.einsum(
-                                "n...d,d->n...", normed, query[stream_index]
+                        if source_index < batch_source_count:
+                            scores_key = ("rms_scores_source", source_key, stream_index)
+                            scores_all = stream_cache.get(scores_key)
+                            if scores_all is None:
+                                # [N,B,L,D] @ [D,Layers] -> [N,B,L,Layers].
+                                # Keep the contraction in FP32; only the
+                                # selected scalar scores are retained by the
+                                # layer's routing path.
+                                query_all = self.msar_queries[:, stream_index].float()
+                                scores_all = torch.matmul(
+                                    normed.reshape(-1, self.d_model), query_all.transpose(0, 1)
+                                ).reshape(
+                                    normed.shape[0], normed.shape[1], normed.shape[2], -1
+                                ) / (self.d_model**0.5)
+                                stream_cache[scores_key] = scores_all
+                            score_sources.append(scores_all[..., layer_idx])
+                        else:
+                            score_sources.append(
+                                torch.matmul(normed, query[stream_index])
+                                / (self.d_model**0.5)
                             )
-                            / (self.d_model**0.5)
-                        )
                     source_scores.append(torch.cat(score_sources, dim=0))
             score_bank = torch.stack(source_scores, dim=1)
             if duplicate_last:
