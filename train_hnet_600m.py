@@ -1720,12 +1720,21 @@ class CUDAGraphStep:
                 by_dtype.setdefault(flat.dtype, []).append(flat)
             for flats in by_dtype.values():
                 if len(flats) == 1:
-                    pending.append(dist.all_reduce(flats[0], op=dist.ReduceOp.SUM, async_op=True))
+                    pending.append(
+                        dist.all_reduce(
+                            flats[0], op=dist.ReduceOp.SUM, async_op=True
+                        )
+                    )
                 else:
-                    with dist._coalescing_manager(async_ops=True) as ddp_work:
-                        for flat in flats:
-                            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                    pending.append(ddp_work)
+                    # Use the explicit homogeneous collective.  The private
+                    # context manager can retain operations across nested
+                    # dtype groups on some NCCL versions, causing the next
+                    # FP32 group to be checked together with BF16 tensors.
+                    pending.append(
+                        dist.all_reduce_coalesced(
+                            flats, op=dist.ReduceOp.SUM, async_op=True
+                        )
+                    )
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
             for work in pending:
