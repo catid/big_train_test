@@ -410,12 +410,18 @@ class LatentMoE(nn.Module):
         # auxiliary loss used to add two full-token launches and a transient
         # map on every routed invocation.
         routing_map.mul_(active[:, None])
-        active_one_hot = routing_map.to(torch.float32)
+        # The route map is already an exact binary int32 tensor. Keep it in
+        # that representation for the prefix scans below; converting the
+        # entire [tokens, experts] map to FP32 here only to reduce its counts
+        # would add a large cast launch and temporary on every MoE call.
+        active_one_hot = routing_map
         # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
         # this normalization explicit so the Switch/GShard term remains
         # invariant if a future configuration allows top-k > 1 (for the
         # canonical 1:8 route ``top_k == 1`` and this is a no-op).
-        dispatch_fraction = active_one_hot.sum(dim=0) / (active_count * self.top_k)
+        dispatch_fraction = active_one_hot.sum(
+            dim=0, dtype=torch.float32
+        ) / (active_count * self.top_k)
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
         current_aux_loss = self.aux_loss_weight * self.num_experts * (
             dispatch_fraction * mean_probs
@@ -519,7 +525,7 @@ class LatentMoE(nn.Module):
             # local expert rank without a Python loop; sequence_ids are sorted,
             # so subtracting the global count at each document start resets the
             # cumsum for every document.
-            global_positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
+            global_positions = torch.cumsum(active_one_hot, dim=0) - 1
             starts = torch.ones(n_tokens, device=flat.device, dtype=torch.bool)
             if n_tokens > 1:
                 starts[1:] = sequence_ids_flat[1:] != sequence_ids_flat[:-1]
@@ -529,9 +535,7 @@ class LatentMoE(nn.Module):
             # exclusive prefix at each document start so every expert's local
             # rank restarts at zero, including experts that did not receive the
             # first token of the document.
-            exclusive_positions = (
-                global_positions + 1 - active_one_hot.to(torch.int32)
-            )
+            exclusive_positions = global_positions + 1 - active_one_hot
             start_values = exclusive_positions.index_select(0, start_idx).to(torch.int32)
             offsets = torch.zeros(
                 (num_sequences, self.num_experts),
@@ -542,8 +546,16 @@ class LatentMoE(nn.Module):
             positions = global_positions - offsets.index_select(0, sequence_ids_flat)
             token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
-        routing_map = routing_map * valid[:, None].to(torch.int32)
-        routing_probs = probs * routing_map.to(probs.dtype)
+        # The TE mask-map permutation uses ``routing_map`` to select the
+        # expert entry from the dense probability matrix.  Passing the dense
+        # FP32 probabilities directly is equivalent to first multiplying by
+        # the binary map: rows with no routed expert have ``n_routed == 0``
+        # and are never loaded by the permutation kernel.  Avoiding that
+        # map-cast/multiply removes one full ``tokens x experts`` elementwise
+        # launch and temporary on every routed layer, while preserving the
+        # probability gradient for the selected entries.
+        routing_map.mul_(valid[:, None].to(torch.int32))
+        routing_probs = probs
         if route_counts is not None:
             route_state = route_counts[loop_idx, layer_idx]
             if decode:
