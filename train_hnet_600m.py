@@ -1059,7 +1059,12 @@ def _read_jsonl_records(path: str | os.PathLike[str], limit: int = 0) -> list[di
 def _normalize_mcq_record(record: dict, benchmark: str) -> tuple[str, list[str], int] | None:
     """Normalize MMLU, ARC, and HellaSwag records to prompt/choices/answer."""
     if benchmark == "hellaswag":
-        prompt = str(record.get("ctx", record.get("context", "")))
+        prompt_value = record.get("ctx", record.get("context"))
+        if prompt_value is None:
+            prompt_value = " ".join(
+                str(record.get(key, "")) for key in ("ctx_a", "ctx_b") if record.get(key)
+            )
+        prompt = str(prompt_value or "")
         choices = record.get("endings", record.get("choices"))
         answer = record.get("label", record.get("answer"))
     else:
