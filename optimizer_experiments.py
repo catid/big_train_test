@@ -932,9 +932,27 @@ class AnchorMuon(torch.optim.Optimizer):
         self,
         entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         group: dict[str, Any],
+        *,
+        stacked_sources: torch.Tensor | None = None,
+        stacked_grads: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        sources = torch.stack([entry[2].to(torch.float32) for entry in entries], dim=0)
-        grads = torch.stack([entry[3].to(torch.float32) for entry in entries], dim=0)
+        # Matrix-group preprocessing already has contiguous FP32 source and
+        # gradient banks. Reusing those banks avoids restacking every slice
+        # into two additional temporaries before PMuonEq/GramNS. The optional
+        # arguments retain the standalone entry-list path used by callers and
+        # keep its dtype conversion semantics unchanged.
+        if stacked_sources is None:
+            sources = torch.stack([entry[2].to(torch.float32) for entry in entries], dim=0)
+        else:
+            sources = stacked_sources
+        if stacked_grads is None:
+            grads = torch.stack([entry[3].to(torch.float32) for entry in entries], dim=0)
+        else:
+            grads = stacked_grads
+        if sources.ndim < 3 or grads.ndim != sources.ndim:
+            raise ValueError("stacked matrix banks must have matching rank >= 3")
+        if sources.shape[0] != len(entries) or grads.shape[0] != len(entries):
+            raise ValueError("stacked matrix banks must match entry count")
 
         row_buffers: list[torch.Tensor] = []
         second_buffers: list[torch.Tensor] = []
@@ -1131,7 +1149,17 @@ class AnchorMuon(torch.optim.Optimizer):
                     )
                     for index, record in enumerate(chunk)
                 ]
-                updates = self._transform_matrix_bucket(entries, group)
+                matrix_shape = _matrix_view(chunk[0][2]).shape
+                stacked_sources = source_stack.reshape(
+                    (len(chunk), *matrix_shape)
+                )
+                stacked_grads = grads.reshape((len(chunk), *matrix_shape))
+                updates = self._transform_matrix_bucket(
+                    entries,
+                    group,
+                    stacked_sources=stacked_sources,
+                    stacked_grads=stacked_grads,
+                )
                 matrix_count += self._apply_matrix_residual_updates(
                     entries,
                     updates,
