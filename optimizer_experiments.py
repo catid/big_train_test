@@ -1125,10 +1125,23 @@ class AnchorMuon(torch.optim.Optimizer):
                 chunk = bucket_entries[
                     start : start + MATRIX_BUCKET_CHUNK_SIZE
                 ]
-                # Casting the stacked BF16 gradients once is equivalent to
-                # casting each gradient before the elementwise FP32 recurrence.
-                grads_full = torch.stack([record[2].detach() for record in chunk], dim=0)
-                grads = grads_full.to(torch.float32)
+                # Materialize the bank directly in FP32.  The previous
+                # stack-then-cast path kept a full BF16 bank live alongside
+                # its FP32 copy; on the graph-heavy B300 run that transient
+                # bank was enough to push the first optimizer update over the
+                # memory limit.  Foreach copy performs the same per-element
+                # BF16->FP32 conversion without the intermediate bank.
+                original_shape = chunk[0][2].shape
+                matrix_shape = _matrix_view(chunk[0][2]).shape
+                grads = torch.empty(
+                    (len(chunk), *original_shape),
+                    device=chunk[0][2].device,
+                    dtype=torch.float32,
+                )
+                torch._foreach_copy_(
+                    list(grads.unbind(0)),
+                    [record[2].detach() for record in chunk],
+                )
                 momentums: list[torch.Tensor] = []
                 for p, _anchor, grad in chunk:
                     state = self.state[p]
@@ -1155,7 +1168,6 @@ class AnchorMuon(torch.optim.Optimizer):
                     )
                     for index, record in enumerate(chunk)
                 ]
-                matrix_shape = _matrix_view(chunk[0][2]).shape
                 stacked_sources = source_stack.reshape(
                     (len(chunk), *matrix_shape)
                 )
