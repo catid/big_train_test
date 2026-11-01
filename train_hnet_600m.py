@@ -1008,6 +1008,19 @@ def _lr_phase(step: int, args) -> str:
 
 
 @torch.no_grad()
+def _gini_from_load(load: torch.Tensor) -> torch.Tensor:
+    """Compute the expert-load Gini coefficient from an aggregated vector."""
+    values = load.detach().float().reshape(-1)
+    total = values.sum()
+    if values.numel() < 2 or not bool(torch.isfinite(total).item()) or float(total.item()) <= 0.0:
+        return values.new_zeros(())
+    ordered = torch.sort(values).values
+    n = ordered.numel()
+    rank = torch.arange(1, n + 1, device=ordered.device, dtype=ordered.dtype)
+    return ((2.0 * rank - n - 1.0) * ordered).sum() / (float(n) * total).clamp_min(1.0)
+
+
+@torch.no_grad()
 def _expert_gini(model) -> torch.Tensor:
     """Return mean accepted-route Gini coefficient across LatentMoE layers.
 
@@ -2439,7 +2452,7 @@ def main():
         )
         report_step = rank == 0 and report_requested
         expert_gini = (
-            float(_expert_gini(model.module if world > 1 else model).item())
+            float(_gini_from_load(expert_load).item())
             if report_step
             else None
         )
