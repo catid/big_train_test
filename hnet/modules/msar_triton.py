@@ -287,7 +287,10 @@ class _WeightedSourceReduce(torch.autograd.Function):
             *bank.stride(),
             BLOCK_D=256,
             N=n,
-            num_warps=4,
+            # Weight-gradient programs are scalar reductions over D; two
+            # warps improve occupancy on the B300 shape versus the generic
+            # four-warp launch without changing arithmetic.
+            num_warps=2,
         )
         return grad_weights, grad_bank
 
