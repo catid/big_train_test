@@ -47,11 +47,6 @@ ADAM_ATAN2_LR_RATIO = 0.5
 # Power calibration still chooses a smaller shape when the per-GPU target is
 # reached before this bound.
 CANONICAL_MAX_BATCH = 16
-# Coalesce the captured DDP gradient storage into large buckets. The direct
-# post-replay reducer otherwise launches several NCCL reductions for the
-# 600M parameter set at the default cap. The bucket layout is still checked
-# across ranks before it is reduced in place.
-DDP_BUCKET_CAP_MB = 1024
 
 
 def parse_args():
@@ -1831,7 +1826,7 @@ def main():
                 model,
                 device_ids=[device.index],
                 broadcast_buffers=False,
-                bucket_cap_mb=DDP_BUCKET_CAP_MB,
+                bucket_cap_mb=256,
                 gradient_as_bucket_view=True,
                 static_graph=CANONICAL_CUDA_GRAPHS,
             )
