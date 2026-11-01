@@ -342,34 +342,45 @@ class Isotropic(nn.Module):
                     ]
                     stream_cache[aggregate_key] = stream_banks
             source_scores = []
-            for stream_index, stream_bank in enumerate(stream_banks):
-                # Use PyTorch's fused RMS normalization kernel.  The former
-                # square/mean/rsqrt/multiply expression launches four large
-                # elementwise kernels per stream and dominated the generic
-                # multiply profile; rms_norm has the same FP32 equation but
-                # performs the reduction and scale in one kernel.
-                # TE's surrounding FP8 autocast otherwise downcasts this
-                # explicitly FP32 normalization before the FP32 router dot.
-                norm_key = ("rms_norm", id(stream_bank))
-                normed = stream_cache.get(norm_key) if stream_cache is not None else None
-                if normed is None:
-                    # Delay the BF16-to-FP32 materialization until a cache
-                    # miss. Reused immutable banks can use their cached
-                    # normalized FP32 view without another full activation
-                    # cast and allocation.
+            if stream_cache is None:
+                for stream_index, stream_bank in enumerate(stream_banks):
+                    # Use PyTorch's fused RMS normalization kernel.  The
+                    # explicitly FP32 normalization keeps router score math
+                    # stable while avoiding any enclosing FP8 autocast.
                     stream_f = stream_bank.float()
                     with te_autocast(enabled=False):
                         normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
-                    if stream_cache is not None:
-                        # The stream bank is immutable until a new MSAR source
-                        # appears. Reusing this exact FP32 result across the
-                        # layers in that interval avoids repeated normalization
-                        # kernels without changing score arithmetic.
-                        stream_cache[norm_key] = normed
-                source_scores.append(
-                    torch.einsum("n...d,d->n...", normed, query[stream_index])
-                    / (self.d_model**0.5)
-                )
+                    source_scores.append(
+                        torch.einsum("n...d,d->n...", normed, query[stream_index])
+                        / (self.d_model**0.5)
+                    )
+            else:
+                # The aggregate source tensor changes whenever the current
+                # MSAR state changes, so normalizing it repeats the old
+                # source work at every layer. Normalize each immutable source
+                # bank once, then immediately reduce it to scalar router
+                # scores. Avoid concatenating normalized [N,B,L,D] tensors:
+                # those FP32 temporaries would be retained by autograd for
+                # every layer and exhaust the canonical CUDA graph pool.
+                for stream_index in range(len(self.msar_kernels)):
+                    score_sources = []
+                    for source_key, source_bank in zip(source_keys, source_banks):
+                        norm_key = ("rms_norm_source", source_key, stream_index)
+                        normed = stream_cache.get(norm_key)
+                        if normed is None:
+                            stream_f = source_bank[stream_index].float()
+                            with te_autocast(enabled=False):
+                                normed = F.rms_norm(
+                                    stream_f, (self.d_model,), eps=1e-6
+                                )
+                            stream_cache[norm_key] = normed
+                        score_sources.append(
+                            torch.einsum(
+                                "n...d,d->n...", normed, query[stream_index]
+                            )
+                            / (self.d_model**0.5)
+                        )
+                    source_scores.append(torch.cat(score_sources, dim=0))
             score_bank = torch.stack(source_scores, dim=1)
             if duplicate_last:
                 score_bank[-1].add_(math.log(2.0))
