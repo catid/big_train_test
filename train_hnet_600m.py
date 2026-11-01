@@ -1710,14 +1710,18 @@ class CUDAGraphStep:
         # keeps the original ordering because its host copies are not safely
         # overlappable with the scaling updates.
         if self.ddp and self._ddp_direct_storage:
-            pending = [
-                (dist.all_reduce(flat, op=dist.ReduceOp.SUM, async_op=True), flat)
-                for flat in self._ddp_storage_buckets
-            ]
+            # The reducer exposes six large contiguous views (five BF16 and
+            # one FP32 in the canonical model).  A coalescing manager emits
+            # one NCCL group operation instead of six Python-side launches;
+            # async_ops lets the host enqueue the group before the independent
+            # TE FP8 amax work while the stream preserves collective ordering.
+            with dist._coalescing_manager(async_ops=True) as ddp_work:
+                for flat in self._ddp_storage_buckets:
+                    dist.all_reduce(flat, op=dist.ReduceOp.SUM)
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
-            for work, flat in pending:
-                work.wait()
+            ddp_work.wait()
+            for flat in self._ddp_storage_buckets:
                 flat.div_(float(self.world))
         else:
             hnet_te.update_fp8_scaling(forward=True)
