@@ -340,11 +340,24 @@ class Isotropic(nn.Module):
                 # elementwise kernels per stream and dominated the generic
                 # multiply profile; rms_norm has the same FP32 equation but
                 # performs the reduction and scale in one kernel.
-                stream_f = stream_bank.float()
                 # TE's surrounding FP8 autocast otherwise downcasts this
                 # explicitly FP32 normalization before the FP32 router dot.
-                with te_autocast(enabled=False):
-                    normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
+                norm_key = ("rms_norm", id(stream_bank))
+                normed = stream_cache.get(norm_key) if stream_cache is not None else None
+                if normed is None:
+                    # Delay the BF16-to-FP32 materialization until a cache
+                    # miss. Reused immutable banks can use their cached
+                    # normalized FP32 view without another full activation
+                    # cast and allocation.
+                    stream_f = stream_bank.float()
+                    with te_autocast(enabled=False):
+                        normed = F.rms_norm(stream_f, (self.d_model,), eps=1e-6)
+                    if stream_cache is not None:
+                        # The stream bank is immutable until a new MSAR source
+                        # appears. Reusing this exact FP32 result across the
+                        # layers in that interval avoids repeated normalization
+                        # kernels without changing score arithmetic.
+                        stream_cache[norm_key] = normed
                 source_scores.append(
                     torch.einsum("n...d,d->n...", normed, query[stream_index])
                     / (self.d_model**0.5)
