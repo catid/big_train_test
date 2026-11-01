@@ -185,6 +185,8 @@ def _validate_schedule_args(args):
         raise ValueError("lr must be positive")
     if int(args.eval_every) < 0:
         raise ValueError("eval-every must be non-negative")
+    if int(args.log_every) < 1:
+        raise ValueError("log-every must be positive")
     if int(args.eval_batches) < 1:
         raise ValueError("eval-batches must be positive")
     if int(args.eval_max_items) < 0:
