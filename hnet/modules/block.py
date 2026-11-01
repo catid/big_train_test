@@ -129,10 +129,10 @@ def create_block(
         )
     elif arch in ("m", "M"):
         mamba_cfg = dict(ssm_cfg)
-        # Mamba-3's fused SISO path is tuned for 64-token chunks.  Its
+        # Mamba-3's fused SISO path is tuned for 32-token chunks on B300.  Its
         # constructor absorbs the legacy d_conv field, which is not part of
         # Mamba-3's recurrence.
-        mamba_cfg["chunk_size"] = 64
+        mamba_cfg["chunk_size"] = 32
         mixer_cls = partial(
             Mamba3Wrapper, **mamba_cfg, **factory_kwargs, layer_idx=layer_idx
         )
