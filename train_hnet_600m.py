@@ -1773,6 +1773,51 @@ class CUDAGraphStep:
                 offset += count
 
 
+class CUDAGraphOptimizerStep:
+    """Replay-safe AnchorMuon/AdamATan2 update.
+
+    The forward/backward graph leaves gradients in stable storage.  After one
+    ordinary update initializes the optimizer state, this helper captures only
+    the optimizer update into the same CUDA graph pool.  Learning rate and
+    update count are device scalars, so schedule decay and Adam bias
+    correction continue to change on every replay without Python launches.
+    """
+
+    def __init__(self, optimizer, model_graph: CUDAGraphStep, device, lr: float, step: int):
+        if device.type != "cuda":
+            raise RuntimeError("graph optimizer requires CUDA")
+        self.optimizer = optimizer
+        self.device = device
+        self.lr = torch.tensor(float(lr), device=device, dtype=torch.float32)
+        # ``optimizer.step`` increments this inside the captured graph.  The
+        # caller has already completed ``step`` eager updates before capture.
+        self.step = torch.tensor(float(step), device=device, dtype=torch.float32)
+        optimizer.set_graph_scalars(self.lr, self.step)
+        self.graph = torch.cuda.CUDAGraph()
+        self.pool = model_graph.graph.pool()
+
+    def capture(self) -> None:
+        with torch.cuda.graph(self.graph, pool=self.pool):
+            self.optimizer.step()
+        torch.cuda.synchronize(self.device)
+
+    def set_lr(self, value: float) -> None:
+        self.lr.fill_(float(value))
+
+    def replay(self) -> None:
+        self.graph.replay()
+
+    def sync_python_state(self) -> None:
+        """Materialize graph counters before checkpointing or process exit."""
+        current_step = int(self.step.item())
+        for group in self.optimizer.param_groups:
+            group["k"] = current_step
+            for parameter in group["params"]:
+                state = self.optimizer.state.get(parameter)
+                if state is not None and "exp_avg_sq" in state:
+                    state["step"] = current_step
+
+
 def main():
     args = parse_args()
     _validate_schedule_args(args)
@@ -1922,6 +1967,11 @@ def main():
             world,
             capture_stream=graph_stream,
         )
+    graph_optimizer_step = None
+    # Fresh calibration clears optimizer state. The first finite update is
+    # therefore eager and initializes AnchorMuon/AdamATan2; resumes already
+    # carry initialized state and can capture on their first replay.
+    optimizer_initialized = resume_state is not None
     log = {
         # Internal capture-only tensors live on the Namespace for the loss
         # closure but must never be serialized into the JSON run record.
@@ -2021,7 +2071,32 @@ def main():
             dist.all_reduce(finite_flag, op=dist.ReduceOp.MIN)
         finite = bool(finite_flag.item())
         if finite:
-            optimizer.step()
+            if graph_step is not None:
+                if graph_optimizer_step is None and optimizer_initialized:
+                    # Capture the update using the current replay's gradients.
+                    # CUDA graph capture records kernels without executing them;
+                    # the explicit replay immediately below applies this real
+                    # training update.
+                    current_k = max(
+                        int(group.get("k", 0)) for group in optimizer.param_groups
+                    )
+                    graph_optimizer_step = CUDAGraphOptimizerStep(
+                        optimizer,
+                        graph_step,
+                        device,
+                        lr=float(args.lr) * float(lr_scale),
+                        step=current_k,
+                    )
+                    graph_optimizer_step.capture()
+                    graph_optimizer_step.replay()
+                elif graph_optimizer_step is not None:
+                    graph_optimizer_step.set_lr(float(args.lr) * float(lr_scale))
+                    graph_optimizer_step.replay()
+                else:
+                    optimizer.step()
+                    optimizer_initialized = True
+            else:
+                optimizer.step()
         else:
             log["nonfinite"].append(step)
         if device.type == "cuda":
@@ -2087,6 +2162,8 @@ def main():
                 flush=True,
             )
         if args.ckpt_every and (step + 1) % args.ckpt_every == 0:
+            if graph_optimizer_step is not None:
+                graph_optimizer_step.sync_python_state()
             local_rng = (
                 torch.get_rng_state(),
                 torch.cuda.get_rng_state(device=device) if device.type == "cuda" else None,
@@ -2126,6 +2203,8 @@ def main():
                 checkpoint, temp_path,
             )
             os.replace(temp_path, path)
+    if graph_optimizer_step is not None:
+        graph_optimizer_step.sync_python_state()
     if rank == 0:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.out).write_text(json.dumps(log, indent=2))

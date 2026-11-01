@@ -3,6 +3,7 @@ from typing import Union, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from flash_attn.ops.triton.layer_norm import RMSNorm
 
 from hnet.modules.isotropic import Isotropic, IsotropicInferenceParams
@@ -483,10 +484,11 @@ class HNet(nn.Module):
                         float(self.config.fbt_jitter),
                     )
                 if next_cu_seqlens is None:
-                    shifted = torch.cat(
-                        (torch.zeros_like(feedback_source[:, :1]), feedback_source[:, :-1]),
-                        dim=1,
-                    )
+                    # The padded graph path has a fixed dense sequence.  F.pad
+                    # emits one contiguous copy for the causal shift, whereas
+                    # concatenating a separately allocated zero column causes
+                    # two full activation copies and an extra fill launch.
+                    shifted = F.pad(feedback_source[:, :-1], (0, 0, 1, 0))
                 else:
                     # Packed feedback is shifted within each document.  Use
                     # differentiable tensor operations instead of indexed
