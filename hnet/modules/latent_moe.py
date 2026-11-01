@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from hnet.te import TEGroupedLinear, make_linear, te, graph_capture_enabled
 from transformer_engine.pytorch.ops.basic.swiglu import SwiGLU
-from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss
+from transformer_engine.pytorch.router import fused_compute_score_for_moe_aux_loss, fused_moe_aux_loss
 
 
 @triton.jit
@@ -451,33 +451,25 @@ class LatentMoE(nn.Module):
         routing_map = fused_routing_map.to(dtype=torch.int32)
         expert_idx = routing_map.argmax(dim=-1)
 
-        # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
-        # mean router probability times dispatched token fraction.  Keep this
-        # in FP32 so BF16/FP8 router logits cannot poison the training loss.
+        # TE's fused aux kernel performs the load-balancing reductions and
+        # writes the exact FP32 gradient coefficient in one CUDA launch.
+        # The canonical mask is fully active, so avoid a full-token masked
+        # probability copy; sparse masks take the explicit masked path.
         active_f = active.to(dtype=torch.float32)
         active_count = active_f.sum().clamp_min(1.0)
-        # Materialize one int32 route map and reuse it for both capacity
-        # accounting and dispatch.  The previous path cast the bool map to
-        # FP32, multiplied by the active mask, then cast it back to int32;
-        # that pair of conversion kernels is on the hot path for every MoE
-        # invocation.  Integer masking is exact for the binary route and the
-        # single FP32 cast below remains sufficient for the auxiliary loss.
-        # The fused router map is discrete and does not participate in
-        # autograd. Mask it in place after the one required bool->int32 cast;
-        # constructing a second int32 tensor and then casting it again for the
-        # auxiliary loss used to add two full-token launches and a transient
-        # map on every routed invocation.
         routing_map.mul_(active[:, None])
         active_one_hot = routing_map.to(torch.float32)
-        # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
-        # this normalization explicit so the Switch/GShard term remains
-        # invariant if a future configuration allows top-k > 1 (for the
-        # canonical 1:8 route ``top_k == 1`` and this is a no-op).
-        dispatch_fraction = active_one_hot.sum(dim=0) / (active_count * self.top_k)
-        mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
-        current_aux_loss = self.aux_loss_weight * self.num_experts * (
-            dispatch_fraction * mean_probs
-        ).sum()
+        tokens_per_expert = routing_map.sum(dim=0, dtype=torch.int32)
+        aux_probs = probs * active_f[:, None]
+        total_num_tokens = active.to(dtype=torch.int64).sum().clamp_min(1)
+        current_aux_loss = fused_moe_aux_loss(
+            probs=aux_probs,
+            tokens_per_expert=tokens_per_expert,
+            total_num_tokens=total_num_tokens,
+            num_experts=self.num_experts,
+            topk=self.top_k,
+            coeff=self.aux_loss_weight,
+        ).float()
         if self._aux_loss is None:
             self._aux_loss = current_aux_loss
         else:
