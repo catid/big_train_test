@@ -45,6 +45,18 @@ def parse_args():
     p.add_argument("--ratio-weight", type=float, default=0.03)
     p.add_argument("--ratio-target", type=float, default=6.0)
     p.add_argument("--log-every", type=int, default=10)
+    p.add_argument(
+        "--eval-every",
+        type=int,
+        default=40,
+        help="run validation after every N optimizer steps (0 disables validation)",
+    )
+    p.add_argument(
+        "--eval-batches",
+        type=int,
+        default=1,
+        help="number of held-out distributed batches per validation pass",
+    )
     p.add_argument("--ckpt-every", type=int, default=1000)
     p.add_argument("--out", default="/home/catid/hnet/artifacts/hnet_600m_train.json")
     p.add_argument("--checkpoint", default="/home/catid/hnet/artifacts/hnet_600m_last.pt")
@@ -55,7 +67,7 @@ def parse_args():
 
 
 class ByteStream:
-    def __init__(self, path, seq, batch, rank, world):
+    def __init__(self, path, seq, batch, rank, world, eval_batches=1):
         self.data = torch.from_file(
             str(path), shared=False, size=os.path.getsize(path), dtype=torch.uint8
         )
@@ -85,7 +97,16 @@ class ByteStream:
         usable = (self.data.numel() - 1) // (self.stride * world) * self.stride * world
         if usable <= 0:
             raise ValueError("byte stream is shorter than one distributed batch")
-        self.n_batches = usable // (self.stride * world)
+        total_batches = usable // (self.stride * world)
+        # Keep the held-out region at the tail so training never consumes
+        # validation bytes.  The explicit batch count makes validation cost
+        # predictable and preserves the exact rank/sequence packing used by
+        # the training stream.
+        requested_eval = max(0, int(eval_batches))
+        self.eval_n_batches = min(requested_eval, max(0, total_batches - 1))
+        self.n_batches = total_batches - self.eval_n_batches
+        if self.n_batches <= 0:
+            raise ValueError("byte stream needs at least one training batch")
 
     def get(self, step, device):
         base = ((step % self.n_batches) * self.world + self.rank) * self.stride
@@ -101,6 +122,30 @@ class ByteStream:
         if self._stage_used[slot]:
             # The event marks completion of the prior H2D reads from this
             # pinned buffer, so overwriting it cannot race the DMA engine.
+            self._stage_events[slot].synchronize()
+        sx, sy = self._staged[slot]
+        sx.copy_(x)
+        sy.copy_(y)
+        stream = torch.cuda.current_stream(device)
+        out_x = sx.to(device=device, non_blocking=True)
+        out_y = sy.to(device=device, non_blocking=True)
+        self._stage_events[slot].record(stream)
+        self._stage_used[slot] = True
+        return out_x, out_y
+
+    def get_eval(self, batch_index, device):
+        """Return one rank-local batch from the held-out tail."""
+        if self.eval_n_batches <= 0:
+            raise RuntimeError("no held-out batches are available")
+        batch_index %= self.eval_n_batches
+        base = ((self.n_batches + batch_index) * self.world + self.rank) * self.stride
+        x = self.data[base : base + self.stride].view(self.batch, self.seq)
+        y = self.data[base + 1 : base + self.stride + 1].view(self.batch, self.seq)
+        if self._staged is None or device.type != "cuda":
+            return x.to(device=device, non_blocking=True), y.to(device=device, non_blocking=True)
+        slot = self._stage_index
+        self._stage_index = (slot + 1) % len(self._staged)
+        if self._stage_used[slot]:
             self._stage_events[slot].synchronize()
         sx, sy = self._staged[slot]
         sx.copy_(x)
@@ -134,8 +179,16 @@ def init_dist():
 
 def annotate_decay(model):
     for name, p in model.named_parameters():
-        if name.endswith(".bias") or "norm" in name.lower() or "msar_bias" in name:
+        if (
+            name.endswith(".bias")
+            or "norm" in name.lower()
+            or "msar_bias" in name
+            or getattr(p, "_lerope_frequency", False)
+        ):
             p._no_weight_decay = True
+            # LeRoPE explicitly excludes its log-frequency scales from
+            # AnchorMuon's SODA pull toward the initialization.
+            p._no_soda = True
 
 
 def make_optimizer(model, args):
@@ -212,6 +265,49 @@ def loss_for_output(out, target, args):
         losses[0],
         ratio,
     )
+
+
+@torch.inference_mode()
+def evaluate(model, stream, args, device, rank, world, step):
+    """Evaluate the exact production model on the held-out byte tail.
+
+    Every rank processes the same number of rank-local batches, then reduces
+    the scalar means.  The model is switched to eval mode only for this
+    function and restored by the caller, so this never changes optimizer or
+    graph state.
+    """
+    if stream.eval_n_batches <= 0:
+        return None
+    was_training = model.training
+    model.eval()
+    total_loss = torch.zeros((), device=device, dtype=torch.float32)
+    total_ratio = torch.zeros((), device=device, dtype=torch.float32)
+    batches = min(max(1, int(args.eval_batches)), stream.eval_n_batches)
+    for eval_idx in range(batches):
+        x, y = stream.get_eval(eval_idx, device)
+        mask = torch.ones_like(x, dtype=torch.bool)
+        out = model(x, mask=mask, fbt_passes=args.fbt_passes)
+        total, primary, ratio = loss_for_output(out, y, args)
+        # Report CE and routing loss separately while retaining the same
+        # objective (including FBT/MoE terms) used for training.
+        total_loss = total_loss + primary.detach().float()
+        total_ratio = total_ratio + ratio.detach().float()
+    total_loss /= batches
+    total_ratio /= batches
+    if world > 1:
+        dist.all_reduce(total_loss)
+        dist.all_reduce(total_ratio)
+        total_loss /= world
+        total_ratio /= world
+    if was_training:
+        model.train()
+    return {
+        "step": int(step),
+        "loss": float(total_loss),
+        "bits_per_byte": float(total_loss / math.log(2.0)),
+        "ratio": float(total_ratio),
+        "batches": int(batches),
+    }
 
 
 def read_power_watts():
@@ -322,12 +418,28 @@ def main():
                 gradient_as_bucket_view=True,
             )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
-    stream = ByteStream(args.data, args.seq, args.batch, rank, world)
+    stream = ByteStream(
+        args.data,
+        args.seq,
+        args.batch,
+        rank,
+        world,
+        eval_batches=args.eval_batches if args.eval_every > 0 else 0,
+    )
     graph_step = None
     if args.cuda_graphs and device.type == "cuda":
         x0, y0 = stream.get(0, device)
         graph_step = GraphStep(model, optimizer, x0, y0, args, capture_stream=graph_stream)
-    log = {"args": vars(args), "params": n_params, "world": world, "loss": [], "ratio": [], "time_ms": [], "nonfinite": []}
+    log = {
+        "args": vars(args),
+        "params": n_params,
+        "world": world,
+        "loss": [],
+        "ratio": [],
+        "time_ms": [],
+        "nonfinite": [],
+        "eval": [],
+    }
     step_start_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     step_end_event = torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     for step in range(args.steps):
@@ -393,6 +505,23 @@ def main():
                 f"power_w={','.join(f'{x:.0f}' for x in power) or 'n/a'}",
                 flush=True,
             )
+        # Validation is deliberately keyed to completed optimizer updates:
+        # step 40 means forty updates have been applied.  All ranks enter the
+        # call together so distributed reductions remain synchronized.
+        if args.eval_every > 0 and (step + 1) % args.eval_every == 0:
+            eval_started = time.perf_counter()
+            eval_result = evaluate(model, stream, args, device, rank, world, step + 1)
+            if eval_result is not None:
+                eval_result["time_ms"] = (time.perf_counter() - eval_started) * 1e3
+                if rank == 0:
+                    log["eval"].append(eval_result)
+                    print(
+                        f"eval(step {eval_result['step']}) loss={eval_result['loss']:.6f} "
+                        f"bpb={eval_result['bits_per_byte']:.6f} "
+                        f"ratio={eval_result['ratio']:.4f} "
+                        f"eval_took={eval_result['time_ms'] / 1e3:.2f}s",
+                        flush=True,
+                    )
         if rank == 0 and args.ckpt_every and (step + 1) % args.ckpt_every == 0:
             path = Path(args.checkpoint)
             path.parent.mkdir(parents=True, exist_ok=True)

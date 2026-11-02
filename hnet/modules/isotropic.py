@@ -48,6 +48,7 @@ class Isotropic(nn.Module):
         config: HNetConfig,
         pos_idx: int,
         stage_idx: int,
+        lerope_registry=None,
         device=None,
         dtype=None,
     ):
@@ -87,6 +88,7 @@ class Isotropic(nn.Module):
                     moe_latent_alpha=getattr(config, "moe_latent_alpha", 2),
                     moe_matched=getattr(config, "moe_matched", True),
                     moe_fp8=getattr(config, "moe_fp8", True),
+                    lerope_registry=lerope_registry,
                     layer_idx=(layer_idx + i),
                     **factory_kwargs,
                 )

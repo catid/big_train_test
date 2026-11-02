@@ -12,6 +12,7 @@ from .config_hnet import HNetConfig
 
 from hnet.modules.dc import RoutingModuleOutput
 from hnet.modules.utils import apply_optimization_params
+from hnet.modules.rotary import LeRoPERegistry
 
 
 class FixedByteFeatures(nn.Module):
@@ -70,12 +71,14 @@ class HNetForCausalLM(nn.Module, GenerationMixin):
         # Thus, the embedding is defined outside of the HNet.
         self.embeddings = nn.Embedding(vocab_size, d_embed, **factory_kwargs)
 
+        self.lerope_registry = LeRoPERegistry()
         self.backbone = HNet(
             config=config,
             # We pass in the stage_idx as an HNet needs to know what
             # depth of the hierarchy it is in.
             stage_idx=0,
             **factory_kwargs,
+            lerope_registry=self.lerope_registry,
         )
         self.lm_head = nn.Linear(d_embed, vocab_size, bias=False, **factory_kwargs)
         self.tie_weights()
@@ -200,7 +203,14 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         self.config = config
         self.input_dtype = dtype or torch.get_default_dtype()
         self.byte_features = FixedByteFeatures(config.d_model[0], device=device)
-        self.backbone = HNet(config=config, stage_idx=0, device=device, dtype=dtype)
+        self.lerope_registry = LeRoPERegistry()
+        self.backbone = HNet(
+            config=config,
+            stage_idx=0,
+            device=device,
+            dtype=dtype,
+            lerope_registry=self.lerope_registry,
+        )
         # Keep the CE output path in FP32, matching the TE model's stable head.
         self.lm_head = nn.Linear(
             config.d_model[0], config.vocab_size, bias=False, device=device, dtype=torch.float32

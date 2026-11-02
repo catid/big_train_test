@@ -47,6 +47,7 @@ def create_block(
     moe_latent_alpha=2,
     moe_matched=True,
     moe_fp8=True,
+    lerope_registry=None,
     device=None,
     dtype=None,
 ):
@@ -55,7 +56,11 @@ def create_block(
     # Mixer
     if arch in ("t", "T"):
         mixer_cls = partial(
-            CausalMHA, **attn_cfg, **factory_kwargs, layer_idx=layer_idx
+            CausalMHA,
+            **attn_cfg,
+            **factory_kwargs,
+            layer_idx=layer_idx,
+            lerope_registry=lerope_registry,
         )
     elif arch in ("m", "M"):
         mixer_cls = partial(

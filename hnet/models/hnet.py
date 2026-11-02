@@ -13,6 +13,7 @@ from hnet.modules.dc import (
     DeChunkState,
 )
 from hnet.modules.utils import apply_optimization_params
+from hnet.modules.rotary import LeRoPERegistry
 
 from .config_hnet import HNetConfig
 
@@ -47,6 +48,7 @@ class HNet(nn.Module):
         stage_idx: int,
         device=None,
         dtype=None,
+        lerope_registry=None,
     ) -> None:
         super().__init__()
 
@@ -55,6 +57,11 @@ class HNet(nn.Module):
 
         self.stage_idx = stage_idx
         self.d_model = config.d_model[stage_idx]
+        # The top-level hierarchy owns the shared LeRoPE bank.  Recursive
+        # stages receive the same object without registering another copy.
+        if lerope_registry is None:
+            self.lerope_registry = LeRoPERegistry()
+            lerope_registry = self.lerope_registry
 
         arch_layout = config.arch_layout
         for _ in range(stage_idx):
@@ -92,6 +99,7 @@ class HNet(nn.Module):
                 config=config,
                 stage_idx=_stage_idx,
                 **_pos_idx_dict,
+                lerope_registry=lerope_registry,
                 **factory_kwargs,
             )
             self.add_module(_name, _sub_model)

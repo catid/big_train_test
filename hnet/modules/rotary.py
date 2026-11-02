@@ -372,6 +372,41 @@ def apply_rotary_emb_kv_(
     return ApplyRotaryEmbKV_.apply(kv, cos, sin, interleaved, seqlen_offsets)
 
 
+class LeRoPERegistry(torch.nn.Module):
+    """Shared bank of learnable RoPE frequencies.
+
+    LeRoPE uses one log-frequency scale per rotary channel, shared by every
+    layer and head.  H-Net has different head/rotary widths at different
+    hierarchy stages, so the bank is keyed by the rotary width and base.  A
+    registry owned by the top-level model makes each key a single Parameter
+    while still allowing the attention blocks to retain their normal
+    ``rotary_emb`` interface.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._embeddings = torch.nn.ModuleDict()
+
+    def get(
+        self,
+        dim: int,
+        *,
+        base: float = 10000.0,
+        interleaved: bool = False,
+        device=None,
+    ) -> "RotaryEmbedding":
+        key = f"d{int(dim)}_b{float(base):g}_i{int(bool(interleaved))}"
+        if key not in self._embeddings:
+            self._embeddings[key] = RotaryEmbedding(
+                dim,
+                base=base,
+                interleaved=interleaved,
+                device=device,
+                learnable=True,
+            )
+        return self._embeddings[key]
+
+
 class RotaryEmbedding(torch.nn.Module):
     """
     The rotary position embeddings from RoFormer_ (Su et. al).
@@ -398,6 +433,7 @@ class RotaryEmbedding(torch.nn.Module):
         scale_base=None,
         pos_idx_in_fp32=True,
         device=None,
+        learnable=True,
     ):
         """
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
@@ -420,6 +456,20 @@ class RotaryEmbedding(torch.nn.Module):
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = self._compute_inv_freq(device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
+        # LeRoPE learns one log scale per frequency band.  A zero
+        # initialization is exactly ordinary RoPE, while the log-space
+        # parameterization keeps the frequencies positive and gives stable
+        # optimization dynamics over long contexts.
+        self.learnable = bool(learnable)
+        if self.learnable:
+            self.log_scale = torch.nn.Parameter(
+                torch.zeros(dim // 2, device=device, dtype=torch.float32)
+            )
+            self.log_scale._no_weight_decay = True
+            self.log_scale._no_soda = True
+            self.log_scale._lerope_frequency = True
+        else:
+            self.register_parameter("log_scale", None)
         self.interleaved = interleaved
         self.scale_base = scale_base
         scale = (
@@ -435,6 +485,107 @@ class RotaryEmbedding(torch.nn.Module):
         self._sin_cached = None
         self._cos_k_cached = None
         self._sin_k_cached = None
+        self._cache_log_scale_version = -1
+
+    def _current_inv_freq(self, device=None):
+        """Return learned frequencies in FP32 without mutating buffers."""
+        if self.learnable:
+            # Keep the multiplication in FP32 even when the model is BF16 or
+            # FP8.  The resulting trigonometric tables are cast only after
+            # angle evaluation.
+            return self.inv_freq.to(device=device, dtype=torch.float32) * self.log_scale.exp()
+        return self.inv_freq.to(device=device, dtype=torch.float32)
+
+    @staticmethod
+    def _rotate(x, cos, sin, rotary_dim, interleaved):
+        """Differentiable LeRoPE rotation used by training and graph capture."""
+        x_rot = x[..., :rotary_dim]
+        x_tail = x[..., rotary_dim:]
+        # Trigonometric values are computed in FP32 but applying them in the
+        # activation dtype avoids widening the entire attention projection.
+        cos = cos.to(dtype=x.dtype)
+        sin = sin.to(dtype=x.dtype)
+        if interleaved:
+            x_even = x_rot[..., 0::2]
+            x_odd = x_rot[..., 1::2]
+            out = torch.stack(
+                (x_even * cos - x_odd * sin, x_even * sin + x_odd * cos), dim=-1
+            ).flatten(-2)
+        else:
+            half = rotary_dim // 2
+            x1, x2 = x_rot[..., :half], x_rot[..., half:]
+            out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        return torch.cat((out, x_tail), dim=-1)
+
+    def _angles(self, positions: torch.Tensor, *, dtype=None):
+        frequencies = self._current_inv_freq(device=positions.device)
+        # Position multiplication and trigonometry intentionally remain FP32;
+        # BF16 position indices lose integer precision well before 4K tokens.
+        angle = positions.to(torch.float32).unsqueeze(-1) * frequencies
+        cos = angle.cos()
+        sin = angle.sin()
+        if dtype is not None:
+            cos = cos.to(dtype=dtype)
+            sin = sin.to(dtype=dtype)
+        return cos, sin
+
+    def _packed_positions(self, cu_seqlens, total, device):
+        lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.long)
+        # Supplying output_size keeps the varlen metadata allocation static
+        # during CUDA graph capture.  The production trainer uses the masked
+        # path today, but packed inference and future packed training should
+        # remain graph-safe as well.
+        starts = torch.repeat_interleave(
+            cu_seqlens[:-1].to(torch.long), lengths, output_size=int(total)
+        )
+        return torch.arange(total, device=device, dtype=torch.long) - starts
+
+    def _apply_le_rope(
+        self, qkv, positions, *, num_heads_q=None, packed=False, kv_stream=False
+    ):
+        rotary_dim = self.dim
+        if qkv.dim() == 5:
+            # (B, S, 3, H, D), position table is (B, S, R/2) or (S, R/2).
+            if positions.dim() == 1:
+                cos, sin = self._angles(positions, dtype=qkv.dtype)
+                cos = cos[None, :, None, None, :]
+                sin = sin[None, :, None, None, :]
+            else:
+                cos, sin = self._angles(positions, dtype=qkv.dtype)
+                cos = cos[:, :, None, None, :]
+                sin = sin[:, :, None, None, :]
+            # RoPE is applied to Q and K only.  A combined QKV tensor has
+            # three slices; a separate KV stream has two, of which only K is
+            # rotated.
+            n_rot = 1 if kv_stream else 2
+            rotated = self._rotate(
+                qkv[:, :, :n_rot], cos, sin, rotary_dim, self.interleaved
+            )
+            return torch.cat((rotated, qkv[:, :, n_rot:]), dim=2)
+        if qkv.dim() == 4:
+            if packed:
+                # Packed varlen (total, 3, H, D), position table is
+                # (total, R/2).  The explicit flag avoids confusing a
+                # separate Q tensor whose sequence length happens to be 3.
+                cos, sin = self._angles(positions, dtype=qkv.dtype)
+                n_rot = 1 if kv_stream else 2
+                rotated = self._rotate(
+                    qkv[:, :n_rot],
+                    cos[:, None, None, :],
+                    sin[:, None, None, :],
+                    rotary_dim,
+                    self.interleaved,
+                )
+                return torch.cat((rotated, qkv[:, n_rot:]), dim=1)
+            # A separate Q or KV stream (B, S, H, D), used by cross
+            # attention and some KV-cache callers.
+            cos, sin = self._angles(positions, dtype=qkv.dtype)
+            if positions.dim() == 1:
+                cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+            else:
+                cos, sin = cos[:, :, None, :], sin[:, :, None, :]
+            return self._rotate(qkv, cos, sin, rotary_dim, self.interleaved)
+        raise ValueError(f"unsupported LeRoPE input rank: {qkv.dim()}")
 
     def _compute_inv_freq(self, device=None):
         return 1.0 / (
@@ -455,6 +606,10 @@ class RotaryEmbedding(torch.nn.Module):
             or self._cos_cached.device != device
             or self._cos_cached.dtype != dtype
             or (self.training and self._cos_cached.is_inference())
+            or (
+                self.learnable
+                and self._cache_log_scale_version != self.log_scale._version
+            )
         ):
             self._seq_len_cached = seqlen
             # We want fp32 here, not self.inv_freq.dtype, since the model could be loaded in bf16
@@ -475,6 +630,8 @@ class RotaryEmbedding(torch.nn.Module):
                 inv_freq = self.inv_freq
             # Don't do einsum, it converts fp32 to fp16 under AMP
             # freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+            if self.learnable:
+                inv_freq = self._current_inv_freq(device=device)
             freqs = torch.outer(t, inv_freq)
             if self.scale is None:
                 self._cos_cached = torch.cos(freqs).to(dtype)
@@ -494,6 +651,7 @@ class RotaryEmbedding(torch.nn.Module):
                 self._sin_cached = (torch.sin(freqs) * scale).to(dtype)
                 self._cos_k_cached = (torch.cos(freqs) / scale).to(dtype)
                 self._sin_k_cached = (torch.sin(freqs) / scale).to(dtype)
+            self._cache_log_scale_version = self.log_scale._version if self.learnable else -1
 
     def forward(
         self,
@@ -519,7 +677,29 @@ class RotaryEmbedding(torch.nn.Module):
         if cu_seqlens is not None:
             assert max_seqlen is not None
             assert self.scale is None
-
+            if self.learnable:
+                # In eval/inference the learned scales are fixed, so retain
+                # FlashAttention's fused Triton rotary kernel.  Training uses
+                # the differentiable path below to propagate gradients into
+                # log_scale.
+                if not self.training and not torch.is_grad_enabled():
+                    self._update_cos_sin_cache(
+                        max_seqlen, device=qkv.device, dtype=qkv.dtype
+                    )
+                    return apply_pad_packed_rotary_emb_qkv_(
+                        qkv,
+                        self._cos_cached,
+                        self._sin_cached,
+                        cu_seqlens,
+                        max_seqlen,
+                        interleaved=self.interleaved,
+                        seqlen_offsets=0,
+                        num_heads_q=num_heads_q,
+                    )
+                positions = self._packed_positions(cu_seqlens, qkv.shape[0], qkv.device)
+                return self._apply_le_rope(
+                    qkv, positions, num_heads_q=num_heads_q, packed=True
+                )
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
             return apply_pad_packed_rotary_emb_qkv_(
                 qkv,
@@ -533,6 +713,71 @@ class RotaryEmbedding(torch.nn.Module):
             )
 
         seqlen = qkv.shape[1]
+        if self.learnable:
+            if not self.training and not torch.is_grad_enabled():
+                self._update_cos_sin_cache(
+                    seqlen + (int(seqlen_offset) if isinstance(seqlen_offset, int) else 0),
+                    device=qkv.device,
+                    dtype=qkv.dtype,
+                )
+                if kv is None:
+                    return apply_rotary_emb_qkv_(
+                        qkv,
+                        self._cos_cached,
+                        self._sin_cached,
+                        interleaved=self.interleaved,
+                        seqlen_offsets=seqlen_offset,
+                        num_heads_q=num_heads_q,
+                    )
+                q = apply_rotary_emb_func(
+                    qkv,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    inplace=False,
+                    seqlen_offsets=seqlen_offset,
+                )
+                kv = apply_rotary_emb_kv_(
+                    kv,
+                    self._cos_cached,
+                    self._sin_cached,
+                    interleaved=self.interleaved,
+                    seqlen_offsets=seqlen_offset,
+                )
+                return q, kv
+            if isinstance(seqlen_offset, int):
+                positions = torch.arange(
+                    seqlen, device=qkv.device, dtype=torch.long
+                ) + int(seqlen_offset)
+            elif torch.is_tensor(seqlen_offset):
+                offsets = seqlen_offset.to(device=qkv.device, dtype=torch.long)
+                positions = torch.arange(seqlen, device=qkv.device, dtype=torch.long)
+                positions = positions[None, :] + offsets.reshape(-1, 1)
+            else:
+                raise TypeError("seqlen_offset must be an int or tensor")
+            if kv is None:
+                return self._apply_le_rope(qkv, positions, num_heads_q=num_heads_q)
+            # Cross attention supplies q and kv separately; use the same
+            # positions for both streams (the current H-Net path has equal
+            # query/key offsets for its KV cache).
+            q = self._apply_le_rope(qkv, positions, num_heads_q=num_heads_q)
+            if kv.shape[1] != qkv.shape[1]:
+                if isinstance(seqlen_offset, int):
+                    kv_positions = torch.arange(
+                        kv.shape[1], device=kv.device, dtype=torch.long
+                    ) + int(seqlen_offset)
+                else:
+                    kv_positions = torch.arange(
+                        kv.shape[1], device=kv.device, dtype=torch.long
+                    )[None, :] + seqlen_offset.to(
+                        device=kv.device, dtype=torch.long
+                    ).reshape(-1, 1)
+            else:
+                kv_positions = positions
+            kv = self._apply_le_rope(
+                kv, kv_positions, num_heads_q=num_heads_q, kv_stream=True
+            )
+            return q, kv
         if max_seqlen is not None:
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
         elif isinstance(seqlen_offset, int):

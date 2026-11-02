@@ -12,7 +12,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 
-from .rotary import RotaryEmbedding
+from .rotary import RotaryEmbedding, LeRoPERegistry
 
 
 class FlashCausalSelfAttention(nn.Module):
@@ -201,6 +201,7 @@ class CausalMHA(nn.Module):
         rotary_emb_dim=0,
         rotary_emb_base=10000.0,
         rotary_emb_interleaved=False,
+        lerope_registry: Optional[LeRoPERegistry] = None,
         device=None,
         dtype=None,
     ) -> None:
@@ -226,12 +227,21 @@ class CausalMHA(nn.Module):
         qkv_dim = self.head_dim * (3 * self.num_heads)
 
         if self.rotary_emb_dim > 0:
-            self.rotary_emb = RotaryEmbedding(
-                self.rotary_emb_dim,
-                base=rotary_emb_base,
-                interleaved=rotary_emb_interleaved,
-                device=device,
-            )
+            if lerope_registry is not None:
+                self.rotary_emb = lerope_registry.get(
+                    self.rotary_emb_dim,
+                    base=rotary_emb_base,
+                    interleaved=rotary_emb_interleaved,
+                    device=device,
+                )
+            else:
+                self.rotary_emb = RotaryEmbedding(
+                    self.rotary_emb_dim,
+                    base=rotary_emb_base,
+                    interleaved=rotary_emb_interleaved,
+                    device=device,
+                    learnable=True,
+                )
 
         self.Wqkv = nn.Linear(d_model, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
         self.inner_attn = FlashCausalSelfAttention(
