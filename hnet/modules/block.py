@@ -106,9 +106,11 @@ class Mamba3Wrapper(Mamba3):
         ADT = A * DT
         DT = DT.transpose(1, 2)
         ADT = ADT.transpose(1, 2)
-        angles = angles.unsqueeze(-2).expand(
-            -1, -1, self.nheads, -1
-        ).float()
+        # The native SISO entry point converts Angles to BF16 before launching
+        # its fused kernel. Keep the projection output in BF16 here so the
+        # graph does not materialize a full FP32 angle bank only to recast it
+        # immediately inside mamba3_siso_combined.
+        angles = angles.unsqueeze(-2).expand(-1, -1, self.nheads, -1)
         B = self.B_norm(B)
         C = self.C_norm(C)
         y = mamba3_siso_combined(
