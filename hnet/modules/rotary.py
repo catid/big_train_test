@@ -7,6 +7,34 @@ from einops import rearrange, repeat
 from flash_attn.ops.triton.rotary import apply_rotary
 
 
+def _lerope_grad_neox_impl(y, dy, positions, freq_scale):
+    """FP32 LeRoPE log-frequency reduction for the canonical NeoX pairing.
+
+    Keeping this contraction in one compiled kernel avoids the separate
+    elementwise dangle, cast, broadcast, and reduction launches that otherwise
+    occur once per SWA layer during backward.
+    """
+    bands = y.shape[-1] // 2
+    y1 = y[..., :bands]
+    y2 = y[..., bands : 2 * bands]
+    dy1 = dy[..., :bands]
+    dy2 = dy[..., bands : 2 * bands]
+    dangle = (-dy1 * y2 + dy2 * y1).float()
+    if dangle.ndim == 4:
+        weighted = dangle * positions.to(dangle.dtype).view(1, -1, 1, 1)
+        return (weighted * freq_scale.view(1, 1, 1, -1)).sum(dim=(0, 1, 2))
+    weighted = dangle * positions.to(dangle.dtype).view(-1, 1, 1)
+    return (weighted * freq_scale.view(1, 1, -1)).sum(dim=(0, 1))
+
+
+_lerope_grad_neox = torch.compile(
+    _lerope_grad_neox_impl,
+    fullgraph=True,
+    dynamic=True,
+    options={"triton.cudagraphs": False},
+)
+
+
 def rotate_half(x, interleaved=False):
     if not interleaved:
         x1, x2 = x.chunk(2, dim=-1)
@@ -425,25 +453,21 @@ class ApplyLearnableRotaryEmbQKV_(torch.autograd.Function):
         if ctx.direct_frequency_grad:
             y = y[..., :rotary_dim]
             dy = dy[..., :rotary_dim]
+            freq_scale = (theta * log_scale.exp()).to(dtype=torch.float32)
             if ctx.interleaved:
-                y1, y2 = y[..., 0::2], y[..., 1::2]
-                dy1, dy2 = dy[..., 0::2], dy[..., 1::2]
-            else:
+                raise RuntimeError("compiled LeRoPE path requires NeoX pairing")
+            if positions.ndim != 1:
+                # Cached decode is outside the canonical training graph; keep
+                # the explicit fallback for its per-row offsets.
                 y1, y2 = y[..., : rotary_dim // 2], y[..., rotary_dim // 2 :]
                 dy1, dy2 = dy[..., : rotary_dim // 2], dy[..., rotary_dim // 2 :]
-            dangle = -dy1 * y2 + dy2 * y1
-            freq_scale = (theta * log_scale.exp()).to(dtype=torch.float32)
-            dangle = dangle.float()
-            if positions.ndim == 1:
-                if dangle.dim() == 4:  # padded [B,S,H,F]
-                    pos = positions.to(dangle.dtype).view(1, -1, 1, 1)
-                    grad_log_scale = (dangle * pos * freq_scale.view(1, 1, 1, -1)).sum(dim=(0, 1, 2))
-                else:  # packed [T,H,F]
-                    pos = positions.to(dangle.dtype).view(-1, 1, 1)
-                    grad_log_scale = (dangle * pos * freq_scale.view(1, 1, -1)).sum(dim=(0, 1))
-            else:  # decode offsets, [B,S,H,F]
+                dangle = (-dy1 * y2 + dy2 * y1).float()
                 pos = positions.to(dangle.dtype).unsqueeze(-1).unsqueeze(-1)
-                grad_log_scale = (dangle * pos * freq_scale.view(1, 1, 1, -1)).sum(dim=tuple(range(dangle.ndim - 1)))
+                grad_log_scale = (dangle * pos * freq_scale.view(1, 1, 1, -1)).sum(
+                    dim=tuple(range(dangle.ndim - 1))
+                )
+            else:
+                grad_log_scale = _lerope_grad_neox(y, dy, positions, freq_scale)
         else:
             y = y[..., :rotary_dim].float()
             dy = dy[..., :rotary_dim].float()
