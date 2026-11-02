@@ -120,9 +120,9 @@ class FusedTokenRouter(nn.Module):
             logits,
             topk=self.top_k,
             score_function="softmax",
-            # Keep the dense boolean map required by the graph-safe TE
-            # permutation below.  Do not inherit a future TE default (for
-            # example BITMAP_U8), which would silently change the map shape.
+            # Keep the dense map required by the graph-safe TE permutation
+            # below. Do not inherit a future TE default (for example
+            # BITMAP_U8), which would silently change the map shape.
             routing_map_format="bytemap",
         )
         if routing_map.shape != logits.shape or routing_map.shape[-1] != self.num_experts:
@@ -135,10 +135,12 @@ class FusedTokenRouter(nn.Module):
                 "Transformer Engine fused router returned unexpected score output: "
                 f"scores={tuple(probs.shape)} dtype={probs.dtype} logits={tuple(logits.shape)}"
             )
-        # The pinned TE kernel currently returns bool for BYTEMAP.  Normalize
-        # the contract here so a compatible TE rebuild cannot leak uint8 into
-        # the int32 map consumed by ``permute_mask_map_fwd``.
-        return probs.contiguous(), routing_map.to(dtype=torch.bool).contiguous()
+        # ``permute_mask_map_fwd`` consumes int32. Normalize the contract at
+        # this boundary so LatentMoE does not first materialize a contiguous
+        # bool map and immediately cast that full [tokens, experts] tensor to
+        # int32 on every routed invocation. This also remains robust if a
+        # compatible TE rebuild returns uint8 for BYTEMAP.
+        return probs.contiguous(), routing_map.to(dtype=torch.int32).contiguous()
 
     def permute(
         self,
@@ -481,10 +483,11 @@ class LatentMoE(nn.Module):
             self._z_loss = current_z_loss
         else:
             self._z_loss = self._z_loss + current_z_loss
-        # Convert the dense boolean route map once.  Reusing this int32 map
-        # for expert selection and the capacity/auxiliary paths avoids a
-        # second bool->int64 conversion on every routed invocation.
-        routing_map = fused_routing_map.to(dtype=torch.int32)
+        # Reuse the router's dense int32 map for expert selection and the
+        # capacity/auxiliary paths without another full-token dtype conversion.
+        # FusedTokenRouter owns the TE dtype normalization and returns the
+        # int32 map consumed by capacity and dispatch directly.
+        routing_map = fused_routing_map
         expert_idx = routing_map.argmax(dim=-1)
 
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
