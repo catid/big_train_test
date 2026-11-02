@@ -951,11 +951,16 @@ def annotate_decay(model):
 @torch.no_grad()
 def _clip_lerope_gradients(model, max_norm: float = 1.0):
     """Clip shared LeRoPE frequency gradients independently of model norm."""
-    grads = [
-        p.grad
-        for p in model.parameters()
-        if getattr(p, "_lerope_frequency", False) and p.grad is not None
-    ]
+    # Parameter identity is stable for the lifetime of a trainer. Cache the
+    # filtered list so the per-step clipping path does not rebuild Python
+    # lists or walk the full 600M-parameter module tree after every replay.
+    parameters = getattr(model, "_hnet_lerope_parameters", None)
+    if parameters is None:
+        parameters = tuple(
+            p for p in model.parameters() if getattr(p, "_lerope_frequency", False)
+        )
+        setattr(model, "_hnet_lerope_parameters", parameters)
+    grads = [p.grad for p in parameters if p.grad is not None]
     if not grads:
         return None
     norm = torch.linalg.vector_norm(torch.stack([g.float().norm() for g in grads]))
@@ -980,13 +985,16 @@ def _clip_non_lerope_gradients(model, max_norm: float = 1.0):
     eager and CUDA-graph training paths.
     """
 
-    parameters = [
-        parameter
-        for parameter in model.parameters()
-        if parameter.requires_grad
-        and not getattr(parameter, "_lerope_frequency", False)
-        and parameter.grad is not None
-    ]
+    parameters = getattr(model, "_hnet_non_lerope_parameters", None)
+    if parameters is None:
+        parameters = tuple(
+            parameter
+            for parameter in model.parameters()
+            if parameter.requires_grad
+            and not getattr(parameter, "_lerope_frequency", False)
+        )
+        setattr(model, "_hnet_non_lerope_parameters", parameters)
+    parameters = [parameter for parameter in parameters if parameter.grad is not None]
     if not parameters:
         return torch.zeros((), device=next(model.parameters()).device)
     # The canonical graph path leaves dense gradients for every trainable
@@ -2541,11 +2549,14 @@ def main():
         )
         if graph_step is not None and graph_step._ddp_direct_storage:
             trainable_model = model.module if world > 1 else model
-            frequency_parameters = [
-                parameter
-                for parameter in trainable_model.parameters()
-                if getattr(parameter, "_lerope_frequency", False)
-            ]
+            frequency_parameters = getattr(trainable_model, "_hnet_lerope_parameters", None)
+            if frequency_parameters is None:
+                frequency_parameters = tuple(
+                    parameter
+                    for parameter in trainable_model.parameters()
+                    if getattr(parameter, "_lerope_frequency", False)
+                )
+                setattr(trainable_model, "_hnet_lerope_parameters", frequency_parameters)
             grad_norm = _clip_direct_ddp_storage(
                 graph_step._ddp_storage_buckets,
                 1.0,

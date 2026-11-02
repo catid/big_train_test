@@ -372,6 +372,7 @@ class ApplyLearnableRotaryEmbQKV_(torch.autograd.Function):
         cu_seqlens=None,
         max_seqlen=None,
         num_heads_q=None,
+        positions=None,
     ):
         packed = cu_seqlens is not None
         if qkv.dim() == 5:
@@ -398,9 +399,26 @@ class ApplyLearnableRotaryEmbQKV_(torch.autograd.Function):
             interleaved=interleaved,
             inplace=True,
         )
-        positions = ApplyLearnableRotaryEmbQKV_._positions(
-            qkv, cu_seqlens, max_seqlen, seqlen_offsets
-        )
+        if positions is None:
+            positions = ApplyLearnableRotaryEmbQKV_._positions(
+                qkv, cu_seqlens, max_seqlen, seqlen_offsets
+            )
+        elif positions.device != qkv.device or positions.dtype != torch.long:
+            raise ValueError("cached rotary positions must be device-local int64")
+        # Packed QKV is flattened across documents.  Its position vector must
+        # therefore contain one document-local index per packed token; a
+        # padded [B, S] cache (or a cache sized from the head dimension) would
+        # broadcast incorrectly and fail only when autograd gathers the
+        # frequency gradients.  Keep this check here as a guard for callers
+        # that invoke the low-level autograd function directly, in addition to
+        # the high-level RotaryEmbedding path which deliberately does not pass
+        # its padded static cache for packed inputs.
+        if cu_seqlens is not None:
+            if positions.ndim != 1 or positions.shape[0] != qkv.shape[0]:
+                raise ValueError(
+                    "packed rotary positions must be a 1D document-local vector "
+                    f"with length {qkv.shape[0]}, got {tuple(positions.shape)}"
+                )
         # Save the post-rotation tensor by reference.  The forward kernel is
         # in-place, so this is the output ``y`` and costs no extra activation
         # storage.  It is enough to reconstruct ``x`` via R(-theta)y.
@@ -542,8 +560,8 @@ class ApplyLearnableRotaryEmbQKV_(torch.autograd.Function):
             conjugate=True,
         )
         if ctx.direct_frequency_grad:
-            return dq, None, None, grad_log_scale, None, None, None, None, None, None
-        return dq, grad_cos, grad_sin, None, None, None, None, None, None, None
+            return dq, None, None, grad_log_scale, None, None, None, None, None, None, None
+        return dq, grad_cos, grad_sin, None, None, None, None, None, None, None, None
 
 
 def apply_learnable_rotary_emb_qkv_(
@@ -557,6 +575,7 @@ def apply_learnable_rotary_emb_qkv_(
     num_heads_q=None,
     log_scale=None,
     theta=None,
+    positions=None,
 ):
     return ApplyLearnableRotaryEmbQKV_.apply(
         qkv,
@@ -569,6 +588,7 @@ def apply_learnable_rotary_emb_qkv_(
         cu_seqlens,
         max_seqlen,
         num_heads_q,
+        positions,
     )
 
 
@@ -763,6 +783,13 @@ class RotaryEmbedding(torch.nn.Module):
         self._sin_cached = None
         self._cos_k_cached = None
         self._sin_k_cached = None
+        # Static padded training repeatedly rotates the same sequence lengths.
+        # Keep the position indices as persistent device tensors so every SWA
+        # layer reuses them instead of launching a fresh arange on each graph
+        # replay. Packed sequences and tensor-offset decode retain the dynamic
+        # path below because their positions depend on document boundaries or
+        # cache state.
+        self._position_cache = {}
 
     def _compute_inv_freq(self, device=None):
         return 1.0 / (
@@ -843,6 +870,14 @@ class RotaryEmbedding(torch.nn.Module):
         # replay must observe the updated log_scale after every optimizer step.
         return self._compute_lerope_cos_sin(seqlen, device=device, dtype=dtype)
 
+    def _static_positions(self, seqlen, *, device):
+        key = (int(seqlen), device.type, device.index)
+        positions = self._position_cache.get(key)
+        if positions is None:
+            positions = torch.arange(int(seqlen), device=device, dtype=torch.long)
+            self._position_cache[key] = positions
+        return positions
+
     def forward(
         self,
         qkv: torch.Tensor,
@@ -887,6 +922,7 @@ class RotaryEmbedding(torch.nn.Module):
                     num_heads_q=num_heads_q,
                     log_scale=self.lerope.log_scale,
                     theta=self.lerope.theta,
+                    positions=None,
                 )
             self._update_cos_sin_cache(max_seqlen, device=qkv.device, dtype=qkv.dtype)
             return apply_pad_packed_rotary_emb_qkv_(
@@ -929,6 +965,11 @@ class RotaryEmbedding(torch.nn.Module):
                     num_heads_q=num_heads_q,
                     log_scale=self.lerope.log_scale,
                     theta=self.lerope.theta,
+                    positions=(
+                        self._static_positions(qkv.shape[1], device=qkv.device)
+                        if isinstance(seqlen_offset, int) and seqlen_offset == 0
+                        else None
+                    ),
                 )
             if self.scale is None:
                 return apply_rotary_emb_qkv_(
