@@ -261,6 +261,8 @@ from typing import Any, TypeAlias
 
 import torch
 
+from hnet.fused_ops import Fp32ToBf16CastCache, Fp32UpdateBf16Cache
+
 
 # Full 623M profiling on B300: 32-entry GramNS banks are about 21% faster
 # than the previous eight-entry banks, while 64-entry banks add memory without
@@ -393,15 +395,9 @@ class GramNewtonSchulz:
         self.epsilon = float(epsilon)
         self.reset_iterations = set(int(i) for i in reset_iterations)
         self.compute_dtype = compute_dtype
-        # The rectangular recurrence only needs an identity matrix for the
-        # reduced Gram dimension.  Keeping one [1, D, D] identity per
-        # device/dtype lets the batched ``q + a * eye`` expression broadcast
-        # over all matrices.  The previous implementation expanded and
-        # materialized a separate D x D identity for every matrix in every
-        # optimizer step, adding a large fill/copy to the graph tail.
-        # Optimizer state is initialized by the eager first update before the
-        # CUDA optimizer graph is captured, so later replay never allocates a
-        # new cache entry.
+        # Cache the reduced identity matrix across optimizer replays. The
+        # cache is populated by the eager initialization step, before graph
+        # capture, so graph replay performs no allocator work here.
         self._identity_cache: dict[tuple[str, int | None, torch.dtype, int], torch.Tensor] = {}
 
     def _compute_dtype_for(self, x: torch.Tensor) -> torch.dtype:
@@ -586,6 +582,11 @@ class AnchorMuon(torch.optim.Optimizer):
         self.matrix_weight_decay = float(matrix_weight_decay)
         self._orthogonalizer = GramNewtonSchulz(epsilon=ns_epsilon, compute_dtype=ns_compute_dtype)
         self.last_stats: dict[str, float] = {}
+        # Pointer tables are built on the first eager update (or explicitly
+        # before a resumed graph capture) and then reused by graph replay.
+        self._fp32_bf16_cast = Fp32ToBf16CastCache(block_size=512)
+        self._fp32_update_bf16 = Fp32UpdateBf16Cache(block_size=512)
+        self._update_buffers = {}
 
         for group in self.param_groups:
             group.setdefault("k", 0)
@@ -1022,15 +1023,48 @@ class AnchorMuon(torch.optim.Optimizer):
         # device copy launch per matrix and per state bank.
         torch._foreach_copy_(row_buffers, list(row_stack.unbind(0)))
         torch._foreach_copy_(second_buffers, list(second_stack.unbind(0)))
-        return update
+        # Retain one stable update bank per parameter chunk.  CUDA graph
+        # capture can then reuse pointer tables prepared by the first eager
+        # update instead of allocating pointer metadata inside capture.
+        update_key = tuple(id(entry[0]) for entry in entries)
+        update_buffer = self._update_buffers.get(update_key)
+        if update_buffer is None or update_buffer.shape != update.shape:
+            update_buffer = torch.empty_like(update)
+            self._update_buffers[update_key] = update_buffer
+        update_buffer.copy_(update)
+        return update_buffer
+
+    def _copy_fp32_masters_to_parameters(self, parameters, masters):
+        """Cast persistent FP32 masters into BF16 parameters in one launch.
+
+        The ordinary foreach copy emits one dtype-conversion kernel per
+        parameter.  The pointer-table Triton path batches all tensors in a
+        same optimizer bucket while retaining their independent storages.
+        Pointer tables are cached before graph capture, so replay performs no
+        allocation or host/device transfer.
+        """
+        cast_params = []
+        cast_masters = []
+        for parameter, master in zip(parameters, masters, strict=True):
+            if master is parameter:
+                continue
+            if parameter.is_cuda and parameter.dtype is torch.bfloat16:
+                cast_params.append(parameter)
+                cast_masters.append(master)
+            else:
+                # CPU/eager diagnostic paths and FP32 parameters retain the
+                # reference copy semantics.
+                torch._foreach_copy_([parameter], [master])
+        if cast_params:
+            self._fp32_bf16_cast.copy_(cast_masters, cast_params)
 
     def _apply_matrix_residual_updates(
         self,
         entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]],
         updates: torch.Tensor,
         *,
-        lr: float,
-        soda_weight: float,
+        lr: float | torch.Tensor,
+        soda_weight: float | torch.Tensor,
     ) -> int:
         """Apply independent matrix residual updates with foreach kernels.
 
@@ -1058,6 +1092,64 @@ class AnchorMuon(torch.optim.Optimizer):
             return 0
 
         masters = [record[1] for record in records]
+        # Materialize all pointer/block tables on an eager optimizer step.
+        # The first CUDA-graph optimizer capture may see a route-dependent
+        # subset of expert matrices, so doing this lazily in graph mode would
+        # attempt torch.cat/.to allocations during stream capture.  Only
+        # BF16 destinations use the fused kernel; FP32 parameters stay on the
+        # regular foreach path below.
+        eager_fused_records = [
+            record for record in records
+            if record[0].dtype is torch.bfloat16
+        ]
+        if not isinstance(lr, torch.Tensor):
+            for no_decay in (False, True):
+                selected = [record for record in eager_fused_records if record[4] is no_decay]
+                if not selected:
+                    continue
+                weight_decay = 0.0 if no_decay else self.matrix_weight_decay
+                self._fp32_update_bf16.prepare(
+                    [record[1] for record in selected],
+                    [record[2] for record in selected],
+                    [record[3] for record in selected],
+                    [record[0] for record in selected],
+                    weight_decay,
+                )
+        if isinstance(lr, torch.Tensor):
+            # Partition BF16 parameters (the common model path) from FP32
+            # parameters such as the output head. The fused kernel requires a
+            # BF16 destination; the latter retain the exact foreach update.
+            fused_records = [record for record in records if record[0].dtype is torch.bfloat16]
+            regular_records = [record for record in records if record[0].dtype is not torch.bfloat16]
+            for no_decay in (False, True):
+                selected = [record for record in fused_records if record[4] is no_decay]
+                if not selected:
+                    continue
+                selected_masters = [record[1] for record in selected]
+                selected_anchors = [record[2] for record in selected]
+                selected_updates = [record[3] for record in selected]
+                selected_params = [record[0] for record in selected]
+                weight_decay = 0.0 if no_decay else self.matrix_weight_decay
+                self._fp32_update_bf16.prepare(
+                    selected_masters,
+                    selected_anchors,
+                    selected_updates,
+                    selected_params,
+                    weight_decay,
+                )
+                self._fp32_update_bf16.apply(
+                    selected_masters,
+                    selected_anchors,
+                    selected_updates,
+                    selected_params,
+                    lr=lr,
+                    soda=soda_weight,
+                    weight_decay=weight_decay,
+                )
+            records = regular_records
+            if not records:
+                return len(fused_records)
+            masters = [record[1] for record in records]
         anchors = [record[2] for record in records]
         if isinstance(soda_weight, torch.Tensor):
             # CUDA-scalar foreach lerp is not capture-safe on this build.
@@ -1093,7 +1185,7 @@ class AnchorMuon(torch.optim.Optimizer):
                 copy_params.append(p)
                 copy_masters.append(master)
         if copy_params:
-            torch._foreach_copy_(copy_params, copy_masters)
+            self._copy_fp32_masters_to_parameters(copy_params, copy_masters)
         return len(records)
 
     def _step_matrix_group(
@@ -1310,7 +1402,7 @@ class AnchorMuon(torch.optim.Optimizer):
         update = torch.atan2(exp_avg / bias1, denom)
         master.add_(update, alpha=-lr)
         if master is not p:
-            p.copy_(master.to(dtype=p.dtype))
+            self._copy_fp32_masters_to_parameters([p], [master])
         return 1
 
     def _step_fallback_group(
@@ -1470,7 +1562,7 @@ class AnchorMuon(torch.optim.Optimizer):
             torch._foreach_add_(masters, scaled_updates)
         else:
             torch._foreach_add_(masters, updates, alpha=-lr)
-        torch._foreach_copy_(active_params, masters)
+        self._copy_fp32_masters_to_parameters(active_params, masters)
         return len(states)
 
     @torch.no_grad()
