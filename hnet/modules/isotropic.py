@@ -20,7 +20,6 @@ from hnet.modules.msar_triton import (
     fused_msar_gate,
     fused_msar_mix,
     weighted_source_reduce,
-    weighted_source_reduce4,
 )
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
@@ -484,12 +483,13 @@ class Isotropic(nn.Module):
             # SelectBackward nodes that allocate zero-filled source banks;
             # these views preserve source ordering without a stack/copy.
             weights_by_stream = weights.unbind(1)
-            retrieved_streams = list(
-                weighted_source_reduce4(
-                    [weights_by_stream[stream_index] for stream_index in range(len(stream_banks))],
-                    list(stream_banks),
+            retrieved_streams = [
+                weighted_source_reduce(
+                    weights_by_stream[stream_index],
+                    stream_bank,
                 )
-            )
+                for stream_index, stream_bank in enumerate(stream_banks)
+            ]
         else:
             if stream_cache is None:
                 stream_banks = []

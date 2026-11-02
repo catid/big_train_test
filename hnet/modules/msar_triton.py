@@ -210,59 +210,6 @@ def _weighted_reduce_grad_weights(
     )
 
 
-@triton.jit
-def _weighted_reduce_grad_weights4(
-    grad0_ptr, bank0_ptr, out0_ptr,
-    grad1_ptr, bank1_ptr, out1_ptr,
-    grad2_ptr, bank2_ptr, out2_ptr,
-    grad3_ptr, bank3_ptr, out3_ptr,
-    batch, length, width,
-    bank0_sn, bank0_sb, bank0_sl, bank0_sd,
-    bank1_sn, bank1_sb, bank1_sl, bank1_sd,
-    bank2_sn, bank2_sb, bank2_sl, bank2_sd,
-    bank3_sn, bank3_sb, bank3_sl, bank3_sd,
-    BLOCK_D: tl.constexpr,
-    N: tl.constexpr,
-):
-    """Compute four independent source-weight gradients per launch.
-
-    Each program owns one source/token pair and keeps four scalar FP32
-    accumulators.  This preserves the per-stream reduction order while
-    removing the launch overhead of four otherwise identical kernels.
-    """
-    pid = tl.program_id(0)
-    tokens = batch * length
-    source = pid // tokens
-    token_pid = pid % tokens
-    batch_index = token_pid // length
-    token = token_pid % length
-    total0 = tl.zeros((), dtype=tl.float32)
-    total1 = tl.zeros((), dtype=tl.float32)
-    total2 = tl.zeros((), dtype=tl.float32)
-    total3 = tl.zeros((), dtype=tl.float32)
-    for d_start in range(0, width, BLOCK_D):
-        d = d_start + tl.arange(0, BLOCK_D)
-        d_mask = d < width
-        base_grad = (batch_index * length + token) * width + d
-        g0 = tl.load(grad0_ptr + base_grad, mask=d_mask, other=0).to(tl.float32)
-        g1 = tl.load(grad1_ptr + base_grad, mask=d_mask, other=0).to(tl.float32)
-        g2 = tl.load(grad2_ptr + base_grad, mask=d_mask, other=0).to(tl.float32)
-        g3 = tl.load(grad3_ptr + base_grad, mask=d_mask, other=0).to(tl.float32)
-        v0 = tl.load(bank0_ptr + source * bank0_sn + batch_index * bank0_sb + token * bank0_sl + d * bank0_sd, mask=d_mask, other=0).to(tl.float32)
-        v1 = tl.load(bank1_ptr + source * bank1_sn + batch_index * bank1_sb + token * bank1_sl + d * bank1_sd, mask=d_mask, other=0).to(tl.float32)
-        v2 = tl.load(bank2_ptr + source * bank2_sn + batch_index * bank2_sb + token * bank2_sl + d * bank2_sd, mask=d_mask, other=0).to(tl.float32)
-        v3 = tl.load(bank3_ptr + source * bank3_sn + batch_index * bank3_sb + token * bank3_sl + d * bank3_sd, mask=d_mask, other=0).to(tl.float32)
-        total0 += tl.sum(g0 * v0, axis=0)
-        total1 += tl.sum(g1 * v1, axis=0)
-        total2 += tl.sum(g2 * v2, axis=0)
-        total3 += tl.sum(g3 * v3, axis=0)
-    out_offset = source * batch * length + batch_index * length + token
-    tl.store(out0_ptr + out_offset, total0)
-    tl.store(out1_ptr + out_offset, total1)
-    tl.store(out2_ptr + out_offset, total2)
-    tl.store(out3_ptr + out_offset, total3)
-
-
 class _WeightedSourceReduce(torch.autograd.Function):
     """FP32 MSAR weighted reduction with fused forward and backward maps."""
 
@@ -348,84 +295,12 @@ class _WeightedSourceReduce(torch.autograd.Function):
         return grad_weights, grad_bank
 
 
-class _WeightedSourceReduce4(torch.autograd.Function):
-    """Four-stream reduction with a fused source-weight backward kernel."""
-
-    @staticmethod
-    def forward(ctx, w0, b0, w1, b1, w2, b2, w3, b3):
-        weights = (w0, w1, w2, w3)
-        banks = (b0, b1, b2, b3)
-        for weights_i, bank_i in zip(weights, banks):
-            if not weights_i.is_cuda or not bank_i.is_cuda:
-                raise RuntimeError("MSAR weighted reduction requires CUDA tensors")
-            if weights_i.ndim != 3 or bank_i.ndim != 4:
-                raise ValueError("expected weights=(N,B,L) and bank=(N,B,L,D)")
-            if weights_i.shape[:3] != bank_i.shape[:3] or weights_i.dtype != torch.float32:
-                raise ValueError("MSAR source and weight shapes/dtypes do not match")
-        n, batch, length, width = banks[0].shape
-        if any(bank.shape != banks[0].shape for bank in banks):
-            raise ValueError("all four MSAR banks must have matching shapes")
-        outputs = [torch.empty((batch, length, width), device=b.device, dtype=torch.float32) for b in banks]
-        for weights_i, bank_i, output_i in zip(weights, banks, outputs):
-            _weighted_reduce_forward[(batch * length * triton.cdiv(width, 1024),)](
-                weights_i, bank_i, output_i, batch, length, width,
-                *weights_i.stride(), *bank_i.stride(), BLOCK_D=1024, N=n, num_warps=4,
-            )
-        ctx.save_for_backward(w0, b0, w1, b1, w2, b2, w3, b3)
-        return tuple(outputs)
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        w0, b0, w1, b1, w2, b2, w3, b3 = ctx.saved_tensors
-        weights = (w0, w1, w2, w3)
-        banks = (b0, b1, b2, b3)
-        grads = tuple(
-            (g if g is not None else torch.zeros_like(bank.new_empty(bank.shape[1], bank.shape[2], bank.shape[3])))
-            .contiguous().float()
-            for g, bank in zip(grad_outputs, banks)
-        )
-        n, batch, length, width = banks[0].shape
-        grad_banks = [torch.empty_like(bank) for bank in banks]
-        for grad, weights_i, bank_i, grad_bank in zip(grads, weights, banks, grad_banks):
-            _weighted_reduce_grad_bank[(batch * length * triton.cdiv(width, 1024),)](
-                grad, weights_i, grad_bank, batch, length, width,
-                *weights_i.stride(), *bank_i.stride(), *grad_bank.stride(),
-                BLOCK_D=1024, N=n, num_warps=4,
-            )
-        grad_weights = [torch.empty_like(weight) for weight in weights]
-        _weighted_reduce_grad_weights4[
-            (n * batch * length,)
-        ](
-            grads[0], banks[0], grad_weights[0],
-            grads[1], banks[1], grad_weights[1],
-            grads[2], banks[2], grad_weights[2],
-            grads[3], banks[3], grad_weights[3],
-            batch, length, width,
-            *banks[0].stride(), *banks[1].stride(),
-            *banks[2].stride(), *banks[3].stride(),
-            BLOCK_D=256, N=n, num_warps=2,
-        )
-        return (
-            grad_weights[0], grad_banks[0], grad_weights[1], grad_banks[1],
-            grad_weights[2], grad_banks[2], grad_weights[3], grad_banks[3],
-        )
-
-
 def weighted_source_reduce(weights: torch.Tensor, bank: torch.Tensor) -> torch.Tensor:
     """Reduce ``weights[:,B,L] * bank[:,B,L,D]`` in FP32 without a temporary."""
 
     if not weights.is_cuda or not bank.is_cuda:
         return (weights.unsqueeze(-1) * bank).sum(dim=0)
     return _WeightedSourceReduce.apply(weights, bank)
-
-
-def weighted_source_reduce4(weights, banks):
-    """Reduce four MSAR streams, fusing only their weight-gradient launch."""
-    if len(weights) != 4 or len(banks) != 4:
-        raise ValueError("production MSAR weighted reduction expects four streams")
-    if not all(w.is_cuda and b.is_cuda for w, b in zip(weights, banks)):
-        return tuple((w.unsqueeze(-1) * b).sum(dim=0) for w, b in zip(weights, banks))
-    return _WeightedSourceReduce4.apply(*(x for pair in zip(weights, banks) for x in pair))
 
 
 @triton.jit
