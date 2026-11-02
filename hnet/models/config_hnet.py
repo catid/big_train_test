@@ -44,6 +44,9 @@ class HNetConfig:
     vocab_size: int = 256
     ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
     attn_cfg: AttnConfig = field(default_factory=AttnConfig)
+    # Shared learnable RoPE frequency scales.  One FP32 log-scale per rotary
+    # band is used by every SWA layer and head; global FA remains NoPE.
+    lerope_enabled: bool = True
     # MSAR is enabled only for the innermost main network.  Outer encoder and
     # decoder stacks remain standard residual networks because they implement
     # input/output chunking and must preserve the routing/dechunking identity.
@@ -133,6 +136,8 @@ class HNetConfig:
                 "the canonical model requires stage rotary dimensions [48, 48]; "
                 "SWA applies 48-dim RoPE and FA applies NoPE"
             )
+        if not self.lerope_enabled:
+            raise ValueError("the canonical model requires shared LeRoPE frequencies for SWA")
         if self.attn_cfg.croissattn_aux != [False, True]:
             raise ValueError(
                 "the canonical model enables patched CroissAttn only on the global FA stage"

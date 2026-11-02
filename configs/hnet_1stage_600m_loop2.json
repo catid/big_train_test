@@ -18,6 +18,7 @@
         "vha_enabled": true,
         "vha_rank": 4
     },
+    "lerope_enabled": true,
     "inner_loops": 2,
     "msar_block_size": 4,
     "msar": true,

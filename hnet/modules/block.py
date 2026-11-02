@@ -119,13 +119,18 @@ def create_block(
     device=None,
     dtype=None,
     moe_cfg=None,
+    rotary_emb_shared=None,
 ):
     factory_kwargs = {"device": device, "dtype": dtype}
 
     # Mixer
     if arch in ("s", "S", "t", "T"):
         mixer_cls = partial(
-            CausalMHA, **attn_cfg, **factory_kwargs, layer_idx=layer_idx
+            CausalMHA,
+            **attn_cfg,
+            **factory_kwargs,
+            layer_idx=layer_idx,
+            rotary_emb_shared=rotary_emb_shared,
         )
     elif arch in ("m", "M"):
         mamba_cfg = dict(ssm_cfg)

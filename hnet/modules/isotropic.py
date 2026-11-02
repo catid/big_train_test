@@ -122,6 +122,7 @@ class Isotropic(nn.Module):
         stage_idx: int,
         device=None,
         dtype=None,
+        rotary_emb_shared=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -194,6 +195,7 @@ class Isotropic(nn.Module):
                     attn_cfg=block_attn_cfg,
                     layer_idx=(layer_idx + i),
                     moe_cfg=config,
+                    rotary_emb_shared=rotary_emb_shared,
                     **factory_kwargs,
                 )
                 for i in range(int(n_layer))

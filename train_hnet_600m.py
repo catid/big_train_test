@@ -880,6 +880,32 @@ def annotate_decay(model):
             p._no_weight_decay = True
         if "msar_bias" in name:
             p._force_fallback = True
+        if getattr(p, "_lerope_frequency", False) or name.endswith(".log_scale"):
+            # LeRoPE frequencies are a coordinate system, not model weights:
+            # keep them out of decay and in the AdamATan2 scalar path.
+            p._no_weight_decay = True
+            p._force_fallback = True
+
+
+@torch.no_grad()
+def _clip_lerope_gradients(model, max_norm: float = 1.0):
+    """Clip shared LeRoPE frequency gradients independently of model norm."""
+    grads = [
+        p.grad
+        for p in model.parameters()
+        if getattr(p, "_lerope_frequency", False) and p.grad is not None
+    ]
+    if not grads:
+        return None
+    norm = torch.linalg.vector_norm(torch.stack([g.float().norm() for g in grads]))
+    coef = torch.clamp(
+        torch.as_tensor(max_norm, device=norm.device, dtype=norm.dtype)
+        / (norm + 1e-6),
+        max=1.0,
+    )
+    for grad in grads:
+        grad.mul_(coef.to(dtype=grad.dtype))
+    return norm
 
 
 def make_optimizer(model, args):
@@ -1489,6 +1515,7 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                         )
                     clip_oom = False
                     try:
+                        _clip_lerope_gradients(probe_model, 1.0)
                         grad_norm = torch.nn.utils.clip_grad_norm_(
                             probe_model.parameters(), 1.0
                         )
@@ -2354,6 +2381,7 @@ def main():
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.
             loss.backward()
+        _clip_lerope_gradients(model.module if world > 1 else model, 1.0)
         if graph_step is not None and graph_step._ddp_direct_storage:
             grad_norm = _clip_direct_ddp_storage(graph_step._ddp_storage_buckets, 1.0)
         else:

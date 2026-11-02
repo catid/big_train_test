@@ -11,6 +11,7 @@ from .config_hnet import HNetConfig
 
 from hnet.modules.dc import RoutingModuleOutput
 from hnet.te import make_linear, graph_capture_enabled
+from hnet.modules.rotary import LeRoPEFrequencies
 
 
 class FixedByteFeatures(nn.Module):
@@ -86,7 +87,21 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         self.config = config
         self.input_dtype = dtype or torch.get_default_dtype()
         self.byte_features = FixedByteFeatures(config.d_model[0], device=device)
-        self.backbone = HNet(config=config, stage_idx=0, device=device, dtype=dtype)
+        rotary_dim = int(config.attn_cfg.rotary_emb_dim[0])
+        if not bool(getattr(config, "lerope_enabled", False)):
+            raise ValueError("the canonical model requires LeRoPE for SWA")
+        self.lerope = LeRoPEFrequencies(
+            rotary_dim,
+            base=10000.0,
+            device=device,
+        )
+        self.backbone = HNet(
+            config=config,
+            stage_idx=0,
+            device=device,
+            dtype=dtype,
+            rotary_emb_shared=self.lerope,
+        )
         # Keep the CE output path in FP32, matching the TE model's stable head.
         self.lm_head = make_linear(
             config.d_model[0],
@@ -109,6 +124,10 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             raise ValueError(f"the canonical model requires fbt_passes={required_passes}")
         if inference_params is not None and int(fbt_passes) != 1:
             raise ValueError("inference-cache prefill uses exactly one pass")
+        # The shared LeRoPE table is attached to the current autograd graph.
+        # Clear only the Python cache between model forwards; CUDA graph replay
+        # reruns the captured table construction directly from log_scale.
+        self.lerope.begin_forward()
         integer_dtypes = (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64)
         if input_ids.dtype not in integer_dtypes:
             raise TypeError("H-Net byte inputs must be integer byte IDs")

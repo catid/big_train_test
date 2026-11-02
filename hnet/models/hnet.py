@@ -63,6 +63,7 @@ class HNet(nn.Module):
         stage_idx: int,
         device=None,
         dtype=None,
+        rotary_emb_shared=None,
     ) -> None:
         super().__init__()
 
@@ -108,6 +109,7 @@ class HNet(nn.Module):
                 config=config,
                 stage_idx=_stage_idx,
                 **_pos_idx_dict,
+                rotary_emb_shared=rotary_emb_shared,
                 **factory_kwargs,
             )
             self.add_module(_name, _sub_model)

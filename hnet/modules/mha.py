@@ -113,6 +113,7 @@ class CausalMHA(nn.Module):
         rotary_emb_dim=0,
         rotary_emb_base=10000.0,
         rotary_emb_interleaved=False,
+        rotary_emb_shared=None,
         croissattn_aux=False,
         num_kv_heads=None,
         vha_enabled=False,
@@ -184,6 +185,7 @@ class CausalMHA(nn.Module):
                 base=rotary_emb_base,
                 interleaved=rotary_emb_interleaved,
                 device=device,
+                lerope=rotary_emb_shared,
             )
 
         self.Wqkv = make_linear(d_model, qkv_dim, bias=qkv_proj_bias, **factory_kwargs)
@@ -239,13 +241,18 @@ class CausalMHA(nn.Module):
         assert inference_params is not None and inference_params.seqlen_offset > 0
         if self.rotary_emb_dim > 0:
             assert self.rotary_emb.scale is None, "This code path does not support xPos"
-            self.rotary_emb._update_cos_sin_cache(
-                inference_params.max_seqlen, device=q.device, dtype=q.dtype
-            )
-            rotary_cos, rotary_sin = (
-                self.rotary_emb._cos_cached,
-                self.rotary_emb._sin_cached,
-            )
+            if self.rotary_emb.lerope is not None:
+                rotary_cos, rotary_sin = self.rotary_emb._lerope_cos_sin(
+                    inference_params.max_seqlen, device=q.device, dtype=q.dtype
+                )
+            else:
+                self.rotary_emb._update_cos_sin_cache(
+                    inference_params.max_seqlen, device=q.device, dtype=q.dtype
+                )
+                rotary_cos, rotary_sin = (
+                    self.rotary_emb._cos_cached,
+                    self.rotary_emb._sin_cached,
+                )
         else:
             rotary_cos, rotary_sin = None, None
         batch = q.shape[0]
@@ -318,13 +325,18 @@ class CausalMHA(nn.Module):
             # RotaryEmbedding's packed QKV kernel expects a single 3-way
             # tensor. VHA has eight physical Q heads but only two KV heads,
             # so rotate Q and K with the varlen kernel separately.
-            if cu_seqlens is None:
+            if self.rotary_emb.lerope is not None:
+                q_phys, kv = self.rotary_emb(
+                    q_phys,
+                    kv=kv,
+                    seqlen_offset=seqlen_offset,
+                    cu_seqlens=cu_seqlens,
+                    max_seqlen=max_seqlen,
+                )
+            elif cu_seqlens is None:
                 if isinstance(seqlen_offset, int):
                     rotary_len = q_phys.shape[1] + seqlen_offset
                 else:
-                    # Tensor offsets are used only by variable-length decode;
-                    # the cache API already performs this host read when it
-                    # selects per-sample cache lengths.
                     rotary_len = q_phys.shape[1] + int(seqlen_offset.max().item())
                 self.rotary_emb._update_cos_sin_cache(
                     rotary_len, device=q_phys.device, dtype=q_phys.dtype
