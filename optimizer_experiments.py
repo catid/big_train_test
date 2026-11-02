@@ -264,11 +264,13 @@ import torch
 from hnet.fused_ops import Fp32ToBf16CastCache, Fp32UpdateBf16Cache
 
 
-# Full 623M profiling on B300: 32-entry GramNS banks are about 21% faster
-# than the previous eight-entry banks, while 64-entry banks add memory without
-# improving the optimizer tail. Keep this as one canonical setting rather than
-# exposing an unvalidated optimizer ablation through the production trainer.
-MATRIX_BUCKET_CHUNK_SIZE = 32
+# Full 623M B300 graph ABs show that 128-entry GramNS banks reduce the
+# optimizer tail once the graph-owned activation pool is established. The
+# complete B18/S4096 path stayed finite at this setting and measured
+# 38.03 ms for the captured optimizer invocation versus 38.61 ms with 32
+# entries. Keep this fixed in the production path so graph capture and eager
+# replay use the same bounded bank shape.
+MATRIX_BUCKET_CHUNK_SIZE = 128
 
 
 __version__ = "0.5.1"
