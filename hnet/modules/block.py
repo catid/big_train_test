@@ -5,13 +5,14 @@ from typing import Optional
 
 import torch
 from torch import nn, Tensor
+import torch.nn.functional as F
 
 from flash_attn.ops.triton.layer_norm import RMSNorm
-from mamba_ssm.modules.mamba3 import Mamba3
+from mamba_ssm.modules.mamba3 import Mamba3, mamba3_siso_combined
 
 from .mha import CausalMHA
 from .latent_moe import LatentMoE
-from hnet.te import make_linear
+from hnet.te import graph_capture_enabled, make_linear
 
 
 class Mamba3Wrapper(Mamba3):
@@ -50,11 +51,98 @@ class Mamba3Wrapper(Mamba3):
                     projection.linear.bias.copy_(native.bias)
             setattr(self, name, projection)
 
+        if self.is_mimo or self.is_outproj_norm:
+            raise ValueError(
+                "the canonical H-Net Mamba-3 path requires SISO without output normalization"
+            )
+        # The native Mamba-3 kernel is already fused, but its tensor plumbing
+        # around that kernel contains many small split/reshape/softplus/cast
+        # launches.  Compile only this precision-stable core, leaving the TE
+        # input/output projections outside the compiled region.  The outer
+        # trainer enables this path only while preparing a CUDA graph, so the
+        # first fixed-shape call compiles during TE's graph-backend warmup and
+        # the raw capture/replays see only the already materialized kernels.
+        self._compiled_core_forward = torch.compile(
+            self._core_forward,
+            fullgraph=False,
+            dynamic=False,
+            options={"triton.cudagraphs": False},
+        )
+
+    def _core_forward(self, projected, cu_seqlens=None):
+        """Run the canonical SISO preparation and native Mamba-3 kernel.
+
+        ``projected`` is the output of the TE FP8 input projection. Keeping
+        that projection outside this function avoids TE graph breaks while
+        allowing Inductor to fuse the surrounding elementwise and view work.
+        The canonical graph uses dense padded sequences, so ``cu_seqlens`` is
+        normally ``None``; packed/eager paths remain on the upstream native
+        implementation for their variable-length metadata.
+        """
+        batch, seqlen, _ = projected.shape
+        z, x, B, C, dd_dt, dd_A, trap, angles = torch.split(
+            projected,
+            [
+                self.d_inner,
+                self.d_inner,
+                self.d_state * self.num_bc_heads * self.mimo_rank,
+                self.d_state * self.num_bc_heads * self.mimo_rank,
+                self.nheads,
+                self.nheads,
+                self.nheads,
+                self.num_rope_angles,
+            ],
+            dim=-1,
+        )
+        z = z.view(batch, seqlen, self.nheads, self.headdim)
+        x = x.view(batch, seqlen, self.nheads, self.headdim)
+        B = B.view(batch, seqlen, self.mimo_rank, self.num_bc_heads, self.d_state)
+        C = C.view(batch, seqlen, self.mimo_rank, self.num_bc_heads, self.d_state)
+        trap = trap.transpose(1, 2)
+
+        A = -F.softplus(dd_A.float())
+        A = torch.clamp(A, max=-self.A_floor)
+        DT = F.softplus(dd_dt + self.dt_bias)
+        ADT = A * DT
+        DT = DT.transpose(1, 2)
+        ADT = ADT.transpose(1, 2)
+        angles = angles.unsqueeze(-2).expand(
+            -1, -1, self.nheads, -1
+        ).float()
+        B = self.B_norm(B)
+        C = self.C_norm(C)
+        y = mamba3_siso_combined(
+            Q=C.squeeze(2),
+            K=B.squeeze(2),
+            V=x,
+            ADT=ADT,
+            DT=DT,
+            Trap=trap,
+            Q_bias=self.C_bias.squeeze(1),
+            K_bias=self.B_bias.squeeze(1),
+            Angles=angles,
+            D=self.D,
+            Z=z,
+            chunk_size=self.chunk_size,
+            Input_States=None,
+            return_final_states=False,
+            cu_seqlens=cu_seqlens,
+        )
+        return y.view(batch, seqlen, self.d_inner).to(x.dtype)
+
     def forward(self, u, seq_idx=None, cu_seqlens=None, inference_params=None):
         if inference_params is not None and inference_params.seqlen_offset > 0:
             if u.ndim != 3 or u.shape[1] != 1:
                 raise ValueError("Mamba-3 cached decode requires a single token")
             return self.step(u, inference_params)
+        if (
+            inference_params is None
+            and cu_seqlens is None
+            and graph_capture_enabled()
+        ):
+            projected = self.in_proj(u)
+            y = self._compiled_core_forward(projected)
+            return self.out_proj(y)
         return super().forward(
             u,
             seq_idx=seq_idx,
