@@ -1435,7 +1435,11 @@ class AnchorMuon(torch.optim.Optimizer):
         torch._foreach_mul_(exp_avg, beta1)
         torch._foreach_add_(exp_avg, grads, alpha=1.0 - beta1)
         numerators = torch._foreach_div(exp_avg, bias1)
-        updates = [torch.atan2(numerator, denom) for numerator, denom in zip(numerators, denoms, strict=True)]
+        # AdamATan2's denominator is strictly positive (sqrt(v)+eps), so
+        # atan2(n, d) is exactly atan(n/d) over the update domain.  Use the
+        # foreach kernels to batch the ratio and inverse-tangent work across
+        # the fallback tensors instead of launching one atan2 per tensor.
+        updates = torch._foreach_atan(torch._foreach_div(numerators, denoms))
 
         soda_weight = self._soda_weight(t)
         if isinstance(soda_weight, torch.Tensor):

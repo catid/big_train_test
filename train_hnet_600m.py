@@ -390,6 +390,17 @@ class ByteStream:
         self.seed = int(seed)
         self.stride = batch * seq
         self.document_count = len(self.documents)
+        # A document-local window has no padding when every document contains
+        # at least one complete input/target pair of the configured length.
+        # The canonical FineWeb shards commonly satisfy this invariant.  In
+        # that case the graph's all-ones masks are static and need not be
+        # rebuilt, copied to the device, or copied into the graph-owned input
+        # tensors on every replay.  Keep the general masked path below for
+        # manifests containing short documents.
+        self.full_windows = all(
+            int(document["length"]) >= int(seq) + 1
+            for document in self.documents
+        )
         global_rows = batch * world
         # Round the epoch up to a complete global batch. Repeating only the
         # first few document indices is preferable to silently dropping the
@@ -462,7 +473,9 @@ class ByteStream:
         value ^= value >> 27
         return int(value % (max_start + 1))
 
-    def get(self, step, device):
+    def get(self, step, device, *, omit_masks=False):
+        if omit_masks and not self.full_windows:
+            raise ValueError("omit_masks requires a full-window document stream")
         epoch, offset = divmod(int(step), self.n_batches)
         permutation = self._epoch_permutation(epoch)
         first = (offset * self.world + self.rank) * self.batch
@@ -474,10 +487,11 @@ class ByteStream:
             # waiting here protects the pinned buffer before it is rewritten.
             self._stage_events[slot].synchronize()
         x_cpu, y_cpu, active_cpu, loss_cpu = self._staged[slot]
-        x_cpu.zero_()
-        y_cpu.zero_()
-        active_cpu.zero_()
-        loss_cpu.zero_()
+        if not omit_masks:
+            x_cpu.zero_()
+            y_cpu.zero_()
+            active_cpu.zero_()
+            loss_cpu.zero_()
         for row, document_index in enumerate(document_indices.tolist()):
             document = self.documents[int(document_index)]
             start = self._window_start(self.seed, epoch, int(document_index), document["length"], self.seq)
@@ -485,24 +499,44 @@ class ByteStream:
             span = self.data[document["offset"] + start : document["offset"] + start + available + 1]
             x_cpu[row, :available].copy_(span[:-1])
             y_cpu[row, :available].copy_(span[1:])
-            active_cpu[row, :available] = True
-            loss_cpu[row, :available] = True
+            if not omit_masks:
+                active_cpu[row, :available] = True
+                loss_cpu[row, :available] = True
         if not self._pinned or device.type != "cuda":
-            return tuple(
-                tensor.to(device=device, non_blocking=True)
-                for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
-            )
+            outputs = [
+                x_cpu.to(device=device, non_blocking=True),
+                y_cpu.to(device=device, non_blocking=True),
+            ]
+            if not omit_masks:
+                outputs.extend(
+                    [
+                        active_cpu.to(device=device, non_blocking=True),
+                        loss_cpu.to(device=device, non_blocking=True),
+                    ]
+                )
+            else:
+                outputs.extend((None, None))
+            return tuple(outputs)
         with torch.cuda.stream(self._copy_stream):
-            outputs = tuple(
-                tensor.to(device=device, non_blocking=True)
-                for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
-            )
+            outputs = [
+                x_cpu.to(device=device, non_blocking=True),
+                y_cpu.to(device=device, non_blocking=True),
+            ]
+            if not omit_masks:
+                outputs.extend(
+                    [
+                        active_cpu.to(device=device, non_blocking=True),
+                        loss_cpu.to(device=device, non_blocking=True),
+                    ]
+                )
             self._stage_events[slot].record(self._copy_stream)
         # Asynchronous dependency insertion; the host remains free while the
         # copy stream performs DMA and the graph stream can continue prior work.
         torch.cuda.current_stream(device).wait_event(self._stage_events[slot])
         self._stage_used[slot] = True
-        return outputs
+        if omit_masks:
+            outputs.extend((None, None))
+        return tuple(outputs)
 
 
 def load_config():
@@ -2045,12 +2079,14 @@ class CUDAGraphStep:
         self._ddp_direct_storage = compatible
         self._ddp_storage_buckets = groups if compatible else None
 
-    def replay(self, x, y, active_mask, loss_mask):
+    def replay(self, x, y, active_mask=None, loss_mask=None):
         if self.capture_stream is None:
             self.static_x.copy_(x)
             self.static_y.copy_(y)
-            self.static_mask.copy_(active_mask)
-            self.static_loss_mask.copy_(loss_mask)
+            if active_mask is not None:
+                self.static_mask.copy_(active_mask)
+            if loss_mask is not None:
+                self.static_loss_mask.copy_(loss_mask)
             self.graph.replay()
         else:
             current_stream = torch.cuda.current_stream(self.device)
@@ -2058,8 +2094,10 @@ class CUDAGraphStep:
             with torch.cuda.stream(self.capture_stream):
                 self.static_x.copy_(x)
                 self.static_y.copy_(y)
-                self.static_mask.copy_(active_mask)
-                self.static_loss_mask.copy_(loss_mask)
+                if active_mask is not None:
+                    self.static_mask.copy_(active_mask)
+                if loss_mask is not None:
+                    self.static_loss_mask.copy_(loss_mask)
                 self.graph.replay()
             current_stream.wait_stream(self.capture_stream)
         # Delayed scaling updates are deliberately outside the captured region;
@@ -2444,7 +2482,12 @@ def main():
         torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     )
     for step in range(start_step, args.steps):
-        x, y, active_mask, loss_mask = stream.get(step, device)
+        omit_graph_masks = (
+            graph_step is not None and bool(getattr(stream, "full_windows", False))
+        )
+        x, y, active_mask, loss_mask = stream.get(
+            step, device, omit_masks=omit_graph_masks
+        )
         lr_scale = _wsqd_scale(step, args)
         log["learning_rate_scale"].append(float(lr_scale))
         step_number = int(step) + 1
