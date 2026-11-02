@@ -17,9 +17,18 @@ def get_seq_idx(cu_seqlens, device=None, total_length=None):
     total_length = int(total_length)
     if total_length < 0:
         raise ValueError("total_length must be non-negative")
-    seq_idx = torch.zeros(total_length, dtype=torch.long, device=device)
-    seq_idx[cu_seqlens[:-1]] = 1
-    seq_idx = (torch.cumsum(seq_idx, dim=0) - 1).unsqueeze(0).int()
+    if device is None:
+        device = cu_seqlens.device
+    # Positive-length packed documents are represented by the interior end
+    # offsets. ``searchsorted(..., right=True)`` maps each token position to
+    # the document whose end lies strictly after it. This replaces the old
+    # zero-fill + indexed write + cumsum sequence (four full-token kernels)
+    # with an arange and one search kernel, while retaining the [1, T] int32
+    # contract expected by the Mamba and MoE paths.
+    positions = torch.arange(total_length, device=device, dtype=cu_seqlens.dtype)
+    boundaries = cu_seqlens[1:-1]
+    seq_idx = torch.searchsorted(boundaries, positions, right=True)
+    seq_idx = seq_idx.unsqueeze(0).to(dtype=torch.int32)
 
     return seq_idx
 

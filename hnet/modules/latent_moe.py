@@ -490,20 +490,22 @@ class LatentMoE(nn.Module):
         # accounting and dispatch.  The previous path cast the bool map to
         # FP32, multiplied by the active mask, then cast it back to int32;
         # that pair of conversion kernels is on the hot path for every MoE
-        # invocation.  Integer masking is exact for the binary route and the
-        # single FP32 cast below remains sufficient for the auxiliary loss.
+        # invocation.  Integer masking is exact for the binary route. Keep
+        # the packed capacity path integer throughout as well; only the
+        # dispatch probabilities need a floating-point copy later.
         # The fused router map is discrete and does not participate in
         # autograd. Mask it in place after the one required bool->int32 cast;
         # constructing a second int32 tensor and then casting it again for the
         # auxiliary loss used to add two full-token launches and a transient
         # map on every routed invocation.
         routing_map.mul_(active[:, None])
-        active_one_hot = routing_map.to(torch.float32)
         # ``f_e`` is a fraction of routing *slots*, not token rows.  Keep
         # this normalization explicit so the Switch/GShard term remains
         # invariant if a future configuration allows top-k > 1 (for the
         # canonical 1:8 route ``top_k == 1`` and this is a no-op).
-        dispatch_fraction = active_one_hot.sum(dim=0) / (active_count * self.top_k)
+        dispatch_fraction = routing_map.sum(dim=0, dtype=torch.float32) / (
+            active_count * self.top_k
+        )
         mean_probs = (probs * active_f[:, None]).sum(dim=0) / active_count
         current_aux_loss = self.aux_loss_weight * self.num_experts * (
             dispatch_fraction * mean_probs
@@ -612,7 +614,7 @@ class LatentMoE(nn.Module):
             # local expert rank without a Python loop; sequence_ids are sorted,
             # so subtracting the global count at each document start resets the
             # cumsum for every document.
-            global_positions = torch.cumsum(active_one_hot.to(torch.int32), dim=0) - 1
+            global_positions = torch.cumsum(routing_map, dim=0) - 1
             starts = torch.ones(n_tokens, device=flat.device, dtype=torch.bool)
             if n_tokens > 1:
                 starts[1:] = sequence_ids_flat[1:] != sequence_ids_flat[:-1]
@@ -622,9 +624,7 @@ class LatentMoE(nn.Module):
             # exclusive prefix at each document start so every expert's local
             # rank restarts at zero, including experts that did not receive the
             # first token of the document.
-            exclusive_positions = (
-                global_positions + 1 - active_one_hot.to(torch.int32)
-            )
+            exclusive_positions = global_positions + 1 - routing_map
             start_values = exclusive_positions.index_select(0, start_idx).to(torch.int32)
             offsets = torch.zeros(
                 (num_sequences, self.num_experts),

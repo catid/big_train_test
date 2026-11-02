@@ -140,9 +140,12 @@ class RoutingModule(nn.Module):
 
         boundary_prob = torch.stack(((1 - boundary_prob), boundary_prob), dim=-1)
 
-        selected_idx = torch.argmax(boundary_prob, dim=-1)
-
-        boundary_mask = selected_idx == 1  # (shape hidden_states.shape[:-1])
+        # The two-class row is [1-p, p]. Argmax selects class zero on an
+        # exact tie, so the hard decision is precisely p > 0.5. Keep the
+        # explicit two-column probabilities for downstream losses, while
+        # avoiding the argmax index tensor and a second gather over every
+        # byte row.
+        boundary_mask = boundary_prob[..., 1] > 0.5
         if mask is not None:
             # No invalid tokens can be selected
             boundary_mask = boundary_mask & mask
@@ -166,9 +169,7 @@ class RoutingModule(nn.Module):
                 )
             )
 
-        selected_probs = boundary_prob.gather(
-            dim=-1, index=selected_idx.unsqueeze(-1)
-        )  # (shape hidden_states.shape[:-1], 1)
+        selected_probs = boundary_prob.max(dim=-1).values.unsqueeze(-1)
 
         return RoutingModuleOutput(
             boundary_prob=boundary_prob,  # (shape hidden_states.shape[:-1], 2)

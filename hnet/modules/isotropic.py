@@ -812,11 +812,6 @@ class Isotropic(nn.Module):
                 )
                 ssm_mixer_kwargs.update(
                     {
-                        "seq_idx": get_seq_idx(
-                            cu_seqlens,
-                            device=hidden_states.device,
-                            total_length=hidden_states.shape[0],
-                        ),
                         "cu_seqlens": cu_seqlens,
                     }
                 )
@@ -835,22 +830,11 @@ class Isotropic(nn.Module):
                 )
                 ssm_mixer_kwargs.update(
                     {
-                        "seq_idx": get_seq_idx(
-                            cu_seqlens,
-                            device=hidden_states.device,
-                            total_length=(
-                                hidden_states.shape[0]
-                                if hidden_states.dim() == 2
-                                else hidden_states.shape[1]
-                            ),
-                        ),
                         # Mamba-3's fused varlen kernel uses cu_seqlens to
                         # reset the recurrent state at document boundaries;
-                        # seq_idx is not consumed by that kernel.  Keep the
-                        # packed B=1 activation paired with the exact offsets
-                        # just as the attention path does, otherwise eager
-                        # masked batches leak state from one document into
-                        # the next.
+                        # keep the packed activation paired with exact
+                        # offsets, otherwise eager masked batches leak state
+                        # from one document into the next.
                         "cu_seqlens": cu_seqlens,
                     }
                 )
@@ -865,17 +849,8 @@ class Isotropic(nn.Module):
             )
             ssm_mixer_kwargs.update(
                 {
-                    "seq_idx": get_seq_idx(
-                        cu_seqlens,
-                        device=hidden_states.device,
-                        total_length=(
-                            hidden_states.shape[0]
-                            if hidden_states.dim() == 2
-                            else hidden_states.shape[1]
-                        ),
-                        ),
                     # Mamba-3's varlen kernel resets recurrent state from
-                    # cu_seqlens; seq_idx is not consumed by that kernel.
+                    # cu_seqlens.
                     "cu_seqlens": cu_seqlens.int(),
                 }
             )

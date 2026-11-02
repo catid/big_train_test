@@ -419,9 +419,11 @@ class HNet(nn.Module):
         # gathered for the inner stack.  Keep the router's original mask in
         # ``bpred_output`` so the routing loss and diagnostics measure the
         # learned decision rather than the static capacity overflow policy.
-        effective_selected_probs = bpred_output.boundary_prob.gather(
-            -1, effective_boundary_mask.unsqueeze(-1).to(dtype=torch.long)
-        )
+        effective_selected_probs = torch.where(
+            effective_boundary_mask,
+            bpred_output.boundary_prob[..., 1],
+            bpred_output.boundary_prob[..., 0],
+        ).unsqueeze(-1)
 
         # ChunkLayer's static path returns a left-aligned padded latent tensor
         # so the training graph has stable addresses.  Inference caches are
@@ -497,16 +499,18 @@ class HNet(nn.Module):
                     # writes into a ``zeros_like`` destination.  Indexed
                     # writes there detach the previous pass and silently
                     # freeze both FBT projection matrices at zero.
-                    shifted = torch.cat(
-                        (torch.zeros_like(feedback_source[:1]), feedback_source[:-1]),
-                        dim=0,
-                    )
+                    # Keep the shift as one destination allocation and two
+                    # slice copies. This preserves CopySlices autograd while
+                    # avoiding the full-token cat temporary and its fill.
+                    shifted = torch.empty_like(feedback_source)
+                    shifted[:1].zero_()
+                    shifted[1:].copy_(feedback_source[:-1])
                     starts = next_cu_seqlens[:-1]
                     is_start = torch.zeros(
                         (shifted.shape[0],), device=shifted.device, dtype=torch.bool
                     )
                     is_start.scatter_(0, starts, True)
-                    shifted = torch.where(is_start[:, None], torch.zeros_like(shifted), shifted)
+                    shifted.masked_fill_(is_start[:, None], 0)
                 # Quantize the learned feedback projections with the same FP8
                 # recipe as the main stack, then evaluate the sigmoid in FP32
                 # so the multiplicative gate keeps stable gradients.
@@ -684,9 +688,11 @@ class HNet(nn.Module):
                     boundary_count < capacity
                 )
                 boundary_count.add_(effective_boundary_mask.to(dtype=boundary_count.dtype))
-        effective_selected_probs = bpred_output.boundary_prob.gather(
-            -1, effective_boundary_mask.unsqueeze(-1).to(dtype=torch.long)
-        )
+        effective_selected_probs = torch.where(
+            effective_boundary_mask,
+            bpred_output.boundary_prob[..., 1],
+            bpred_output.boundary_prob[..., 0],
+        ).unsqueeze(-1)
         hidden_states_inner = self.chunk_layer.step(
             hidden_states, effective_boundary_mask
         )
