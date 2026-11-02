@@ -393,6 +393,16 @@ class GramNewtonSchulz:
         self.epsilon = float(epsilon)
         self.reset_iterations = set(int(i) for i in reset_iterations)
         self.compute_dtype = compute_dtype
+        # The rectangular recurrence only needs an identity matrix for the
+        # reduced Gram dimension.  Keeping one [1, D, D] identity per
+        # device/dtype lets the batched ``q + a * eye`` expression broadcast
+        # over all matrices.  The previous implementation expanded and
+        # materialized a separate D x D identity for every matrix in every
+        # optimizer step, adding a large fill/copy to the graph tail.
+        # Optimizer state is initialized by the eager first update before the
+        # CUDA optimizer graph is captured, so later replay never allocates a
+        # new cache entry.
+        self._identity_cache: dict[tuple[str, int | None, torch.dtype, int], torch.Tensor] = {}
 
     def _compute_dtype_for(self, x: torch.Tensor) -> torch.dtype:
         if self.compute_dtype is not None:
@@ -448,9 +458,12 @@ class GramNewtonSchulz:
         projection banks.
         """
         gram = x @ x.mT
-        eye = torch.eye(
-            gram.size(-1), device=x.device, dtype=x.dtype
-        ).expand(gram.size(0), -1, -1).contiguous()
+        dim = int(gram.size(-1))
+        device_key = (x.device.type, x.device.index, x.dtype, dim)
+        eye = self._identity_cache.get(device_key)
+        if eye is None:
+            eye = torch.eye(dim, device=x.device, dtype=x.dtype).unsqueeze(0)
+            self._identity_cache[device_key] = eye
         q = None
         for i, (a, b, c) in enumerate(self.coefficients):
             if i in self.reset_iterations and i != 0:
