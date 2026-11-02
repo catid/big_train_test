@@ -3,36 +3,89 @@
 from typing import Optional, Tuple, Union
 
 import torch
+import triton
+import triton.language as tl
 from einops import rearrange, repeat
 from flash_attn.ops.triton.rotary import apply_rotary
 
 
-def _lerope_grad_neox_impl(y, dy, positions, freq_scale):
-    """FP32 LeRoPE log-frequency reduction for the canonical NeoX pairing.
+@triton.jit
+def _lerope_grad_neox_kernel(
+    y_ptr,
+    dy_ptr,
+    positions_ptr,
+    freq_scale_ptr,
+    grad_ptr,
+    rows,
+    heads,
+    positions_len,
+    dim,
+    bands: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Reduce one LeRoPE frequency band per program tile.
 
-    Keeping this contraction in one compiled kernel avoids the separate
-    elementwise dangle, cast, broadcast, and reduction launches that otherwise
-    occur once per SWA layer during backward.
+    The previous ``torch.compile`` reduction assigned the complete
+    ``B*S*H`` reduction to one generated program.  At B16/S4096 this left a
+    single ~23 ms reduction kernel on the critical backward path.  Splitting
+    the reduction into row tiles gives the SMs independent work; one FP32
+    atomic per tile/band is negligible compared with the activation reads.
+    ``rows`` is flattened over sequence and head, and ``heads`` maps the row
+    back to the sequence position for the positional multiplier.
     """
+    tile = tl.program_id(0)
+    band = tl.program_id(1)
+    row = tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    mask = row < rows
+    seq = (row // heads) % positions_len
+    pos = tl.load(positions_ptr + seq, mask=mask, other=0).to(tl.float32)
+    y1 = tl.load(y_ptr + row * dim + band, mask=mask, other=0).to(tl.float32)
+    y2 = tl.load(y_ptr + row * dim + bands + band, mask=mask, other=0).to(tl.float32)
+    dy1 = tl.load(dy_ptr + row * dim + band, mask=mask, other=0).to(tl.float32)
+    dy2 = tl.load(dy_ptr + row * dim + bands + band, mask=mask, other=0).to(tl.float32)
+    scale = tl.load(freq_scale_ptr + band).to(tl.float32)
+    partial = tl.sum((-dy1 * y2 + dy2 * y1) * pos * scale, axis=0)
+    tl.atomic_add(grad_ptr + band, partial)
+
+
+def _lerope_grad_neox(y, dy, positions, freq_scale):
+    """FP32 LeRoPE log-frequency reduction for the canonical NeoX pairing."""
+    if not (y.is_cuda and dy.is_cuda and positions.is_cuda and freq_scale.is_cuda):
+        bands = y.shape[-1] // 2
+        y1, y2 = y[..., :bands], y[..., bands : 2 * bands]
+        dy1, dy2 = dy[..., :bands], dy[..., bands : 2 * bands]
+        dangle = (-dy1 * y2 + dy2 * y1).float()
+        if dangle.ndim == 4:
+            weighted = dangle * positions.to(dangle.dtype).view(1, -1, 1, 1)
+            return (weighted * freq_scale.view(1, 1, 1, -1)).sum(dim=(0, 1, 2))
+        weighted = dangle * positions.to(dangle.dtype).view(-1, 1, 1)
+        return (weighted * freq_scale.view(1, 1, -1)).sum(dim=(0, 1))
     bands = y.shape[-1] // 2
-    y1 = y[..., :bands]
-    y2 = y[..., bands : 2 * bands]
-    dy1 = dy[..., :bands]
-    dy2 = dy[..., bands : 2 * bands]
-    dangle = (-dy1 * y2 + dy2 * y1).float()
-    if dangle.ndim == 4:
-        weighted = dangle * positions.to(dangle.dtype).view(1, -1, 1, 1)
-        return (weighted * freq_scale.view(1, 1, 1, -1)).sum(dim=(0, 1, 2))
-    weighted = dangle * positions.to(dangle.dtype).view(-1, 1, 1)
-    return (weighted * freq_scale.view(1, 1, -1)).sum(dim=(0, 1))
-
-
-_lerope_grad_neox = torch.compile(
-    _lerope_grad_neox_impl,
-    fullgraph=True,
-    dynamic=True,
-    options={"triton.cudagraphs": False},
-)
+    # qkv is contiguous in both packed [T,2H,D] and padded [B,S,2H,D]
+    # paths. Flatten every dimension except the final head/channel pair so
+    # the kernel can use one fixed addressing scheme.
+    heads = y.shape[-2]
+    y_flat = y.reshape(-1, y.shape[-1]).contiguous()
+    dy_flat = dy.reshape(-1, dy.shape[-1]).contiguous()
+    rows = y_flat.shape[0]
+    positions_len = positions.numel()
+    grad = torch.zeros((bands,), device=y.device, dtype=torch.float32)
+    grid = (triton.cdiv(rows, 1024), bands)
+    _lerope_grad_neox_kernel[grid](
+        y_flat,
+        dy_flat,
+        positions,
+        freq_scale,
+        grad,
+        rows,
+        heads,
+        positions_len,
+        y_flat.shape[-1],
+        bands=bands,
+        BLOCK_ROWS=1024,
+        num_warps=4,
+    )
+    return grad
 
 
 def rotate_half(x, interleaved=False):
