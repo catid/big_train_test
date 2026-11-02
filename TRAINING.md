@@ -10,9 +10,13 @@ two shared-weight inner executions, chunk-level FBT feedback, FP32 CE/router
 losses, AnchorMuon/GramNS plus its AdamATan2 fallback, weight decay, and DDP.
 The production SWA width is 128 tokens; the outer stacks do not use FA or
 MSAR because they preserve the byte/chunk boundary interfaces.
-SWA uses 48 rotary dimensions; global FA is NoPE. The stage configuration keeps
-the first (Mamba-only) entry at zero and applies the 48-dimension RoPE only to
-the `S` layers, so FA never allocates or rotates a positional cache.
+SWA uses 48 rotary dimensions with one shared LeRoPE log-frequency scale per
+frequency band across all SWA layers and heads; global FA is NoPE. LeRoPE is
+initialized at ordinary RoPE (`alpha=0`), keeps its FP32 frequency parameter
+out of weight decay, and clips its gradient separately before the model-wide
+clip. The stage configuration keeps the first (Mamba-only) entry at zero and
+applies the 48-dimension LeRoPE only to the `S` layers, so FA never allocates
+or rotates a positional cache.
 
 The public Cartesia posts support the outer state-space stacks and the causal
 adjacent-state router used here. They describe 1024-token SWA in encoder and
