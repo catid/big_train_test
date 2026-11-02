@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils._pytree import register_pytree_node
 
 from flash_attn.utils.generation import GenerationMixin
@@ -32,9 +33,10 @@ class FixedByteFeatures(nn.Module):
         self.d_model = d_model
 
     def forward(self, input_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return self.codes.index_select(0, input_ids.long().reshape(-1)).view(
-            *input_ids.shape, self.d_model
-        ).to(dtype=dtype)
+        # F.embedding uses the fused CUDA lookup kernel and preserves the
+        # fixed, non-trainable byte codebook.
+        output = F.embedding(input_ids.long(), self.codes)
+        return output if output.dtype == dtype else output.to(dtype=dtype)
 
 @dataclass
 class CausalLMOutput:

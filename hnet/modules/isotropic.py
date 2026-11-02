@@ -1,6 +1,5 @@
 import math
 import re
-import copy
 from dataclasses import dataclass, field
 
 import optree
@@ -765,8 +764,12 @@ class Isotropic(nn.Module):
             cu_seqlens = None
             max_seqlen = None
 
-        attn_mixer_kwargs = copy.deepcopy(mixer_kwargs)
-        ssm_mixer_kwargs = copy.deepcopy(mixer_kwargs)
+        # The trainer passes only immutable flags in ``mixer_kwargs``.  A
+        # shallow copy is sufficient because this method adds stage-specific
+        # keys without mutating nested values; deepcopy needlessly walks and
+        # clones any tensor metadata before every isotropic stage.
+        attn_mixer_kwargs = dict(mixer_kwargs)
+        ssm_mixer_kwargs = dict(mixer_kwargs)
         unpack_mask = None
         if mask is not None:
             packed = False

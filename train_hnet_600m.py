@@ -989,7 +989,10 @@ def _clip_non_lerope_gradients(model, max_norm: float = 1.0):
     ]
     if not parameters:
         return torch.zeros((), device=next(model.parameters()).device)
-    return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    # The canonical graph path leaves dense gradients for every trainable
+    # parameter. Explicit foreach dispatch batches the norm and scaling work
+    # instead of selecting the conservative per-tensor implementation.
+    return torch.nn.utils.clip_grad_norm_(parameters, max_norm, foreach=True)
 
 
 def make_optimizer(model, args):

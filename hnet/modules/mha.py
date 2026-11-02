@@ -466,13 +466,13 @@ class CausalMHA(nn.Module):
             if context_was_flat:
                 context = context.reshape(*context.shape[:-1], self.num_heads, self.head_dim)
             context = self._vha_postmix(context)
-            context_flat = rearrange(context, "... h d -> ... (h d)")
+            context_flat = context.reshape(*context.shape[:-2], self.d_model)
             return self.out_proj(context_flat)
 
         qkv = self.Wqkv(x)
-        qkv = rearrange(
-            qkv, "... (three h d) -> ... three h d", three=3, d=self.head_dim
-        )
+        # Wqkv is contiguous in its final projection dimension. A view keeps
+        # the FlashAttention layout without invoking einops parsing here.
+        qkv = qkv.view(*qkv.shape[:-1], 3, self.num_heads, self.head_dim)
         if (
             inference_params is None
             or inference_params.seqlen_offset == 0
@@ -532,7 +532,7 @@ class CausalMHA(nn.Module):
         context_flat = (
             context
             if context.shape[-1] == self.d_model
-            else rearrange(context, "... h d -> ... (h d)")
+            else context.reshape(*context.shape[:-2], self.d_model)
         )
         out = self.out_proj(context_flat)
         return out
