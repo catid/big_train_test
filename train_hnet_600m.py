@@ -2552,36 +2552,42 @@ def main():
                 elapsed = None
         else:
             elapsed = (time.perf_counter() - t0) * 1e3
-        # Aggregate all diagnostics in one NCCL operation.  The previous loop
-        # launched one all-reduce for the objective and one for every metric,
-        # then converted each scalar independently on the host.  Keep the
-        # metric order explicit so the graph replay and the JSON schema remain
-        # unchanged while reducing the synchronization/launch count to one.
+        # Aggregate all diagnostics in one NCCL operation.  Keep the metric
+        # order explicit so the graph replay and JSON schema remain unchanged.
+        # Expert-load telemetry belongs in this same vector: reducing it in a
+        # second collective added a launch and synchronization on every
+        # reported step despite having no dependency on the optimizer.
+        expert_load = metrics["moe_expert_load"].detach().float()
+        metric_count = len(metric_names)
         if report_requested:
-            metric_vector = torch.stack(
-                [loss.detach().float()]
-                + [metrics[name].detach().float() for name in metric_names[1:]]
+            diagnostic_vector = torch.cat(
+                (
+                    torch.stack(
+                        [loss.detach().float()]
+                        + [metrics[name].detach().float() for name in metric_names[1:]]
+                    ),
+                    expert_load.reshape(-1),
+                )
             )
             if world > 1:
-                dist.all_reduce(metric_vector)
-                metric_vector.div_(float(world))
+                dist.all_reduce(diagnostic_vector)
+                diagnostic_vector.div_(float(world))
             # One device-to-host copy replaces a scalar .item()/float
-            # conversion per metric. Non-reporting steps leave None markers in
-            # the JSON arrays and never force a host wait on captured tensors.
-            metric_values = metric_vector.cpu().tolist()
+            # conversion per metric and the separate expert-load copy.
+            # Non-reporting steps leave None markers in the JSON arrays and
+            # never force a host wait on captured tensors.
+            diagnostic_values = diagnostic_vector.cpu().tolist()
+            metric_values = diagnostic_values[:metric_count]
+            expert_load_values = diagnostic_values[metric_count:]
+            # Keep the reduced GPU view for the Gini diagnostic below.
+            expert_load = diagnostic_vector[metric_count:]
             reduced = metric_values[0]
             reduced_metrics = dict(zip(metric_names, metric_values))
         else:
             reduced = None
             reduced_metrics = None
-        expert_load = metrics["moe_expert_load"].detach().float()
-        # Expert utilization is telemetry rather than an optimization term.
-        # Reduce its eight counters only on report steps so normal graph
-        # replay does not pay an extra NCCL collective every update.
-        if world > 1 and report_requested:
-            dist.all_reduce(expert_load)
-            expert_load.div_(float(world))
-        expert_load_values = expert_load.cpu().tolist() if report_requested else None
+            expert_load_values = None
+
         standard_ce_value = (
             reduced_metrics["standard_ce"] if reduced_metrics is not None else None
         )
