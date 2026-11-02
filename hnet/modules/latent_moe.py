@@ -469,8 +469,14 @@ class LatentMoE(nn.Module):
         # flattened-token router's contract.
         probs, fused_routing_map = self.fused_router(logits)
         # Keep the router z regularizer in FP32, alongside the load-balancing
-        # term. This prevents large logits from destabilizing FP8 expert GEMMs.
-        current_z_loss = 1e-3 * torch.logsumexp(logits, dim=-1).square().mean()
+        # term. Static graph batches contain a large inactive tail after the
+        # learned chunker has emitted its real latents; those rows must not
+        # contribute router gradients or inflate the FP8 activation range. Use
+        # the same active-row normalization as the load-balancing term below.
+        active_f = active.to(dtype=torch.float32)
+        active_count = active_f.sum().clamp_min(1.0)
+        z_values = torch.logsumexp(logits, dim=-1)
+        current_z_loss = 1e-3 * (z_values.square() * active_f).sum() / active_count
         if self._z_loss is None:
             self._z_loss = current_z_loss
         else:
@@ -484,8 +490,6 @@ class LatentMoE(nn.Module):
         # Auxiliary loss follows the Mixtral/DeepSeek load-balancing form:
         # mean router probability times dispatched token fraction.  Keep this
         # in FP32 so BF16/FP8 router logits cannot poison the training loss.
-        active_f = active.to(dtype=torch.float32)
-        active_count = active_f.sum().clamp_min(1.0)
         # Materialize one int32 route map and reuse it for both capacity
         # accounting and dispatch.  The previous path cast the bool map to
         # FP32, multiplied by the active mask, then cast it back to int32;

@@ -2399,9 +2399,12 @@ def main():
         )
     graph_optimizer_step = None
     # Fresh calibration clears optimizer state. The first finite update is
-    # therefore eager and initializes AnchorMuon/AdamATan2; resumes already
-    # carry initialized state and can capture on their first replay.
-    optimizer_initialized = resume_state is not None
+    # therefore eager and initializes AnchorMuon/AdamATan2. A resumed
+    # optimizer also needs one eager update before capture: AnchorMuon lazily
+    # creates GramNS identities, fused pointer tables, and update buffers from
+    # the first observed gradient. Capturing that allocation would make the
+    # resume path graph-unsafe and can fail only after a long capture.
+    optimizer_initialized = False
     log = {
         # Internal capture-only tensors live on the Namespace for the loss
         # closure but must never be serialized into the JSON run record.
