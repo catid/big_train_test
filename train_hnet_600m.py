@@ -398,23 +398,35 @@ class ByteStream:
             (self.document_count + global_rows - 1) // global_rows
         ) * global_rows
         self.n_batches = self.n_documents // global_rows
-        # Reuse pinned host staging buffers so document-local sampling does
-        # not allocate pageable tensors or force a synchronous host-to-device
-        # copy on every graph replay. The buffers are private to this stream
-        # and are fully overwritten before each transfer.
+        # Reuse a ring of pinned host staging buffers so document-local
+        # sampling does not allocate pageable tensors or force a synchronous
+        # host-to-device copy on every graph replay. Transfers are queued on a
+        # dedicated stream and the consumer stream waits only on the selected
+        # slot's event; this overlaps the next H2D transfer with the previous
+        # model/optimizer replay.
         self._pinned = bool(torch.cuda.is_available())
-        self._x_cpu = torch.empty(
-            (self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned
+        self._stage_count = 4 if self._pinned else 1
+        self._copy_stream = (
+            torch.cuda.Stream(device=torch.cuda.current_device())
+            if self._pinned
+            else None
         )
-        self._y_cpu = torch.empty(
-            (self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned
+        self._staged = [
+            (
+                torch.empty((self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned),
+                torch.empty((self.batch, self.seq), dtype=torch.uint8, pin_memory=self._pinned),
+                torch.empty((self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned),
+                torch.empty((self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned),
+            )
+            for _ in range(self._stage_count)
+        ]
+        self._stage_events = (
+            [torch.cuda.Event() for _ in range(self._stage_count)]
+            if self._pinned
+            else []
         )
-        self._active_cpu = torch.empty(
-            (self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned
-        )
-        self._loss_cpu = torch.empty(
-            (self.batch, self.seq), dtype=torch.bool, pin_memory=self._pinned
-        )
+        self._stage_used = [False] * self._stage_count
+        self._stage_index = 0
         self._epoch = None
         self._permutation = None
 
@@ -455,10 +467,13 @@ class ByteStream:
         permutation = self._epoch_permutation(epoch)
         first = (offset * self.world + self.rank) * self.batch
         document_indices = permutation[first : first + self.batch]
-        x_cpu = self._x_cpu
-        y_cpu = self._y_cpu
-        active_cpu = self._active_cpu
-        loss_cpu = self._loss_cpu
+        slot = self._stage_index
+        self._stage_index = (slot + 1) % self._stage_count
+        if self._pinned and self._stage_used[slot]:
+            # The event is recorded after the prior H2D reads from this slot;
+            # waiting here protects the pinned buffer before it is rewritten.
+            self._stage_events[slot].synchronize()
+        x_cpu, y_cpu, active_cpu, loss_cpu = self._staged[slot]
         x_cpu.zero_()
         y_cpu.zero_()
         active_cpu.zero_()
@@ -472,10 +487,22 @@ class ByteStream:
             y_cpu[row, :available].copy_(span[1:])
             active_cpu[row, :available] = True
             loss_cpu[row, :available] = True
-        return tuple(
-            tensor.to(device=device, non_blocking=True)
-            for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
-        )
+        if not self._pinned or device.type != "cuda":
+            return tuple(
+                tensor.to(device=device, non_blocking=True)
+                for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
+            )
+        with torch.cuda.stream(self._copy_stream):
+            outputs = tuple(
+                tensor.to(device=device, non_blocking=True)
+                for tensor in (x_cpu, y_cpu, active_cpu, loss_cpu)
+            )
+            self._stage_events[slot].record(self._copy_stream)
+        # Asynchronous dependency insertion; the host remains free while the
+        # copy stream performs DMA and the graph stream can continue prior work.
+        torch.cuda.current_stream(device).wait_event(self._stage_events[slot])
+        self._stage_used[slot] = True
+        return outputs
 
 
 def load_config():
@@ -908,6 +935,29 @@ def _clip_lerope_gradients(model, max_norm: float = 1.0):
     return norm
 
 
+@torch.no_grad()
+def _clip_non_lerope_gradients(model, max_norm: float = 1.0):
+    """Clip the ordinary model gradients without re-clipping LeRoPE.
+
+    LeRoPE's frequency gradient has a separate norm in the method's reference
+    recipe.  Passing all parameters to ``clip_grad_norm_`` after that step
+    silently couples the frequency channels back into the global norm and can
+    suppress every model update at long context.  Keep this helper shared by
+    eager and CUDA-graph training paths.
+    """
+
+    parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+        and not getattr(parameter, "_lerope_frequency", False)
+        and parameter.grad is not None
+    ]
+    if not parameters:
+        return torch.zeros((), device=next(model.parameters()).device)
+    return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+
+
 def make_optimizer(model, args):
     # The canonical trainer uses the repository's reviewed optimizer module.
     # Do not silently switch to an alternate scripts/ checkout: a training run
@@ -1254,14 +1304,38 @@ def read_power_watts(device_index=None):
 
 
 @torch.no_grad()
-def _clip_direct_ddp_storage(buckets, max_norm: float = 1.0):
-    """Clip gradients in validated contiguous DDP reducer storage."""
+def _clip_direct_ddp_storage(
+    buckets, max_norm: float = 1.0, frequency_parameters=()
+):
+    """Clip contiguous DDP storage while preserving a separate LeRoPE norm.
+
+    Reducer views put the tiny FP32 LeRoPE tensor in a shared storage bucket.
+    Save and restore those views around the bucket-wide scale so the ordinary
+    norm never changes their independently clipped gradient.
+    """
     if not buckets:
         raise ValueError("direct DDP clipping requires at least one storage bucket")
-    # Match clip_grad_norm_'s foreach path and native dtype rounding. Casting
-    # BF16 buckets to FP32 changes the clip coefficient at model scale.
-    norms = torch.stack(torch._foreach_norm(list(buckets), 2.0))
-    total_norm = torch.linalg.vector_norm(norms, ord=2)
+    frequency_parameters = tuple(
+        parameter
+        for parameter in frequency_parameters
+        if parameter.grad is not None
+    )
+    saved_frequency = tuple(
+        (parameter, parameter.grad.detach().clone())
+        for parameter in frequency_parameters
+    )
+    # The direct storage buckets do not retain parameter boundaries.  Compute
+    # one norm per bucket, subtracting the tiny frequency-vector contribution;
+    # this preserves the independent LeRoPE norm without launching a norm
+    # kernel for every parameter tensor.
+    norms = torch.stack(torch._foreach_norm(list(buckets), 2.0)).float()
+    total_sq = norms.square().sum()
+    if saved_frequency:
+        frequency_sq = torch.stack(
+            [gradient.float().norm().square() for _, gradient in saved_frequency]
+        ).sum()
+        total_sq = total_sq.sub(frequency_sq).clamp_min(0.0)
+    total_norm = total_sq.sqrt()
     clip_coef = torch.clamp(
         torch.as_tensor(max_norm, dtype=total_norm.dtype, device=total_norm.device)
         / (total_norm + 1e-6),
@@ -1269,6 +1343,8 @@ def _clip_direct_ddp_storage(buckets, max_norm: float = 1.0):
     )
     for bucket in buckets:
         bucket.mul_(clip_coef.to(dtype=bucket.dtype))
+    for parameter, gradient in saved_frequency:
+        parameter.grad.copy_(gradient)
     return total_norm
 
 
@@ -1515,10 +1591,8 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                         )
                     clip_oom = False
                     try:
-                        _clip_lerope_gradients(probe_model, 1.0)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
-                            probe_model.parameters(), 1.0
-                        )
+                        lerope_norm = _clip_lerope_gradients(probe_model, 1.0)
+                        grad_norm = _clip_non_lerope_gradients(probe_model, 1.0)
                     except RuntimeError as exc:
                         if "out of memory" not in str(exc).lower():
                             raise
@@ -1533,7 +1607,10 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
                     if bool(clip_flag.item()):
                         oom = True
                         break
-                    finite_grad_flag = torch.isfinite(grad_norm).to(dtype=torch.int32)
+                    finite_grad = torch.isfinite(grad_norm)
+                    if lerope_norm is not None:
+                        finite_grad = finite_grad & torch.isfinite(lerope_norm)
+                    finite_grad_flag = finite_grad.to(dtype=torch.int32)
                     if world > 1:
                         dist.all_reduce(finite_grad_flag, op=dist.ReduceOp.MIN)
                     if not bool(finite_grad_flag.item()):
@@ -2345,10 +2422,37 @@ def main():
             flush=True,
         )
     latest_power = []
+    metric_names = (
+        "objective",
+        "standard_ce",
+        "feedback_ce",
+        "router_loss",
+        "moe_aux",
+        "moe_balance_loss",
+        "routing_ratio",
+        "soft_routing_ratio",
+        "ratio_target_error",
+    )
+    # Timing events are recorded every update but synchronized only when the
+    # step is reported or evaluated.  The old loop synchronized the entire
+    # device after every optimizer replay, preventing the next input DMA and
+    # graph launch from overlapping the tail of the current update.
+    step_start_event = (
+        torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+    )
+    step_end_event = (
+        torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
+    )
     for step in range(start_step, args.steps):
         x, y, active_mask, loss_mask = stream.get(step, device)
         lr_scale = _wsqd_scale(step, args)
         log["learning_rate_scale"].append(float(lr_scale))
+        step_number = int(step) + 1
+        report_requested = (
+            step < 3
+            or step % int(args.log_every) == 0
+            or (int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0)
+        )
         for group in optimizer.param_groups:
             # AnchorMuon splits matrix and AdamATan2 fallback tensors into
             # separate groups; preserve the requested fallback rate.
@@ -2363,7 +2467,9 @@ def main():
                 group["lr"] = args.lr * lr_scale
             if "fallback_lr" in group:
                 group["fallback_lr"] = args.lr * ADAM_ATAN2_LR_RATIO * lr_scale
-        t0 = time.perf_counter()
+        t0 = time.perf_counter() if step_start_event is None else None
+        if step_start_event is not None:
+            step_start_event.record()
         if graph_step is not None:
             loss, metrics = graph_step.replay(x, y, active_mask, loss_mask)
         else:
@@ -2381,12 +2487,26 @@ def main():
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.
             loss.backward()
-        _clip_lerope_gradients(model.module if world > 1 else model, 1.0)
+        lerope_norm = _clip_lerope_gradients(
+            model.module if world > 1 else model, 1.0
+        )
         if graph_step is not None and graph_step._ddp_direct_storage:
-            grad_norm = _clip_direct_ddp_storage(graph_step._ddp_storage_buckets, 1.0)
+            trainable_model = model.module if world > 1 else model
+            frequency_parameters = [
+                parameter
+                for parameter in trainable_model.parameters()
+                if getattr(parameter, "_lerope_frequency", False)
+            ]
+            grad_norm = _clip_direct_ddp_storage(
+                graph_step._ddp_storage_buckets,
+                1.0,
+                frequency_parameters=frequency_parameters,
+            )
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = _clip_non_lerope_gradients(model, 1.0)
         finite_local = torch.isfinite(loss) & torch.isfinite(grad_norm)
+        if lerope_norm is not None:
+            finite_local = finite_local & torch.isfinite(lerope_norm)
         # A single rank with an invalid batch must not advance its optimizer
         # while the other DDP ranks do.  Reduce the finite flag before any
         # optimizer mutation so every rank takes the same branch.
@@ -2423,45 +2543,38 @@ def main():
                 optimizer.step()
         else:
             log["nonfinite"].append(step)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        elapsed = (time.perf_counter() - t0) * 1e3
+        if step_end_event is not None:
+            step_end_event.record()
+            if report_requested:
+                step_end_event.synchronize()
+                elapsed = step_start_event.elapsed_time(step_end_event)
+            else:
+                elapsed = None
+        else:
+            elapsed = (time.perf_counter() - t0) * 1e3
         # Aggregate all diagnostics in one NCCL operation.  The previous loop
         # launched one all-reduce for the objective and one for every metric,
         # then converted each scalar independently on the host.  Keep the
         # metric order explicit so the graph replay and the JSON schema remain
         # unchanged while reducing the synchronization/launch count to one.
-        metric_names = (
-            "objective",
-            "standard_ce",
-            "feedback_ce",
-            "router_loss",
-            "moe_aux",
-            "moe_balance_loss",
-            "routing_ratio",
-            "soft_routing_ratio",
-            "ratio_target_error",
-        )
-        metric_vector = torch.stack(
-            [loss.detach().float()]
-            + [metrics[name].detach().float() for name in metric_names[1:]]
-        )
-        if world > 1:
-            dist.all_reduce(metric_vector)
-            metric_vector.div_(float(world))
-        # One device-to-host copy replaces a scalar .item()/float conversion
-        # per metric.  It also makes the logging path independent of whether
-        # graph replay returned aliases into captured storage.
-        metric_values = metric_vector.cpu().tolist()
-        reduced = metric_values[0]
-        reduced_metrics = dict(zip(metric_names, metric_values))
-        step_number = int(step) + 1
+        if report_requested:
+            metric_vector = torch.stack(
+                [loss.detach().float()]
+                + [metrics[name].detach().float() for name in metric_names[1:]]
+            )
+            if world > 1:
+                dist.all_reduce(metric_vector)
+                metric_vector.div_(float(world))
+            # One device-to-host copy replaces a scalar .item()/float
+            # conversion per metric. Non-reporting steps leave None markers in
+            # the JSON arrays and never force a host wait on captured tensors.
+            metric_values = metric_vector.cpu().tolist()
+            reduced = metric_values[0]
+            reduced_metrics = dict(zip(metric_names, metric_values))
+        else:
+            reduced = None
+            reduced_metrics = None
         expert_load = metrics["moe_expert_load"].detach().float()
-        report_requested = (
-            step < 3
-            or step % int(args.log_every) == 0
-            or (int(args.eval_every) > 0 and step_number % int(args.eval_every) == 0)
-        )
         # Expert utilization is telemetry rather than an optimization term.
         # Reduce its eight counters only on report steps so normal graph
         # replay does not pay an extra NCCL collective every update.
@@ -2469,17 +2582,25 @@ def main():
             dist.all_reduce(expert_load)
             expert_load.div_(float(world))
         expert_load_values = expert_load.cpu().tolist() if report_requested else None
-        standard_ce_value = reduced_metrics["standard_ce"]
+        standard_ce_value = (
+            reduced_metrics["standard_ce"] if reduced_metrics is not None else None
+        )
         current_lr = float(args.lr) * float(lr_scale)
-        tokens_per_second = float(args.batch * args.seq * world) / max(elapsed / 1000.0, 1e-9)
         # A conservative dense-equivalent estimate keeps MFU comparable across
         # runs while the model's actual sparse expert balance is reported
         # separately. The estimate is telemetry only and never affects updates.
         # ``tokens_per_second`` is the aggregate DDP rate, so scale the
         # per-GPU peak by world size when converting it to a cluster MFU.
-        mfu = (6.0 * float(n_params) * tokens_per_second) / (
-            float(args.peak_tflops) * float(world) * 1e12
-        )
+        if elapsed is None:
+            tokens_per_second = None
+            mfu = None
+        else:
+            tokens_per_second = float(args.batch * args.seq * world) / max(
+                elapsed / 1000.0, 1e-9
+            )
+            mfu = (6.0 * float(n_params) * tokens_per_second) / (
+                float(args.peak_tflops) * float(world) * 1e12
+            )
         report_step = rank == 0 and report_requested
         expert_gini = (
             float(_gini_from_load(expert_load).item())
@@ -2487,14 +2608,24 @@ def main():
             else None
         )
         log["loss"].append(standard_ce_value)
-        for name, value in reduced_metrics.items():
-            log[name].append(float(value))
-        if log["target_reached_step"] is None and standard_ce_value <= float(args.target_ce):
+        if reduced_metrics is None:
+            for name in metric_names:
+                log[name].append(None)
+        else:
+            for name, value in reduced_metrics.items():
+                log[name].append(float(value))
+        if (
+            log["target_reached_step"] is None
+            and standard_ce_value is not None
+            and standard_ce_value <= float(args.target_ce)
+        ):
             log["target_reached_step"] = int(step)
         log["time_ms"].append(elapsed)
         log["learning_rate"].append(current_lr)
         log["lr_phase"].append(_lr_phase(step, args))
-        log["grad_norm"].append(float(grad_norm.detach().float().item()))
+        log["grad_norm"].append(
+            float(grad_norm.detach().float().item()) if report_requested else None
+        )
         log["tokens_per_second"].append(tokens_per_second)
         log["mfu"].append(mfu)
         log["expert_gini"].append(expert_gini)
