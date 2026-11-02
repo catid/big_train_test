@@ -10,16 +10,23 @@ from flash_attn.ops.triton.rotary import apply_rotary
 
 
 @triton.jit
-def _lerope_grad_neox_kernel(
+def _lerope_grad_neox_padded_kernel(
     y_ptr,
     dy_ptr,
     positions_ptr,
     freq_scale_ptr,
     grad_ptr,
-    rows,
+    batch,
+    seqlen,
     heads,
-    positions_len,
-    dim,
+    stride_yb,
+    stride_ys,
+    stride_yh,
+    stride_yd,
+    stride_dyb,
+    stride_dys,
+    stride_dyh,
+    stride_dyd,
     bands: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
 ):
@@ -30,19 +37,63 @@ def _lerope_grad_neox_kernel(
     single ~23 ms reduction kernel on the critical backward path.  Splitting
     the reduction into row tiles gives the SMs independent work; one FP32
     atomic per tile/band is negligible compared with the activation reads.
-    ``rows`` is flattened over sequence and head, and ``heads`` maps the row
-    back to the sequence position for the positional multiplier.
+    Rows are flattened over batch, sequence, and head; the explicit strides
+    preserve the Q/K view of the packed QKV tensor and avoid a 200 MB
+    activation copy per SWA layer at B16/S4096.
     """
     tile = tl.program_id(0)
     band = tl.program_id(1)
     row = tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rows = batch * seqlen * heads
     mask = row < rows
-    seq = (row // heads) % positions_len
+    head = row % heads
+    seq = (row // heads) % seqlen
+    batch_idx = row // (heads * seqlen)
+    y_base = batch_idx * stride_yb + seq * stride_ys + head * stride_yh
+    dy_base = batch_idx * stride_dyb + seq * stride_dys + head * stride_dyh
     pos = tl.load(positions_ptr + seq, mask=mask, other=0).to(tl.float32)
-    y1 = tl.load(y_ptr + row * dim + band, mask=mask, other=0).to(tl.float32)
-    y2 = tl.load(y_ptr + row * dim + bands + band, mask=mask, other=0).to(tl.float32)
-    dy1 = tl.load(dy_ptr + row * dim + band, mask=mask, other=0).to(tl.float32)
-    dy2 = tl.load(dy_ptr + row * dim + bands + band, mask=mask, other=0).to(tl.float32)
+    y1 = tl.load(y_ptr + y_base + band * stride_yd, mask=mask, other=0).to(tl.float32)
+    y2 = tl.load(y_ptr + y_base + (bands + band) * stride_yd, mask=mask, other=0).to(tl.float32)
+    dy1 = tl.load(dy_ptr + dy_base + band * stride_dyd, mask=mask, other=0).to(tl.float32)
+    dy2 = tl.load(dy_ptr + dy_base + (bands + band) * stride_dyd, mask=mask, other=0).to(tl.float32)
+    scale = tl.load(freq_scale_ptr + band).to(tl.float32)
+    partial = tl.sum((-dy1 * y2 + dy2 * y1) * pos * scale, axis=0)
+    tl.atomic_add(grad_ptr + band, partial)
+
+
+@triton.jit
+def _lerope_grad_neox_packed_kernel(
+    y_ptr,
+    dy_ptr,
+    positions_ptr,
+    freq_scale_ptr,
+    grad_ptr,
+    tokens,
+    heads,
+    stride_yt,
+    stride_yh,
+    stride_yd,
+    stride_dyt,
+    stride_dyh,
+    stride_dyd,
+    bands: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Strided LeRoPE reduction for packed [T, heads, D] Q/K views."""
+    tile = tl.program_id(0)
+    band = tl.program_id(1)
+    row = tile * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    rows = tokens * heads
+    mask = row < rows
+    head = row % heads
+    token = row // heads
+    y_base = token * stride_yt + head * stride_yh
+    dy_base = token * stride_dyt + head * stride_dyh
+    pos = tl.load(positions_ptr + token, mask=mask, other=0).to(tl.float32)
+    y1 = tl.load(y_ptr + y_base + band * stride_yd, mask=mask, other=0).to(tl.float32)
+    y2 = tl.load(y_ptr + y_base + (bands + band) * stride_yd, mask=mask, other=0).to(tl.float32)
+    dy1 = tl.load(dy_ptr + dy_base + band * stride_dyd, mask=mask, other=0).to(tl.float32)
+    dy2 = tl.load(dy_ptr + dy_base + (bands + band) * stride_dyd, mask=mask, other=0).to(tl.float32)
     scale = tl.load(freq_scale_ptr + band).to(tl.float32)
     partial = tl.sum((-dy1 * y2 + dy2 * y1) * pos * scale, axis=0)
     tl.atomic_add(grad_ptr + band, partial)
@@ -61,30 +112,28 @@ def _lerope_grad_neox(y, dy, positions, freq_scale):
         weighted = dangle * positions.to(dangle.dtype).view(-1, 1, 1)
         return (weighted * freq_scale.view(1, 1, -1)).sum(dim=(0, 1))
     bands = y.shape[-1] // 2
-    # qkv is contiguous in both packed [T,2H,D] and padded [B,S,2H,D]
-    # paths. Flatten every dimension except the final head/channel pair so
-    # the kernel can use one fixed addressing scheme.
     heads = y.shape[-2]
-    y_flat = y.reshape(-1, y.shape[-1]).contiguous()
-    dy_flat = dy.reshape(-1, dy.shape[-1]).contiguous()
-    rows = y_flat.shape[0]
-    positions_len = positions.numel()
     grad = torch.zeros((bands,), device=y.device, dtype=torch.float32)
-    grid = (triton.cdiv(rows, 1024), bands)
-    _lerope_grad_neox_kernel[grid](
-        y_flat,
-        dy_flat,
-        positions,
-        freq_scale,
-        grad,
-        rows,
-        heads,
-        positions_len,
-        y_flat.shape[-1],
-        bands=bands,
-        BLOCK_ROWS=1024,
-        num_warps=4,
-    )
+    if y.ndim == 4:
+        batch, seqlen = y.shape[:2]
+        grid = (triton.cdiv(batch * seqlen * heads, 1024), bands)
+        _lerope_grad_neox_padded_kernel[grid](
+            y, dy, positions, freq_scale, grad,
+            batch, seqlen, heads,
+            *y.stride(), *dy.stride(),
+            bands=bands, BLOCK_ROWS=1024, num_warps=4,
+        )
+    elif y.ndim == 3:
+        tokens = y.shape[0]
+        grid = (triton.cdiv(tokens * heads, 1024), bands)
+        _lerope_grad_neox_packed_kernel[grid](
+            y, dy, positions, freq_scale, grad,
+            tokens, heads,
+            *y.stride(), *dy.stride(),
+            bands=bands, BLOCK_ROWS=1024, num_warps=4,
+        )
+    else:
+        raise ValueError(f"unsupported LeRoPE reduction rank {y.ndim}")
     return grad
 
 
