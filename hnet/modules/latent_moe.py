@@ -635,7 +635,11 @@ class LatentMoE(nn.Module):
             positions = global_positions - offsets.index_select(0, sequence_ids_flat)
             token_pos = positions.gather(1, expert_idx[:, None]).squeeze(1)
             valid = (token_pos < row_capacity) & active
-        routing_map = routing_map * valid[:, None].to(torch.int32)
+        # The pre-capacity map is no longer needed after the accepted-route
+        # counts are recorded. Mask it in place to avoid another full
+        # [tokens, experts] allocation and elementwise launch before the TE
+        # permutation.
+        routing_map.mul_(valid[:, None])
         self._expert_counts.add_(routing_map.sum(dim=0, dtype=torch.float32))
         self._expert_active_count.add_(active_count)
         routing_probs = probs * routing_map.to(probs.dtype)

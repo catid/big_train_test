@@ -126,7 +126,7 @@ class HNet(nn.Module):
                     else None
                 )
             )
-            self.dechunk_layer = DeChunkLayer(self.d_model)
+            self.dechunk_layer = DeChunkLayer(self.d_model, device=device)
 
             # do the residual in fp32
             self.residual_proj = make_linear(

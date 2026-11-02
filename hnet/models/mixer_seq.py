@@ -104,6 +104,17 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             dtype=dtype,
             rotary_emb_shared=self.lerope,
         )
+        # The production stack has a fixed module topology.  Cache the small
+        # set of LatentMoE modules once instead of walking the entire nested
+        # H-Net hierarchy on every eager forward to reset and collect routing
+        # statistics.  CUDA-graph replay does not execute this Python path,
+        # while calibration/eager validation avoid repeated ``modules()``
+        # generators and attribute probes.
+        self._moe_modules = tuple(
+            module
+            for module in self.backbone.modules()
+            if callable(getattr(module, "reset_aux_loss", None))
+        )
         # Keep the CE output path in FP32, matching the TE model's stable head.
         self.lm_head = make_linear(
             config.d_model[0],
@@ -152,10 +163,8 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         # MoE routing statistics are accumulated across recurrent inner loops
         # and FBT passes.  Reset once at the outer model boundary so a stale
         # value from the previous minibatch cannot leak into this loss.
-        for module in self.backbone.modules():
-            reset_aux_loss = getattr(module, "reset_aux_loss", None)
-            if reset_aux_loss is not None:
-                reset_aux_loss()
+        for module in self._moe_modules:
+            module.reset_aux_loss()
         hidden_dtype = self.input_dtype
         hidden_states = self.byte_features(input_ids, hidden_dtype)
         B, L, D = hidden_states.shape
@@ -191,7 +200,7 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         moe_losses = []
         moe_balance_losses = []
         expert_loads = []
-        for module in self.backbone.modules():
+        for module in self._moe_modules:
             aux_loss = getattr(module, "aux_loss", None)
             if aux_loss is None:
                 continue

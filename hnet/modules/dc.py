@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from einops import repeat, rearrange
+from einops import rearrange
 
 from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
@@ -342,6 +342,7 @@ class DeChunkLayer(nn.Module):
         dtype=torch.bfloat16,
         block_size=256,
         headdim=32,
+        device=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -352,6 +353,14 @@ class DeChunkLayer(nn.Module):
         self.headdim = headdim
         assert d_model % self.headdim == 0
         self.nheads = d_model // self.headdim
+        # The dechunk EMA has a fixed diagonal state matrix.  Keep it as a
+        # buffer so every call reuses the same device allocation instead of
+        # launching a full ``torch.ones`` fill in the hot path.
+        self.register_buffer(
+            "A",
+            -torch.ones(self.nheads, dtype=torch.float32, device=device),
+            persistent=False,
+        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return DeChunkState(
@@ -405,16 +414,15 @@ class DeChunkLayer(nn.Module):
         # deaggregation.
         dt = torch.log(1 / (1 - p)).to(self.dtype)
         x = (hidden_states / dt[..., None]).to(self.dtype)
-        A = -torch.ones(
-            (self.nheads,), device=hidden_states.device, dtype=torch.float32
-        )
         b = p.to(self.dtype)
         c = torch.ones_like(b)
 
         out = mamba_chunk_scan_combined(
             rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
-            repeat(dt, "b l -> b l h", h=self.nheads),
-            A,
+            # Mamba's scan only reads the expanded head view; a zero-stride
+            # expand avoids materializing ``nheads`` copies of every delta.
+            dt.unsqueeze(-1).expand(-1, -1, self.nheads),
+            self.A,
             rearrange(b, "b l -> b l 1 1"),
             rearrange(c, "b l -> b l 1 1"),
             chunk_size=self.block_size,

@@ -800,6 +800,82 @@ class AnchorMuon(torch.optim.Optimizer):
     def eval(self) -> "AnchorMuon":
         return self
 
+    @torch.no_grad()
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Clear gradient views with one foreach launch per dtype.
+
+        The canonical CUDA-graph path keeps DDP's ``gradient_as_bucket_view``
+        tensors alive across replays, so it must use ``set_to_none=False``.
+        PyTorch's base implementation then calls ``zero_`` once per
+        parameter because AnchorMuon deliberately has no global ``foreach``
+        default.  That creates hundreds of tiny graph nodes before every
+        backward.  Grouping the same stable views by device and dtype retains
+        the exact detach/zero semantics while dispatching the clear through
+        the batched foreach primitive.
+        """
+        if set_to_none:
+            for group in self.param_groups:
+                for parameter in group["params"]:
+                    if parameter.grad is not None:
+                        parameter.grad = None
+            return
+
+        grouped: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+        # DDP's gradient_as_bucket_view exposes every parameter gradient as a
+        # slice of a handful of contiguous reducer storages.  Zero each
+        # storage once rather than launching one clear per parameter.  The
+        # views are cached after the first warmup, which is required for
+        # CUDA-graph capture to keep their addresses stable.
+        storage_grouped: dict[tuple[torch.device, torch.dtype], list[torch.Tensor]] = {}
+        storage_cache = getattr(self, "_zero_grad_storage_cache", None)
+        if storage_cache is None:
+            storage_cache = self._zero_grad_storage_cache = {}
+        for group in self.param_groups:
+            for parameter in group["params"]:
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                if gradient.grad_fn is not None:
+                    gradient.detach_()
+                else:
+                    gradient.requires_grad_(False)
+                if gradient.is_sparse:
+                    gradient.zero_()
+                elif gradient.is_cuda and gradient.is_contiguous():
+                    storage = gradient.untyped_storage()
+                    key = (
+                        gradient.device,
+                        gradient.dtype,
+                        int(storage.data_ptr()),
+                        int(storage.nbytes()),
+                    )
+                    flat = storage_cache.get(key)
+                    if flat is None:
+                        element_size = gradient.element_size()
+                        if storage.nbytes() % element_size:
+                            raise RuntimeError("gradient storage size is not dtype-aligned")
+                        flat = torch.empty(
+                            0, device=gradient.device, dtype=gradient.dtype
+                        ).set_(
+                            storage,
+                            0,
+                            (storage.nbytes() // element_size,),
+                            (1,),
+                        )
+                        storage_cache[key] = flat
+                    storage_grouped.setdefault(
+                        (gradient.device, gradient.dtype), []
+                    ).append(flat)
+                else:
+                    grouped.setdefault((gradient.device, gradient.dtype), []).append(gradient)
+        for key, storages in storage_grouped.items():
+            # A parameter list may contain multiple views into the same
+            # bucket; preserve one clear per unique storage pointer.
+            unique = {tensor.data_ptr(): tensor for tensor in storages}
+            grouped.setdefault(key, []).extend(unique.values())
+        for gradients in grouped.values():
+            torch._foreach_zero_(gradients)
+
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Restore optimizer state without narrowing its FP32 accumulators.
 
