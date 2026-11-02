@@ -42,12 +42,12 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
-# With activation recomputation disabled, B=16 at S=4096 is the largest
+# With activation recomputation disabled, B=18 at S=4096 is the largest
 # validated complete full-model step with optimizer state on a B300. B=20
 # and larger exhaust the CUDA graph pool during the first complete update.
 # Power calibration still chooses a smaller shape when the per-GPU target is
 # reached before this bound.
-CANONICAL_MAX_BATCH = 16
+CANONICAL_MAX_BATCH = 18
 
 
 def parse_args():
@@ -67,7 +67,7 @@ def parse_args():
         "--auto-batch-max",
         type=int,
         default=CANONICAL_MAX_BATCH,
-        help="upper bound for power-calibration candidates (validated complete-step cap is 16)",
+        help="upper bound for power-calibration candidates (validated complete-step cap is 18)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument("--steps", type=int, default=100000)
