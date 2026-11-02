@@ -891,13 +891,20 @@ class AnchorMuon(torch.optim.Optimizer):
         return summary
 
     def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
+        # Frequency parameters such as LeRoPE's learned log scales should not
+        # be pulled toward their initialization by SODA.  Returning the live
+        # parameter also avoids allocating an unused anchor tensor/state entry.
+        if getattr(p, "_no_soda", False):
+            return p
         state = self.state[p]
         anchor = state.get("soda_z0")
         if anchor is None:
             anchor = state["soda_z0"] = torch.clone(p, memory_format=torch.preserve_format)
         return anchor
 
-    def _soda_weight(self, t: int) -> float:
+    def _soda_weight(self, t: int, p: torch.Tensor | None = None) -> float:
+        if p is not None and getattr(p, "_no_soda", False):
+            return 0.0
         if not self.use_soda:
             return 0.0
         return min(1.0, self.soda_lambda_scale / float(t + 1) ** self.soda_lambda_power)
@@ -1017,7 +1024,9 @@ class AnchorMuon(torch.optim.Optimizer):
         for bucket_entries in buckets.values():
             updates = self._transform_matrix_bucket(bucket_entries, group)
             for (p, anchor, _source, _grad), update in zip(bucket_entries, updates.unbind(0), strict=True):
-                p.lerp_(end=anchor, weight=soda_weight)
+                # Use a per-parameter weight so `_no_soda` remains effective
+                # even when a bucket contains mixed semantic parameter kinds.
+                p.lerp_(end=anchor, weight=self._soda_weight(t, p))
                 matrix_decay = 0.0 if getattr(p, "_no_weight_decay", False) else self.matrix_weight_decay
                 if matrix_decay:
                     p.mul_(1.0 - lr * matrix_decay)
@@ -1068,7 +1077,7 @@ class AnchorMuon(torch.optim.Optimizer):
         beta1, beta2 = group.get("betas", (0.9, 0.999))
         eps = float(group.get("eps", 1e-8))
         g = grad.detach().to(torch.float32)
-        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t))
+        p.lerp_(end=self._soda_anchor(p), weight=self._soda_weight(t, p))
         fallback_weight_decay = 0.0 if getattr(p, "_no_weight_decay", False) else float(group.get("fallback_weight_decay", 0.0))
         if fallback_weight_decay != 0.0:
             p.mul_(1.0 - lr * fallback_weight_decay)
@@ -1209,6 +1218,7 @@ def build_param_groups(
                 "param_names": matrix_names,
                 "use_matrix_update": True,
                 "lr": lr,
+                "base_lr": lr,
                 "momentum": momentum,
                 "pmuoneq_beta": pmuoneq_beta,
                 "row_gamma": row_gamma,
@@ -1225,6 +1235,7 @@ def build_param_groups(
                 "param_names": fallback_names,
                 "use_matrix_update": False,
                 "lr": fallback_lr,
+                "base_lr": fallback_lr,
                 "fallback_mode": fallback_mode,
                 "betas": fallback_betas,
                 "fallback_weight_decay": fallback_weight_decay,
