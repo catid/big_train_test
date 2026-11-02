@@ -1003,9 +1003,12 @@ class AnchorMuon(torch.optim.Optimizer):
             eps=float(group["normuon_eps"]),
         )
 
-        for idx, (p, _anchor, _source, _grad) in enumerate(entries):
-            self.state[p]["pmuoneq_row_ema"].copy_(row_stack[idx])
-            self.state[p]["normuon_second_momentum"].copy_(second_stack[idx])
+        # The state buffers are already collected in shape-homogeneous lists
+        # above. Batch their write-back just as the momentum bank below does;
+        # this preserves each state tensor's identity while avoiding one tiny
+        # device copy launch per matrix and per state bank.
+        torch._foreach_copy_(row_buffers, list(row_stack.unbind(0)))
+        torch._foreach_copy_(second_buffers, list(second_stack.unbind(0)))
         return update
 
     def _apply_matrix_residual_updates(

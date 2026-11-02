@@ -34,7 +34,14 @@ def _top1_capacity_rank_kernel(
     selected = mask & (active_values != 0) & (expert_ids == expert)
     ranks = tl.cumsum(selected.to(tl.int32), axis=0) - 1
     accepted = selected & (ranks < row_capacity)
-    tl.store(valid_ptr + token_offsets, accepted, mask=selected)
+    # Write every in-range row, including rejected and inactive routes, but
+    # only from the program belonging to that row's selected expert.  Letting
+    # all expert programs store false for every row races with the one true
+    # store and makes capacity acceptance nondeterministic.  The selected
+    # expert is unique for top-1 routing, so this mask gives one writer per
+    # output element and lets the caller use ``empty_like`` safely.
+    write_mask = mask & (expert_ids == expert)
+    tl.store(valid_ptr + token_offsets, accepted, mask=write_mask)
 
 
 def _top1_capacity_positions(
@@ -53,7 +60,10 @@ def _top1_capacity_positions(
         raise ValueError("top-1 expert indices do not match the static sequence shape")
     if not expert_idx.is_cuda or not active.is_cuda:
         raise ValueError("top-1 capacity positions require CUDA vectors")
-    valid = torch.zeros_like(active, dtype=torch.bool)
+    # The Triton rank kernel writes every valid token row, so no prior memset
+    # is needed.  This is a hot path: the canonical graph executes it for each
+    # routed layer, recurrent loop, and feedback pass.
+    valid = torch.empty_like(active, dtype=torch.bool)
     block_t = triton.next_power_of_2(int(tokens_per_sequence))
     _top1_capacity_rank_kernel[(int(num_sequences) * int(num_experts),)](
         expert_idx,
