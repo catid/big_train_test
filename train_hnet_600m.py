@@ -2202,7 +2202,7 @@ class CUDAGraphStep:
                 if len(flats) == 1:
                     pending.append(
                         dist.all_reduce(
-                            flats[0], op=dist.ReduceOp.SUM, async_op=True
+                            flats[0], op=dist.ReduceOp.AVG, async_op=True
                         )
                     )
                 else:
@@ -2212,15 +2212,15 @@ class CUDAGraphStep:
                     # FP32 group to be checked together with BF16 tensors.
                     pending.append(
                         dist.all_reduce_coalesced(
-                            flats, op=dist.ReduceOp.SUM, async_op=True
+                            flats, op=dist.ReduceOp.AVG, async_op=True
                         )
                     )
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
             for work in pending:
                 work.wait()
-            for flat in self._ddp_storage_buckets:
-                flat.div_(float(self.world))
+            # NCCL's AVG reduction includes the world-size normalization, so
+            # avoid a full-buffer divide kernel after communication.
         else:
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
