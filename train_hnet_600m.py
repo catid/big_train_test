@@ -1934,6 +1934,9 @@ class CUDAGraphStep:
         }
         self._ddp_storage_buckets = None
         self._ddp_direct_storage = False
+        self._ddp_comm_stream = (
+            torch.cuda.Stream(device=device) if self.ddp else None
+        )
         if self.ddp:
             for param in self._ddp_params:
                 if param.dtype not in self._ddp_grad_buckets:
@@ -2221,25 +2224,33 @@ class CUDAGraphStep:
             by_dtype = {}
             for flat in self._ddp_storage_buckets:
                 by_dtype.setdefault(flat.dtype, []).append(flat)
-            for flats in by_dtype.values():
-                if len(flats) == 1:
-                    pending.append(
-                        dist.all_reduce(
-                            flats[0], op=dist.ReduceOp.AVG, async_op=True
+            # Launch NCCL on a side stream after the current stream has
+            # produced all gradients. This permits TE delayed-scaling updates
+            # on the current stream to overlap communication; the current
+            # stream waits for the side stream before clipping/optimizer use.
+            current_stream = torch.cuda.current_stream(self.device)
+            self._ddp_comm_stream.wait_stream(current_stream)
+            with torch.cuda.stream(self._ddp_comm_stream):
+                for flats in by_dtype.values():
+                    if len(flats) == 1:
+                        pending.append(
+                            dist.all_reduce(
+                                flats[0], op=dist.ReduceOp.AVG, async_op=True
+                            )
                         )
-                    )
-                else:
-                    # Use the explicit homogeneous collective.  The private
-                    # context manager can retain operations across nested
-                    # dtype groups on some NCCL versions, causing the next
-                    # FP32 group to be checked together with BF16 tensors.
-                    pending.append(
-                        dist.all_reduce_coalesced(
-                            flats, op=dist.ReduceOp.AVG, async_op=True
+                    else:
+                        # Use the explicit homogeneous collective.  The private
+                        # context manager can retain operations across nested
+                        # dtype groups on some NCCL versions, causing the next
+                        # FP32 group to be checked together with BF16 tensors.
+                        pending.append(
+                            dist.all_reduce_coalesced(
+                                flats, op=dist.ReduceOp.AVG, async_op=True
+                            )
                         )
-                    )
             hnet_te.update_fp8_scaling(forward=True)
             hnet_te.update_fp8_scaling(forward=False)
+            current_stream.wait_stream(self._ddp_comm_stream)
             for work in pending:
                 work.wait()
             # NCCL's AVG reduction includes the world-size normalization, so
