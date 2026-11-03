@@ -4,6 +4,7 @@ from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from flash_attn.utils.generation import GenerationMixin
 
@@ -26,19 +27,31 @@ class FixedByteFeatures(nn.Module):
     adjacent bytes nearly collinear and initially collapse chunking.
     """
 
-    def __init__(self, d_model: int, device=None, seed: int = 1729):
+    def __init__(self, d_model: int, device=None, dtype=None, seed: int = 1729):
         super().__init__()
         generator = torch.Generator(device="cpu")
         generator.manual_seed(seed)
         codes = torch.randn(256, d_model, generator=generator, dtype=torch.float32)
         codes = codes / codes.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        self.register_buffer("codes", codes.to(device=device), persistent=True)
+        # The codebook is immutable; materialize it directly in the model
+        # activation dtype so every batch avoids an FP32 gather followed by a
+        # full [B,L,D] cast. Keep normalization in FP32 for deterministic
+        # initialization before the one-time conversion.
+        target_dtype = torch.float32 if dtype is None else dtype
+        self.register_buffer("codes", codes.to(device=device, dtype=target_dtype), persistent=True)
         self.d_model = d_model
 
     def forward(self, input_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return self.codes.index_select(0, input_ids.long().reshape(-1)).view(
-            *input_ids.shape, self.d_model
-        ).to(dtype=dtype)
+        # F.embedding selects the same fixed rows as index_select but uses the
+        # fused embedding lookup kernel on CUDA, avoiding the flatten/view
+        # bookkeeping in the byte hot path.
+        # CUDA's embedding kernel accepts int32 indices.  ByteStream batches
+        # arrive as uint8; promoting to int64 doubles the index-transfer and
+        # gather bandwidth for no benefit and creates an avoidable temporary
+        # before every graph replay.  Keep the narrow int32 conversion.
+        indices = input_ids.to(dtype=torch.int32)
+        output = F.embedding(indices, self.codes)
+        return output if output.dtype == dtype else output.to(dtype=dtype)
 
 @dataclass
 class CausalLMOutput:
@@ -202,7 +215,7 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         super().__init__()
         self.config = config
         self.input_dtype = dtype or torch.get_default_dtype()
-        self.byte_features = FixedByteFeatures(config.d_model[0], device=device)
+        self.byte_features = FixedByteFeatures(config.d_model[0], device=device, dtype=dtype)
         self.lerope_registry = LeRoPERegistry()
         self.backbone = HNet(
             config=config,
@@ -210,6 +223,16 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             device=device,
             dtype=dtype,
             lerope_registry=self.lerope_registry,
+        )
+        # The MoE regularizers are emitted by a fixed set of LatentMoE
+        # modules. Cache the tuple once at construction instead of walking
+        # the complete recursive backbone on every training forward (which
+        # otherwise adds Python traversal and attribute checks to each graph
+        # warmup/replay dispatch).
+        self._moe_modules = tuple(
+            module
+            for module in self.backbone.modules()
+            if hasattr(module, "aux_loss") and hasattr(module, "z_loss")
         )
         # Keep the CE output path in FP32, matching the TE model's stable head.
         self.lm_head = nn.Linear(
@@ -253,19 +276,30 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             hidden_states, bpred_output = result
             feedback_hidden = []
         hidden_states = hidden_states.view(B, L, D)
-        logits = self.lm_head(hidden_states.float())
-        feedback_logits = [self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden]
+        # ``HNet.forward`` appends every feedback pass, including the final
+        # decoded pass.  The old path projected that final activation twice:
+        # once for ``logits`` and again for ``feedback_logits[-1]``.  Reuse
+        # the final feedback projection as the primary logits tensor.  This
+        # removes one full output-head GEMM from every FBT training step and
+        # keeps the returned tensors and loss ordering unchanged.
+        if feedback_hidden:
+            feedback_logits = [
+                self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden
+            ]
+            logits = feedback_logits[-1]
+        else:
+            logits = self.lm_head(hidden_states.float())
+            feedback_logits = []
         moe_aux_loss = logits.new_zeros((), dtype=torch.float32)
         moe_z_loss = logits.new_zeros((), dtype=torch.float32)
-        # The production graph has a fixed module set; traversing it here is
-        # capture-safe and keeps each LatentMoE's FP32 router losses on-device.
-        # LatentMoE exposes the regularizers from the final FBT pass, matching
-        # the primary final-pass CE objective; earlier passes are auxiliary CE
-        # supervision only and do not silently double-count router penalties.
-        for module in self.backbone.modules():
-            if hasattr(module, "aux_loss") and hasattr(module, "z_loss"):
-                moe_aux_loss = moe_aux_loss + module.aux_loss.float()
-                moe_z_loss = moe_z_loss + module.z_loss.float()
+        # Keep each LatentMoE's FP32 router losses on-device.  The cached
+        # module tuple is fixed after construction, so this remains safe for
+        # CUDA graph capture while avoiding a recursive Python walk per step.
+        # Regularizers come from the final FBT pass; earlier passes contribute
+        # auxiliary CE only and do not silently double-count router penalties.
+        for module in self._moe_modules:
+            moe_aux_loss = moe_aux_loss + module.aux_loss.float()
+            moe_z_loss = moe_z_loss + module.z_loss.float()
         return CausalLMOutput(
             logits=logits,
             bpred_output=bpred_output,
