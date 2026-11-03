@@ -1501,8 +1501,10 @@ def _reduce_packed_gradients_by_dtype(buckets, world):
         if not params:
             continue
         flat = bucket["buffer"]
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-        flat.div_(float(world))
+        # NCCL performs the world-size normalization in its AVG reduction;
+        # this avoids a full-buffer divide kernel after communication.  Keep
+        # the same averaging contract as the direct DDP graph path.
+        dist.all_reduce(flat, op=dist.ReduceOp.AVG)
         offset = 0
         for parameter in params:
             count = parameter.numel()
@@ -2240,8 +2242,7 @@ class CUDAGraphStep:
 
         if self._ddp_direct_storage:
             for flat in self._ddp_storage_buckets:
-                dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-                flat.div_(float(self.world))
+                dist.all_reduce(flat, op=dist.ReduceOp.AVG)
             return
 
         for dtype, bucket in self._ddp_grad_buckets.items():
@@ -2262,8 +2263,7 @@ class CUDAGraphStep:
                 else:
                     view.copy_(param.grad.detach().reshape(-1))
                 offset += count
-            dist.all_reduce(flat, op=dist.ReduceOp.SUM)
-            flat.div_(float(self.world))
+            dist.all_reduce(flat, op=dist.ReduceOp.AVG)
             offset = 0
             for param in params:
                 count = param.numel()
