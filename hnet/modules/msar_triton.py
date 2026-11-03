@@ -1176,7 +1176,7 @@ def _depthwise_dw(
         BLOCK_T=512,
         KERNEL=kernel,
         K_PAD=16,
-        num_warps=4,
+        num_warps=2,
     )
     return grad_weight.to(dtype=output_dtype)
 
@@ -1355,7 +1355,7 @@ class _MSARGate(torch.autograd.Function):
     def backward(ctx, grad_result):
         start, output, residual, scale = ctx.saved_tensors
         elements = start.numel()
-        grad_result = grad_result.contiguous().float()
+        grad_result = grad_result.contiguous()
         grad_start, grad_output, grad_residual = (
             torch.empty_like(start), torch.empty_like(output), torch.empty_like(residual)
         )
