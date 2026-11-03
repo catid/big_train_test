@@ -309,8 +309,12 @@ class CausalMHA(nn.Module):
         flattened = context.shape[-1] == self.num_heads * self.head_dim
         if flattened:
             context = context.reshape(*context.shape[:-1], self.num_heads, self.head_dim)
-        low_rank = torch.einsum("...hd,hr->...rd", context, self.vha_postmix_a)
-        mixed = torch.einsum("...rd,hr->...hd", low_rank, self.vha_postmix_b)
+        # These contractions only reduce/mix the head axis.  Express them as
+        # batched matmuls so cuBLAS can use the regular GEMM path; einsum's
+        # generic contraction planner adds a dispatch and often materializes
+        # an avoidable transpose for every global-attention call.
+        low_rank = torch.matmul(self.vha_postmix_a.transpose(0, 1), context)
+        mixed = torch.matmul(self.vha_postmix_b, low_rank)
         mixed = context + mixed
         return mixed.reshape(*mixed.shape[:-2], -1) if flattened else mixed
 
