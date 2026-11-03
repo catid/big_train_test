@@ -283,9 +283,20 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
         # removes one full output-head GEMM from every FBT training step and
         # keeps the returned tensors and loss ordering unchanged.
         if feedback_hidden:
-            feedback_logits = [
-                self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden
-            ]
+            # FBT produces a fixed number of same-shaped decoded states.  A
+            # Python loop here launches one output-head GEMM per pass, which
+            # leaves the small per-pass matrices under-occupied and adds
+            # graph nodes.  Stack the states along a temporary leading
+            # dimension and project them with one larger GEMM.  The reshape
+            # keeps each pass contiguous and the split is a view, so logits
+            # retain the exact per-pass ordering expected by the loss.
+            feedback_states = torch.stack(feedback_hidden, dim=0).reshape(
+                -1, D
+            ).float()
+            feedback_projected = self.lm_head(feedback_states).view(
+                len(feedback_hidden), B, L, self.config.vocab_size
+            )
+            feedback_logits = list(feedback_projected.unbind(0))
             logits = feedback_logits[-1]
         else:
             logits = self.lm_head(hidden_states.float())
