@@ -2353,15 +2353,25 @@ def main():
     args.data = str(manifest.data_path)
     args._manifest_doc_count = len(manifest.documents)
     runtime = _runtime_provenance(args.data, manifest)
-    model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    if rank == 0:
-        print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
+    # Keep parameter construction on the same stream used by DDP and graph
+    # warmup.  Autograd's AccumulateGrad nodes retain the stream on which the
+    # parameters were created; constructing on the default stream otherwise
+    # adds a cross-stream dependency to every captured backward pass.
     graph_stream = (
         torch.cuda.Stream(device=device)
         if CANONICAL_CUDA_GRAPHS and world > 1
         else None
     )
+    model_context = (
+        torch.cuda.stream(graph_stream)
+        if graph_stream is not None
+        else contextlib.nullcontext()
+    )
+    with model_context:
+        model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if rank == 0:
+        print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
     if world > 1:
         ddp_context = (
             torch.cuda.stream(graph_stream)
