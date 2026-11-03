@@ -190,24 +190,13 @@ class HNetForByteCausalLM(nn.Module, GenerationMixin):
             hidden_states, bpred_output = result
             feedback_hidden = []
         hidden_states = hidden_states.view(B, L, D)
-        if feedback_hidden:
-            # FBT returns same-shaped decoded states for every pass, with the
-            # final state equal to ``hidden_states``.  Stack them and run one
-            # larger output-head GEMM instead of one GEMM for the final pass
-            # plus one per auxiliary pass.  Unbinding the result preserves
-            # the existing pass ordering and loss semantics.
-            feedback_states = torch.stack(feedback_hidden, dim=0).reshape(
-                -1, D
-            ).float()
-            feedback_projected = self.lm_head(feedback_states).view(
-                len(feedback_hidden), B, L, self.config.vocab_size
-            )
-            feedback_all = list(feedback_projected.unbind(0))
-            logits = feedback_all[-1]
-            feedback_logits = feedback_all[:-1]
-        else:
-            logits = self.lm_head(hidden_states.float())
-            feedback_logits = []
+        logits = self.lm_head(hidden_states.float())
+        # The final feedback pass is identical to ``hidden_states`` and its
+        # logits are already available as ``logits``.  Keep only earlier pass
+        # logits here so the LM head is evaluated once per distinct state.
+        feedback_logits = [
+            self.lm_head(h.view(B, L, D).float()) for h in feedback_hidden[:-1]
+        ]
         # The router's z-loss is part of the same FP32 routing regularizer as
         # load balancing.  Keep it attached to the returned objective; merely
         # storing it on LatentMoE leaves the computed term dead during training.
