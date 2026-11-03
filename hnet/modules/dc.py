@@ -50,13 +50,51 @@ class RoutingModule(nn.Module):
         self.d_model = d_model
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.q_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
-        self.k_proj_layer = nn.Linear(d_model, d_model, bias=False, **factory_kwargs)
+        # Query and key use the same input stream and have identical matrix
+        # shapes.  Keep them in one output-wide GEMM: projecting the complete
+        # stream once and slicing the two halves removes one launch from every
+        # encoder/router stage while doing the same arithmetic as two Linear
+        # modules.  The split layout is [q | k], matching the old parameter
+        # ordering so checkpoints can be migrated below.
+        self.qk_proj_layer = nn.Linear(d_model, 2 * d_model, bias=False, **factory_kwargs)
         with torch.no_grad():
-            self.q_proj_layer.weight.copy_(torch.eye(d_model))
-            self.k_proj_layer.weight.copy_(torch.eye(d_model))
-        self.q_proj_layer.weight._no_reinit = True
-        self.k_proj_layer.weight._no_reinit = True
+            self.qk_proj_layer.weight.copy_(torch.cat((torch.eye(d_model), torch.eye(d_model)), dim=0))
+        self.qk_proj_layer.weight._no_reinit = True
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        """Accept checkpoints written before the fused router projection.
+
+        The old router stored ``q_proj_layer.weight`` and
+        ``k_proj_layer.weight`` separately.  Concatenating those matrices into
+        the new [q | k] projection keeps existing training checkpoints usable
+        without retaining duplicate parameters in the live model.
+        """
+        fused_key = prefix + "qk_proj_layer.weight"
+        q_key = prefix + "q_proj_layer.weight"
+        k_key = prefix + "k_proj_layer.weight"
+        if fused_key not in state_dict and q_key in state_dict and k_key in state_dict:
+            state_dict[fused_key] = torch.cat((state_dict[q_key], state_dict[k_key]), dim=0)
+            del state_dict[q_key]
+            del state_dict[k_key]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return RoutingModuleState(
@@ -86,9 +124,13 @@ class RoutingModule(nn.Module):
         # Router probabilities feed hard selection and the EMA dechunker. Do
         # the normalization in FP32 so BF16 roundoff cannot create NaNs or
         # probabilities outside [0, 1] in long runs.
-        q = F.normalize(self.q_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
-        k = F.normalize(self.k_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
-        cos_sim = torch.einsum("b l d, b l d -> b l", q, k)
+        qk = self.qk_proj_layer(hidden_states)
+        q = F.normalize(qk[:, :-1, : self.d_model].float(), dim=-1)
+        k = F.normalize(qk[:, 1:, self.d_model :].float(), dim=-1)
+        # Elementwise reduction maps to a single fused pointwise/reduction
+        # path on CUDA; einsum builds a more general contraction for this
+        # diagonal dot product and is measurably slower at byte-model widths.
+        cos_sim = (q * k).sum(dim=-1)
         # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
 
@@ -147,9 +189,12 @@ class RoutingModule(nn.Module):
     def step(self, hidden_states, inference_params):
         # hidden_states is (B, 1, D)
         hidden_states = hidden_states.squeeze(1)
-        q = F.normalize(self.q_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
-        k = F.normalize(self.k_proj_layer(hidden_states).float(), dim=-1)
-        cos_sim = torch.einsum("b d, b d -> b", q, k)
+        qk = self.qk_proj_layer(
+            torch.cat((inference_params.last_hidden_state, hidden_states), dim=0)
+        )
+        q = F.normalize(qk[: qk.shape[0] // 2, : self.d_model].float(), dim=-1)
+        k = F.normalize(qk[qk.shape[0] // 2 :, self.d_model :].float(), dim=-1)
+        cos_sim = (q * k).sum(dim=-1)
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
         boundary_prob = torch.where(
@@ -204,31 +249,54 @@ class ChunkLayer(nn.Module):
                     )
             else:
                 next_max_seqlen = int(num_tokens.max())
-            token_idx = (
-                torch.arange(L, device=device)[None, :] + (~boundary_mask).long() * L
-            )
-            seq_sorted_indices = torch.argsort(token_idx, dim=1)
-
             # A static bound can exceed the current input length (for example,
             # a short validation batch captured with the 4096-token production
             # bound). Pad the gather indices so the inner network and its mask
             # have the same fixed shape. Invalid rows are masked below and do
             # not contribute to the dechunked output.
-            if next_max_seqlen > L:
-                pad = torch.zeros(
-                    (hidden_states.shape[0], next_max_seqlen - L),
-                    device=device,
-                    dtype=seq_sorted_indices.dtype,
+            if hidden_states.shape[0] <= 2:
+                # Boundary rows are already in source order. Their destination
+                # row is the exclusive prefix rank of the boolean mask;
+                # scattering avoids the per-row O(L log L) argsort. The
+                # sentinel column receives invalid rows and is discarded.
+                boundary_rank = boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                sentinel = next_max_seqlen
+                scatter_rank = torch.where(
+                    boundary_mask,
+                    boundary_rank,
+                    torch.full_like(boundary_rank, sentinel),
                 )
-                seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
-
-            next_hidden_states = torch.gather(
-                hidden_states,
-                dim=1,
-                index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
-                    -1, -1, hidden_states.shape[-1]
-                ),
-            )
+                packed = hidden_states.new_zeros(
+                    (hidden_states.shape[0], next_max_seqlen + 1, hidden_states.shape[-1])
+                )
+                packed.scatter_(
+                    1,
+                    scatter_rank[..., None].expand(-1, -1, hidden_states.shape[-1]),
+                    hidden_states,
+                )
+                next_hidden_states = packed[:, :next_max_seqlen]
+            else:
+                # For larger batches the full-width scatter writes can cost
+                # more than the radix sort; retain the gather path there.
+                token_idx = (
+                    torch.arange(L, device=device)[None]
+                    + (~boundary_mask).long() * L
+                )
+                seq_sorted_indices = torch.argsort(token_idx, dim=1)
+                if next_max_seqlen > L:
+                    pad = torch.zeros(
+                        (hidden_states.shape[0], next_max_seqlen - L),
+                        device=device,
+                        dtype=seq_sorted_indices.dtype,
+                    )
+                    seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
+                next_hidden_states = torch.gather(
+                    hidden_states,
+                    dim=1,
+                    index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
+                        -1, -1, hidden_states.shape[-1]
+                    ),
+                )
 
             next_mask = torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None]
             next_max_seqlen = None
@@ -248,6 +316,7 @@ class DeChunkLayer(nn.Module):
         block_size=256,
         headdim=32,
         static_max_seqlen: int | None = None,
+        device=None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -259,6 +328,14 @@ class DeChunkLayer(nn.Module):
         self.headdim = headdim
         assert d_model % self.headdim == 0
         self.nheads = d_model // self.headdim
+        # The decay is fixed for every call. Keep one device-resident copy so
+        # dechunking does not allocate and initialize it on every forward or
+        # CUDA-graph warmup.
+        self.register_buffer(
+            "_A",
+            -torch.ones(self.nheads, device=device, dtype=torch.float32),
+            persistent=True,
+        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return DeChunkState(
@@ -296,36 +373,54 @@ class DeChunkLayer(nn.Module):
         else:
             B, L = boundary_mask.shape
             seq_idx = None
+            num_tokens = boundary_mask.sum(dim=-1)
 
-            token_idx = (
-                torch.arange(L, device=hidden_states.device)[None, :]
-                + (~boundary_mask).long() * L
-            )
-            seq_sorted_indices = torch.argsort(token_idx, dim=1)
-
-            # ChunkLayer may pad the latent sequence to a configured static
-            # bound. Mirror that padding for the boundary probabilities so the
-            # Mamba scan receives tensors with matching sequence lengths.
+            # Match ChunkLayer's prefix-rank packing without another sort for
+            # the production batch sizes. Larger batches retain the gather
+            # path because it writes fewer full-width rows than scatter.
             latent_len = hidden_states.shape[1]
-            if latent_len > L:
-                pad = torch.zeros(
-                    (B, latent_len - L),
-                    device=hidden_states.device,
-                    dtype=seq_sorted_indices.dtype,
+            if B <= 2:
+                boundary_rank = boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                sentinel = latent_len
+                scatter_rank = torch.where(
+                    boundary_mask,
+                    boundary_rank,
+                    torch.full_like(boundary_rank, sentinel),
                 )
-                seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
-
-            p = torch.gather(
-                p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
-            )  # (B, M)
+                packed = p.new_zeros((B, latent_len + 1))
+                packed.scatter_(1, scatter_rank, p)
+                p = packed[:, :latent_len]
+                # Keep static padding at the same minimum decay used below;
+                # an exact zero would make dt zero and create inf/nan scan
+                # intermediates even though those rows are masked later.
+                pad_pos = torch.arange(latent_len, device=p.device)[None, :]
+                p = torch.where(
+                    pad_pos < num_tokens[:, None],
+                    p,
+                    torch.full_like(p, 1e-4),
+                )
+            else:
+                token_idx = (
+                    torch.arange(L, device=hidden_states.device)[None]
+                    + (~boundary_mask).long() * L
+                )
+                seq_sorted_indices = torch.argsort(token_idx, dim=1)
+                if latent_len > L:
+                    pad = torch.zeros(
+                        (B, latent_len - L),
+                        device=hidden_states.device,
+                        dtype=seq_sorted_indices.dtype,
+                    )
+                    seq_sorted_indices = torch.cat((seq_sorted_indices, pad), dim=1)
+                p = torch.gather(
+                    p, dim=1, index=seq_sorted_indices[:, :latent_len]
+                )  # (B, M)
 
         original_dtype = hidden_states.dtype
         # Reuse Mamba2 kernel for EMA Deaggregator.
         dt = torch.log(1 / (1 - p)).to(self.dtype)
         x = (hidden_states / dt[..., None]).to(self.dtype)
-        A = -torch.ones(
-            (self.nheads,), device=hidden_states.device, dtype=torch.float32
-        )
+        A = self._A
         b = p.to(self.dtype)
         c = torch.ones_like(b)
 
