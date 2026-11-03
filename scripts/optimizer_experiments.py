@@ -1023,15 +1023,37 @@ class AnchorMuon(torch.optim.Optimizer):
         matrix_count = 0
         for bucket_entries in buckets.values():
             updates = self._transform_matrix_bucket(bucket_entries, group)
-            for (p, anchor, _source, _grad), update in zip(bucket_entries, updates.unbind(0), strict=True):
-                # Use a per-parameter weight so `_no_soda` remains effective
-                # even when a bucket contains mixed semantic parameter kinds.
-                p.lerp_(end=anchor, weight=self._soda_weight(t, p))
-                matrix_decay = 0.0 if getattr(p, "_no_weight_decay", False) else self.matrix_weight_decay
-                if matrix_decay:
-                    p.mul_(1.0 - lr * matrix_decay)
-                p.add_(update.reshape_as(p).to(p.dtype), alpha=-lr)
-                matrix_count += 1
+            # Most matrix parameters share a shape, so use multi-tensor
+            # kernels for the three elementwise optimizer operations instead
+            # of launching one lerp/mul/add per projection.  Split by dtype:
+            # the model is BF16 while a few residual projections intentionally
+            # remain FP32.  ``_no_soda``/``_no_weight_decay`` are kept exact by
+            # filtering those semantic exclusions before each foreach call.
+            split = defaultdict(list)
+            for entry, update in zip(bucket_entries, updates.unbind(0), strict=True):
+                p, anchor, _source, _grad = entry
+                split[p.dtype].append((p, anchor, update.reshape_as(p)))
+            for pairs in split.values():
+                ps = [p for p, _a, _u in pairs]
+                anchors = [a for _p, a, _u in pairs]
+                weights = {self._soda_weight(t, p) for p in ps}
+                if len(weights) == 1 and next(iter(weights)):
+                    torch._foreach_lerp_(ps, anchors, next(iter(weights)))
+                elif weights:
+                    for p, anchor, _u in pairs:
+                        weight = self._soda_weight(t, p)
+                        if weight:
+                            p.lerp_(end=anchor, weight=weight)
+
+                if self.matrix_weight_decay:
+                    decay_pairs = [
+                        p for p in ps if not getattr(p, "_no_weight_decay", False)
+                    ]
+                    if decay_pairs:
+                        torch._foreach_mul_(decay_pairs, 1.0 - lr * self.matrix_weight_decay)
+
+                torch._foreach_add_([p for p, _a, _u in pairs], [u.to(dtype=ps[0].dtype) for _p, _a, u in pairs], alpha=-lr)
+                matrix_count += len(pairs)
 
         return {
             "matrix_count": float(matrix_count),
@@ -1101,13 +1123,134 @@ class AnchorMuon(torch.optim.Optimizer):
         return 1
 
     def _step_fallback_group(self, group: dict[str, Any], *, lr: float, t: int) -> dict[str, float]:
-        fallback_count = 0
+        """Apply the scalar/vector fallback in batched foreach launches.
+
+        The production model has roughly one hundred RMS/state/router vectors
+        in this group.  Updating each one through ``_step_fallback_param``
+        launches a separate CUDA kernel for every multiply/add/reduction.  The
+        math is unchanged, but the state updates and elementwise transforms can
+        be issued as a handful of multi-tensor kernels.  Keep the old path for
+        unusual resumed groups whose per-parameter step counters differ (bias
+        correction must remain exact in that case).
+        """
+        entries = []
         for p in group["params"]:
-            fallback_count += self._step_fallback_param(p, group, lr=lr, t=t)
+            grad = p.grad
+            if grad is None:
+                continue
+            state = self.state[p]
+            exp_avg_sq = state.get("exp_avg_sq")
+            exp_avg = state.get("exp_avg")
+            mode = str(group.get("fallback_mode", "atan2")).lower()
+            if mode not in FALLBACK_MODES:
+                raise ValueError(f"fallback_mode must be one of {sorted(FALLBACK_MODES)}")
+            if (
+                not isinstance(exp_avg_sq, torch.Tensor)
+                or exp_avg_sq.shape != p.shape
+                or exp_avg_sq.device != p.device
+                or exp_avg_sq.dtype != torch.float32
+            ):
+                exp_avg_sq = state["exp_avg_sq"] = torch.zeros_like(p, dtype=torch.float32)
+                state["step"] = 0
+            if mode in {"atan2", "adamc"} and (
+                not isinstance(exp_avg, torch.Tensor)
+                or exp_avg.shape != p.shape
+                or exp_avg.device != p.device
+                or exp_avg.dtype != torch.float32
+            ):
+                exp_avg = state["exp_avg"] = torch.zeros_like(p, dtype=torch.float32)
+            state["step"] = int(state.get("step", 0)) + 1
+            entries.append((p, grad.detach().to(torch.float32), exp_avg_sq, exp_avg))
+
+        fallback_count = len(entries)
+        if not entries:
+            return {"matrix_count": 0.0, "fallback_count": 0.0, "soda_weight": float(self._soda_weight(t))}
+
+        # A resumed optimizer can contain mixed counters when some parameters
+        # had no gradient in an earlier step.  Preserve the scalar reference
+        # implementation for that rare case; normal DDP training takes the
+        # fast common path below.
+        steps = {int(self.state[p]["step"]) for p, _g, _sq, _avg in entries}
+        if len(steps) != 1:
+            for p, _g, _sq, _avg in entries:
+                # The batched preparation incremented the counter once; hand
+                # control back to the scalar path with the original value so
+                # it performs exactly one increment.
+                self.state[p]["step"] -= 1
+                self._step_fallback_param(p, group, lr=lr, t=t)
+            return {"matrix_count": 0.0, "fallback_count": float(fallback_count), "soda_weight": float(self._soda_weight(t))}
+
+        params = [p for p, _g, _sq, _avg in entries]
+        grads = [g for _p, g, _sq, _avg in entries]
+        exp_avg_sq = [sq for _p, _g, sq, _avg in entries]
+        exp_avg = [avg for _p, _g, _sq, avg in entries]
+        beta1, beta2 = (float(v) for v in group.get("betas", (0.9, 0.999)))
+        eps = float(group.get("eps", 1e-8))
+        mode = str(group.get("fallback_mode", "atan2")).lower()
+
+        # SODA/decay are scalar operations on the parameter dtype.  Grouping
+        # by the semantic marker keeps no-SODA frequency parameters exact.
+        soda_weight = float(self._soda_weight(t))
+        soda_params, soda_anchors = [], []
+        for p in params:
+            weight = self._soda_weight(t, p)
+            if weight:
+                soda_params.append(p)
+                soda_anchors.append(self._soda_anchor(p))
+        if soda_params:
+            # Foreach kernels require a common destination dtype.  Production
+            # groups are predominantly BF16 but contain a small FP32 set of
+            # residual projections, so split those without changing math.
+            soda_by_dtype = defaultdict(list)
+            for p, anchor in zip(soda_params, soda_anchors):
+                soda_by_dtype[p.dtype].append((p, anchor))
+            for pairs in soda_by_dtype.values():
+                ps = [p for p, _a in pairs]
+                anchors = [a for _p, a in pairs]
+                if all(self._soda_weight(t, p) == self._soda_weight(t, ps[0]) for p in ps):
+                    torch._foreach_lerp_(ps, anchors, self._soda_weight(t, ps[0]))
+                else:
+                    for p, anchor in pairs:
+                        p.lerp_(end=anchor, weight=self._soda_weight(t, p))
+        for p in params:
+            decay = 0.0 if getattr(p, "_no_weight_decay", False) else float(group.get("fallback_weight_decay", 0.0))
+            if decay:
+                p.mul_(1.0 - lr * decay)
+
+        torch._foreach_mul_(exp_avg_sq, beta2)
+        torch._foreach_addcmul_(exp_avg_sq, grads, grads, value=1.0 - beta2)
+        step = next(iter(steps))
+        bias2 = max(1.0 - beta2 ** step, 1e-16)
+        denoms = torch._foreach_div(exp_avg_sq, bias2)
+        denoms = torch._foreach_sqrt(denoms)
+        torch._foreach_add_(denoms, eps)
+        if mode == "rms":
+            updates = torch._foreach_div(grads, denoms)
+        else:
+            exp_avg = [avg for _p, _g, _sq, avg in entries]
+            torch._foreach_mul_(exp_avg, beta1)
+            torch._foreach_add_(exp_avg, grads, alpha=1.0 - beta1)
+            bias1 = max(1.0 - beta1 ** step, 1e-16)
+            numerators = torch._foreach_div(exp_avg, bias1)
+            if mode == "atan2":
+                # PyTorch has no _foreach_atan2.  This is one launch per
+                # vector, but all state updates above are fused; the previous
+                # implementation launched several kernels per vector.
+                updates = [torch.atan2(num, den) for num, den in zip(numerators, denoms)]
+            else:
+                updates = torch._foreach_div(numerators, denoms)
+        # The optimizer stores BF16 model parameters while the fallback state
+        # remains FP32.  Cast once per parameter, then issue grouped adds for
+        # each destination dtype (foreach rejects mixed destination dtypes).
+        by_dtype = defaultdict(list)
+        for p, update in zip(params, updates):
+            by_dtype[p.dtype].append((p, update.to(dtype=p.dtype)))
+        for pairs in by_dtype.values():
+            torch._foreach_add_([p for p, _u in pairs], [u for _p, u in pairs], alpha=-lr)
         return {
             "matrix_count": 0.0,
             "fallback_count": float(fallback_count),
-            "soda_weight": float(self._soda_weight(t)),
+            "soda_weight": soda_weight,
         }
 
     @torch.no_grad()
