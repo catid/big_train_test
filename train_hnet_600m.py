@@ -1413,7 +1413,9 @@ def _clip_direct_ddp_storage(
 
     Reducer views put the tiny FP32 LeRoPE tensor in a shared storage bucket.
     Save and restore those views around the bucket-wide scale so the ordinary
-    norm never changes their independently clipped gradient.
+    norm never changes their independently clipped gradient. When frequency
+    parameters are supplied, return ``(ordinary_norm, frequency_norm)`` so
+    the caller can perform the same finite check without a second traversal.
     """
     if not buckets:
         raise ValueError("direct DDP clipping requires at least one storage bucket")
