@@ -112,6 +112,7 @@ class RoutingModule(nn.Module):
             prefix + "qk_proj_layer.linear.weight",
             prefix + "qk_proj_layer.weight",
         )
+        live_state = self.state_dict()
         if not any(key in state_dict for key in fused_candidates):
             for suffix in ("linear.weight", "weight"):
                 q_key = prefix + "q_proj_layer." + suffix
@@ -128,6 +129,15 @@ class RoutingModule(nn.Module):
                     # Both the TE and legacy torch Linear checkpoints expose
                     # the output rows first for this square projection.
                     state_dict[fused_key] = torch.cat((q_weight, k_weight), dim=0)
+                    # Transformer Engine also stores an empty extra-state
+                    # tensor for each Linear. Older checkpoints have one per
+                    # q/k module, while the fused module has one combined
+                    # entry. It carries no learned values, so use the live
+                    # module's empty entry when the legacy checkpoint did not
+                    # provide a compatible fused spelling.
+                    fused_extra = fused_key.rsplit(".", 1)[0] + "._extra_state"
+                    if fused_extra in live_state and fused_extra not in state_dict:
+                        state_dict[fused_extra] = live_state[fused_extra]
                     # Drop all legacy q/k entries, including any TE module
                     # metadata, so strict loading sees only the fused module.
                     for key in list(state_dict):
