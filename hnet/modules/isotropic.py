@@ -53,6 +53,20 @@ _msar_score = torch.compile(
     options={"triton.cudagraphs": False},
 )
 
+# The production padded graph makes most of its score calls with one query
+# column (the current MSAR source).  Dynamic Inductor guards keep this helper
+# reusable for packed/eval shapes, but they also force a more conservative
+# reduction schedule for the fixed B18/S4096 graph.  Keep a static singleton
+# specialization alongside the dynamic path.  It specializes only the query
+# width of one, while the source count remains a normal shape guard and is
+# compiled once for each fixed source bank during graph warmup.
+_msar_score_single = torch.compile(
+    _msar_score_impl,
+    fullgraph=True,
+    dynamic=False,
+    options={"triton.cudagraphs": False},
+)
+
 
 def _msar_score_dispatch(source, query):
     """Use the compiled score only on the training graph path.
@@ -65,6 +79,8 @@ def _msar_score_dispatch(source, query):
     training graph's compiler cache.
     """
     if torch.is_grad_enabled():
+        if query.shape[-2] == 1:
+            return _msar_score_single(source, query)
         return _msar_score(source, query)
     return _msar_score_impl(source, query)
 
