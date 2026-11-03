@@ -473,9 +473,37 @@ class ByteStream:
         value ^= value >> 27
         return int(value % (max_start + 1))
 
-    def get(self, step, device, *, omit_masks=False, consumer_stream=None):
+    def get(
+        self,
+        step,
+        device,
+        *,
+        omit_masks=False,
+        consumer_stream=None,
+        device_buffers=None,
+    ):
+        """Load one batch, optionally DMAing directly into graph inputs.
+
+        ``CUDAGraphStep`` owns persistent input tensors.  Passing those four
+        tensors here lets the copy stream write them directly from the pinned
+        staging rows, avoiding a temporary GPU batch followed by a second
+        device-to-device copy immediately before replay.  The returned
+        objects are the supplied buffers, so the graph replay can recognize
+        that its inputs are already populated.  The event is still recorded
+        after every DMA and waited on by ``consumer_stream`` before replay.
+        """
         if omit_masks and not self.full_windows:
             raise ValueError("omit_masks requires a full-window document stream")
+        if device_buffers is not None:
+            if device.type != "cuda" or len(device_buffers) != 4:
+                raise ValueError(
+                    "device_buffers requires four CUDA tensors: x, y, active_mask, loss_mask"
+                )
+            expected = ((self.batch, self.seq), (self.batch, self.seq),
+                        (self.batch, self.seq), (self.batch, self.seq))
+            for index, (buffer, shape) in enumerate(zip(device_buffers, expected)):
+                if not isinstance(buffer, torch.Tensor) or buffer.device != device or tuple(buffer.shape) != shape:
+                    raise ValueError(f"device_buffers[{index}] has incompatible shape/device")
         epoch, offset = divmod(int(step), self.n_batches)
         permutation = self._epoch_permutation(epoch)
         first = (offset * self.world + self.rank) * self.batch
@@ -503,6 +531,8 @@ class ByteStream:
                 active_cpu[row, :available] = True
                 loss_cpu[row, :available] = True
         if not self._pinned or device.type != "cuda":
+            if device_buffers is not None:
+                raise ValueError("device_buffers require pinned CUDA staging")
             outputs = [
                 x_cpu.to(device=device, non_blocking=True),
                 y_cpu.to(device=device, non_blocking=True),
@@ -517,18 +547,38 @@ class ByteStream:
             else:
                 outputs.extend((None, None))
             return tuple(outputs)
+        if device_buffers is not None and consumer_stream is not None:
+            # The graph may still be reading its persistent input tensors from
+            # the previous replay.  Make the DMA producer wait for that graph
+            # stream before overwriting the same addresses; the consumer-side
+            # event below then establishes the opposite dependency for the
+            # new replay.
+            self._copy_stream.wait_stream(consumer_stream)
         with torch.cuda.stream(self._copy_stream):
-            outputs = [
-                x_cpu.to(device=device, non_blocking=True),
-                y_cpu.to(device=device, non_blocking=True),
-            ]
-            if not omit_masks:
-                outputs.extend(
-                    [
-                        active_cpu.to(device=device, non_blocking=True),
-                        loss_cpu.to(device=device, non_blocking=True),
-                    ]
-                )
+            if device_buffers is None:
+                outputs = [
+                    x_cpu.to(device=device, non_blocking=True),
+                    y_cpu.to(device=device, non_blocking=True),
+                ]
+                if not omit_masks:
+                    outputs.extend(
+                        [
+                            active_cpu.to(device=device, non_blocking=True),
+                            loss_cpu.to(device=device, non_blocking=True),
+                        ]
+                    )
+            else:
+                # Direct DMA into the persistent graph inputs.  This removes
+                # the temporary GPU allocations and the replay-time D2D copy.
+                x_dst, y_dst, active_dst, loss_dst = device_buffers
+                x_dst.copy_(x_cpu, non_blocking=True)
+                y_dst.copy_(y_cpu, non_blocking=True)
+                if not omit_masks:
+                    active_dst.copy_(active_cpu, non_blocking=True)
+                    loss_dst.copy_(loss_cpu, non_blocking=True)
+                outputs = [x_dst, y_dst]
+                if not omit_masks:
+                    outputs.extend([active_dst, loss_dst])
             self._stage_events[slot].record(self._copy_stream)
         # Asynchronous dependency insertion; the host remains free while the
         # copy stream performs DMA.  CUDA-graph replay can wait on the DMA
@@ -2098,23 +2148,34 @@ class CUDAGraphStep:
         self._ddp_storage_buckets = groups if compatible else None
 
     def replay(self, x, y, active_mask=None, loss_mask=None):
+        # The loader can DMA directly into these persistent graph inputs.  In
+        # that mode all four objects are already at their captured addresses;
+        # avoid launching four redundant device-to-device copies.  The
+        # identity checks intentionally fall back to the old copies for
+        # callers that supply ordinary tensors (calibration/tests).
+        direct_inputs = x is self.static_x and y is self.static_y
+        direct_masks = (
+            active_mask is None or active_mask is self.static_mask
+        ) and (loss_mask is None or loss_mask is self.static_loss_mask)
         if self.capture_stream is None:
-            self.static_x.copy_(x)
-            self.static_y.copy_(y)
-            if active_mask is not None:
+            if not direct_inputs:
+                self.static_x.copy_(x)
+                self.static_y.copy_(y)
+            if active_mask is not None and not direct_masks:
                 self.static_mask.copy_(active_mask)
-            if loss_mask is not None:
+            if loss_mask is not None and not direct_masks:
                 self.static_loss_mask.copy_(loss_mask)
             self.graph.replay()
         else:
             current_stream = torch.cuda.current_stream(self.device)
             self.capture_stream.wait_stream(current_stream)
             with torch.cuda.stream(self.capture_stream):
-                self.static_x.copy_(x)
-                self.static_y.copy_(y)
-                if active_mask is not None:
+                if not direct_inputs:
+                    self.static_x.copy_(x)
+                    self.static_y.copy_(y)
+                if active_mask is not None and not direct_masks:
                     self.static_mask.copy_(active_mask)
-                if loss_mask is not None:
+                if loss_mask is not None and not direct_masks:
                     self.static_loss_mask.copy_(loss_mask)
                 self.graph.replay()
             current_stream.wait_stream(self.capture_stream)
@@ -2511,7 +2572,18 @@ def main():
             device,
             omit_masks=omit_graph_masks,
             consumer_stream=(
-                graph_step.capture_stream if graph_step is not None else None
+                (
+                    graph_step.capture_stream
+                    if graph_step.capture_stream is not None
+                    else torch.cuda.current_stream(device)
+                )
+                if graph_step is not None
+                else None
+            ),
+            device_buffers=(
+                (graph_step.static_x, graph_step.static_y,
+                 graph_step.static_mask, graph_step.static_loss_mask)
+                if graph_step is not None else None
             ),
         )
         lr_scale = _wsqd_scale(step, args)
