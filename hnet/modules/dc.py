@@ -117,7 +117,12 @@ class RoutingModule(nn.Module):
                 q_key = prefix + "q_proj_layer." + suffix
                 k_key = prefix + "k_proj_layer." + suffix
                 if q_key in state_dict and k_key in state_dict:
-                    fused_key = fused_candidates[0]
+                    # Select the wrapped TE parameter spelling in the live
+                    # module; a plain Linear test/checkpoint uses ``weight``.
+                    fused_key = next(
+                        (key for key in fused_candidates if key in self.state_dict()),
+                        fused_candidates[0],
+                    )
                     q_weight = state_dict[q_key]
                     k_weight = state_dict[k_key]
                     # Both the TE and legacy torch Linear checkpoints expose
