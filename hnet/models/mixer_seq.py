@@ -33,9 +33,12 @@ class FixedByteFeatures(nn.Module):
         self.d_model = d_model
 
     def forward(self, input_ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        # F.embedding uses the fused CUDA lookup kernel and preserves the
-        # fixed, non-trainable byte codebook.
-        output = F.embedding(input_ids.long(), self.codes)
+        # F.embedding accepts int32 indices on CUDA.  The trainer's byte
+        # stream is uint8, so promoting it to int64 needlessly doubles index
+        # bandwidth and creates a larger temporary before the lookup.  Keep
+        # the fixed, non-trainable byte codebook and use the narrow CUDA
+        # integer index type directly.
+        output = F.embedding(input_ids.to(dtype=torch.int32), self.codes)
         return output if output.dtype == dtype else output.to(dtype=dtype)
 
 @dataclass
