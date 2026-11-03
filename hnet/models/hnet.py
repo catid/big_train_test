@@ -403,6 +403,7 @@ class HNet(nn.Module):
             next_max_seqlen,
             next_mask,
             effective_boundary_mask,
+            chunk_sort_indices,
         ) = self.chunk_layer(
             hidden_states,
             bpred_output.boundary_mask,
@@ -595,6 +596,7 @@ class HNet(nn.Module):
                 next_cu_seqlens,
                 mask=mask,
                 inference_params=cached_dechunk_state,
+                sort_indices=chunk_sort_indices,
             )
             decoded = self.residual_func(
                 decoded.to(dtype=residual.dtype), residual, effective_selected_probs

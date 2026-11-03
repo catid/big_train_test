@@ -224,6 +224,7 @@ class ChunkLayer(nn.Module):
             boundary_prob = boundary_mask.to(dtype=hidden_states.dtype).unsqueeze(-1)
             boundary_prob = torch.cat((1 - boundary_prob, boundary_prob), dim=-1)
 
+        sort_indices = None
         if cu_seqlens is not None:
             # Packed callers use exact per-document cumulative lengths.  Apply
             # the same latent capacity as the padded graph path before
@@ -310,6 +311,7 @@ class ChunkLayer(nn.Module):
                 + (~effective_boundary_mask).long() * L
             )
             seq_sorted_indices = torch.argsort(token_idx, dim=1)
+            sort_indices = seq_sorted_indices
 
             next_hidden_states = torch.gather(
                 hidden_states,
@@ -328,6 +330,7 @@ class ChunkLayer(nn.Module):
             next_max_seqlen,
             next_mask,
             effective_boundary_mask,
+            sort_indices,
         )
 
     def step(self, hidden_states, boundary_mask):
@@ -377,6 +380,7 @@ class DeChunkLayer(nn.Module):
         cu_seqlens=None,
         inference_params=None,
         mask=None,
+        sort_indices=None,
     ):
         if inference_params is not None:
             assert (
@@ -399,11 +403,16 @@ class DeChunkLayer(nn.Module):
             B, L = boundary_mask.shape
             seq_idx = None
 
-            token_idx = (
-                torch.arange(L, device=hidden_states.device)[None, :]
-                + (~boundary_mask).long() * L
-            )
-            seq_sorted_indices = torch.argsort(token_idx, dim=1)
+            if sort_indices is None:
+                token_idx = (
+                    torch.arange(L, device=hidden_states.device)[None, :]
+                    + (~boundary_mask).long() * L
+                )
+                seq_sorted_indices = torch.argsort(token_idx, dim=1)
+            else:
+                seq_sorted_indices = sort_indices
+                if seq_sorted_indices.shape[0] != B or seq_sorted_indices.shape[1] < hidden_states.shape[1]:
+                    raise ValueError("ChunkLayer sort indices do not match dechunk shape")
 
             p = torch.gather(
                 p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
