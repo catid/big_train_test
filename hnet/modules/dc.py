@@ -134,6 +134,12 @@ class RoutingModule(nn.Module):
                         if key.startswith(prefix + "q_proj_layer.") or key.startswith(prefix + "k_proj_layer."):
                             del state_dict[key]
                     break
+        # A merged checkpoint can contain both the migrated key and legacy
+        # aliases.  The live module has no q/k submodules, so remove aliases
+        # even when the fused key was already present before this hook.
+        for key in list(state_dict):
+            if key.startswith(prefix + "q_proj_layer.") or key.startswith(prefix + "k_proj_layer."):
+                del state_dict[key]
         super()._load_from_state_dict(
             state_dict,
             prefix,
