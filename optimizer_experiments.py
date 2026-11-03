@@ -1273,6 +1273,7 @@ class AnchorMuon(torch.optim.Optimizer):
         lr: float | torch.Tensor,
         t: int | torch.Tensor,
         graph_step: torch.Tensor | None = None,
+        soda_weight: float | torch.Tensor | None = None,
     ) -> dict[str, float | torch.Tensor]:
         beta_m = float(group["momentum"])
         # Gather matrix records first.  The momentum/source preprocessing below
@@ -1318,6 +1319,7 @@ class AnchorMuon(torch.optim.Optimizer):
                 lr=fallback_lr,
                 t=t,
                 graph_step=graph_step,
+                soda_weight=soda_weight,
             )
             return {
                 "matrix_count": 0.0,
@@ -1335,7 +1337,8 @@ class AnchorMuon(torch.optim.Optimizer):
             grad = record[2]
             buckets[(grad.device, _matrix_view(grad).shape, grad.shape)].append(record)
 
-        soda_weight = self._soda_weight(t)
+        if soda_weight is None:
+            soda_weight = self._soda_weight(t)
         matrix_count = 0
         for bucket_entries in buckets.values():
             # GramNS forms several square intermediates whose size is the
@@ -1422,6 +1425,7 @@ class AnchorMuon(torch.optim.Optimizer):
             lr=fallback_lr,
             t=t,
             graph_step=graph_step,
+            soda_weight=soda_weight,
         )
 
         return {
@@ -1490,9 +1494,11 @@ class AnchorMuon(torch.optim.Optimizer):
         lr: float | torch.Tensor,
         t: int | torch.Tensor,
         graph_step: torch.Tensor | None = None,
+        soda_weight: float | torch.Tensor | None = None,
     ) -> dict[str, float | torch.Tensor]:
         return self._step_fallback_params(
-            group["params"], group, lr=lr, t=t, graph_step=graph_step
+            group["params"], group, lr=lr, t=t, graph_step=graph_step,
+            soda_weight=soda_weight,
         )
 
     def _step_fallback_params(
@@ -1503,6 +1509,7 @@ class AnchorMuon(torch.optim.Optimizer):
         lr: float | torch.Tensor,
         t: int | torch.Tensor,
         graph_step: torch.Tensor | None = None,
+        soda_weight: float | torch.Tensor | None = None,
     ) -> dict[str, float | torch.Tensor]:
         # AdamATan2 is used by a large collection of skinny controls (biases,
         # norms, router scales).  The old scalar loop launched every pointwise
@@ -1525,14 +1532,15 @@ class AnchorMuon(torch.optim.Optimizer):
         fallback_count = 0
         for bucket in buckets.values():
             fallback_count += self._step_fallback_bucket(
-                bucket, group, lr=lr, t=t, graph_step=graph_step
+                bucket, group, lr=lr, t=t, graph_step=graph_step,
+                soda_weight=soda_weight,
             )
         return {
             "matrix_count": 0.0,
             "fallback_count": float(fallback_count),
             "soda_weight": (
-                self._soda_weight(t)
-                if isinstance(graph_step, torch.Tensor)
+                soda_weight
+                if soda_weight is not None
                 else float(self._soda_weight(t))
             ),
         }
@@ -1545,6 +1553,7 @@ class AnchorMuon(torch.optim.Optimizer):
         lr: float | torch.Tensor,
         t: int | torch.Tensor,
         graph_step: torch.Tensor | None = None,
+        soda_weight: float | torch.Tensor | None = None,
     ) -> int:
         if not params:
             return 0
@@ -1624,7 +1633,8 @@ class AnchorMuon(torch.optim.Optimizer):
         # the fallback tensors instead of launching one atan2 per tensor.
         updates = torch._foreach_atan(torch._foreach_div(numerators, denoms))
 
-        soda_weight = self._soda_weight(t)
+        if soda_weight is None:
+            soda_weight = self._soda_weight(t)
         if isinstance(soda_weight, torch.Tensor):
             scaled_anchors = torch._foreach_mul(anchors, soda_weight)
             torch._foreach_mul_(masters, 1.0 - soda_weight)
@@ -1659,9 +1669,15 @@ class AnchorMuon(torch.optim.Optimizer):
             # a fixed ratio of the matrix rate.
             graph_t = self._graph_step.add_(1)
             graph_lr = self._graph_lr
+            # Every optimizer group in a graph replay shares the same SODA
+            # schedule. Compute its device scalar once and pass it through
+            # the group/bucket dispatch instead of rebuilding the same power
+            # expression for every fallback bucket and matrix group.
+            graph_soda_weight = self._soda_weight(graph_t)
         else:
             graph_t = None
             graph_lr = None
+            graph_soda_weight = None
 
         stats = {
             "matrix_count": 0.0,
@@ -1684,11 +1700,13 @@ class AnchorMuon(torch.optim.Optimizer):
 
             if group.get("use_matrix_update", False):
                 group_stats = self._step_matrix_group(
-                    group, lr=lr, t=t, graph_step=graph_t
+                    group, lr=lr, t=t, graph_step=graph_t,
+                    soda_weight=graph_soda_weight,
                 )
             else:
                 group_stats = self._step_fallback_group(
-                    group, lr=lr, t=t, graph_step=graph_t
+                    group, lr=lr, t=t, graph_step=graph_t,
+                    soda_weight=graph_soda_weight,
                 )
             if not graph_mode:
                 stats["matrix_count"] += group_stats["matrix_count"]
