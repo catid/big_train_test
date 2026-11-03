@@ -972,7 +972,13 @@ class Isotropic(nn.Module):
                             )
                         else:
                             msar_state = fused_msar_gate(
-                                layer_input.float(),
+                                # The Triton gate widens each operand to FP32
+                                # inside its fused load.  ``layer_input`` is
+                                # already in the block parameter dtype, so
+                                # widening it here would allocate a full
+                                # activation-sized FP32 temporary and then
+                                # immediately narrow it at the output.
+                                layer_input,
                                 msar_out,
                                 msar_residual,
                                 layer_scale.float(),
