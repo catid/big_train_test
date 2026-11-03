@@ -321,6 +321,12 @@ class LatentMoE(nn.Module):
             persistent=False,
         )
         self._shared_stream = None
+        # The eager latency-hiding path records one dependency event after the
+        # shared expert finishes.  Reusing the event is safe because the
+        # dedicated stream is ordered behind the current stream before each
+        # invocation; allocating a fresh CUDA event for every routed call was
+        # visible in traces as thousands of host-side event-creation calls.
+        self._shared_event = None
         # ``expert_starts`` depends only on the static grouped-GEMM capacity.
         # Cache it per device/capacity so every MoE invocation does not launch
         # a tiny arange/multiply pair (there are 20 routed blocks and two FBT
@@ -432,7 +438,9 @@ class LatentMoE(nn.Module):
             shared_stream.wait_stream(current_stream)
             with torch.cuda.stream(shared_stream):
                 shared_result = self._shared(flat)
-                shared_event = torch.cuda.Event()
+                if self._shared_event is None:
+                    self._shared_event = torch.cuda.Event()
+                shared_event = self._shared_event
                 shared_event.record(shared_stream)
             # ``flat`` and the side-stream result participate in autograd on
             # the current stream after the event below.
