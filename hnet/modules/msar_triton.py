@@ -303,6 +303,304 @@ def weighted_source_reduce(weights: torch.Tensor, bank: torch.Tensor) -> torch.T
     return _WeightedSourceReduce.apply(weights, bank)
 
 
+# The cached padded MSAR path keeps each source in its own allocation.  The
+# old reduction first concatenated those singleton source banks into a new
+# [N, B, L, D] tensor solely to feed ``weighted_source_reduce``.  Keep the
+# source pointers as ordinary kernel arguments instead.  Eight pointers cover
+# the canonical five-boundary stack and leave room for deeper configurations;
+# the constexpr source count keeps unused arguments out of the loop.
+@triton.jit
+def _weighted_reduce_ptr_forward(
+    weights_ptr,
+    output_ptr,
+    batch,
+    length,
+    width,
+    weights_stride_n,
+    weights_stride_b,
+    weights_stride_l,
+    bank0_ptr,
+    bank1_ptr,
+    bank2_ptr,
+    bank3_ptr,
+    bank4_ptr,
+    bank5_ptr,
+    bank6_ptr,
+    bank7_ptr,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    blocks_d = tl.cdiv(width, BLOCK_D)
+    token_pid = pid // blocks_d
+    d_pid = pid % blocks_d
+    batch_index = token_pid // length
+    token = token_pid % length
+    d = d_pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d < width
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+    for source in range(N):
+        if source == 0:
+            bank_ptr = bank0_ptr
+        elif source == 1:
+            bank_ptr = bank1_ptr
+        elif source == 2:
+            bank_ptr = bank2_ptr
+        elif source == 3:
+            bank_ptr = bank3_ptr
+        elif source == 4:
+            bank_ptr = bank4_ptr
+        elif source == 5:
+            bank_ptr = bank5_ptr
+        elif source == 6:
+            bank_ptr = bank6_ptr
+        else:
+            bank_ptr = bank7_ptr
+        weight = tl.load(
+            weights_ptr + source * weights_stride_n
+            + batch_index * weights_stride_b + token * weights_stride_l
+        ).to(tl.float32)
+        value = tl.load(
+            bank_ptr + batch_index * bank_stride_b + token * bank_stride_l
+            + d * bank_stride_d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        acc += weight * value
+    tl.store(
+        output_ptr + (batch_index * length + token) * width + d,
+        acc,
+        mask=d_mask,
+    )
+
+
+@triton.jit
+def _weighted_reduce_ptr_grad_bank(
+    grad_output_ptr,
+    weights_ptr,
+    grad_bank0_ptr,
+    grad_bank1_ptr,
+    grad_bank2_ptr,
+    grad_bank3_ptr,
+    grad_bank4_ptr,
+    grad_bank5_ptr,
+    grad_bank6_ptr,
+    grad_bank7_ptr,
+    batch,
+    length,
+    width,
+    weights_stride_n,
+    weights_stride_b,
+    weights_stride_l,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    blocks_d = tl.cdiv(width, BLOCK_D)
+    token_pid = pid // blocks_d
+    d_pid = pid % blocks_d
+    batch_index = token_pid // length
+    token = token_pid % length
+    d = d_pid * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = d < width
+    grad_output = tl.load(
+        grad_output_ptr + (batch_index * length + token) * width + d,
+        mask=d_mask,
+        other=0,
+    ).to(tl.float32)
+    for source in range(N):
+        if source == 0:
+            grad_bank_ptr = grad_bank0_ptr
+        elif source == 1:
+            grad_bank_ptr = grad_bank1_ptr
+        elif source == 2:
+            grad_bank_ptr = grad_bank2_ptr
+        elif source == 3:
+            grad_bank_ptr = grad_bank3_ptr
+        elif source == 4:
+            grad_bank_ptr = grad_bank4_ptr
+        elif source == 5:
+            grad_bank_ptr = grad_bank5_ptr
+        elif source == 6:
+            grad_bank_ptr = grad_bank6_ptr
+        else:
+            grad_bank_ptr = grad_bank7_ptr
+        weight = tl.load(
+            weights_ptr + source * weights_stride_n
+            + batch_index * weights_stride_b + token * weights_stride_l
+        ).to(tl.float32)
+        tl.store(
+            grad_bank_ptr + batch_index * bank_stride_b + token * bank_stride_l
+            + d * bank_stride_d,
+            grad_output * weight,
+            mask=d_mask,
+        )
+
+
+@triton.jit
+def _weighted_reduce_ptr_grad_weights(
+    grad_output_ptr,
+    bank0_ptr,
+    bank1_ptr,
+    bank2_ptr,
+    bank3_ptr,
+    bank4_ptr,
+    bank5_ptr,
+    bank6_ptr,
+    bank7_ptr,
+    grad_weights_ptr,
+    batch,
+    length,
+    width,
+    bank_stride_b,
+    bank_stride_l,
+    bank_stride_d,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    tokens = batch * length
+    source = pid // tokens
+    token_pid = pid % tokens
+    batch_index = token_pid // length
+    token = token_pid % length
+    if source == 0:
+        bank_ptr = bank0_ptr
+    elif source == 1:
+        bank_ptr = bank1_ptr
+    elif source == 2:
+        bank_ptr = bank2_ptr
+    elif source == 3:
+        bank_ptr = bank3_ptr
+    elif source == 4:
+        bank_ptr = bank4_ptr
+    elif source == 5:
+        bank_ptr = bank5_ptr
+    elif source == 6:
+        bank_ptr = bank6_ptr
+    else:
+        bank_ptr = bank7_ptr
+    total = tl.zeros((), dtype=tl.float32)
+    for d_start in range(0, width, BLOCK_D):
+        d = d_start + tl.arange(0, BLOCK_D)
+        d_mask = d < width
+        grad_output = tl.load(
+            grad_output_ptr + (batch_index * length + token) * width + d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        value = tl.load(
+            bank_ptr + batch_index * bank_stride_b + token * bank_stride_l
+            + d * bank_stride_d,
+            mask=d_mask,
+            other=0,
+        ).to(tl.float32)
+        total += tl.sum(grad_output * value, axis=0)
+    tl.store(grad_weights_ptr + source * batch * length + token_pid, total)
+
+
+class _WeightedSourceReducePointers(torch.autograd.Function):
+    """Reduce singleton source banks without materializing their concatenation."""
+
+    @staticmethod
+    def forward(ctx, weights: torch.Tensor, *banks: torch.Tensor) -> torch.Tensor:
+        if not banks or len(banks) > 8:
+            raise ValueError("pointer MSAR reduction supports one through eight banks")
+        if weights.ndim != 3 or any(bank.ndim != 3 for bank in banks):
+            raise ValueError("expected weights=(N,B,L) and banks=(B,L,D)")
+        n, batch, length = weights.shape
+        if n != len(banks) or any(bank.shape[:2] != (batch, length) for bank in banks):
+            raise ValueError("pointer MSAR source and weight shapes do not match")
+        if weights.dtype != torch.float32 or any(
+            bank.dtype not in (torch.bfloat16, torch.float32) for bank in banks
+        ):
+            raise TypeError("pointer MSAR reduction expects FP32 weights and BF16/FP32 banks")
+        width = banks[0].shape[-1]
+        if any(bank.shape[-1] != width or not bank.is_contiguous() for bank in banks):
+            raise ValueError("pointer MSAR banks must be contiguous and equally wide")
+        output = torch.empty((batch, length, width), device=weights.device, dtype=torch.float32)
+        padded = list(banks) + [banks[0]] * (8 - n)
+        block_d = 1024
+        _weighted_reduce_ptr_forward[(batch * length * triton.cdiv(width, block_d),)](
+            weights,
+            output,
+            batch,
+            length,
+            width,
+            weights.stride(0),
+            weights.stride(1),
+            weights.stride(2),
+            *padded,
+            banks[0].stride(0),
+            banks[0].stride(1),
+            banks[0].stride(2),
+            BLOCK_D=block_d,
+            N=n,
+            num_warps=4,
+        )
+        ctx.save_for_backward(weights, *banks)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        saved = ctx.saved_tensors
+        weights, *banks = saved
+        n, batch, length = weights.shape
+        width = banks[0].shape[-1]
+        grad_output = grad_output.contiguous().float()
+        grad_weights = torch.empty_like(weights)
+        grad_banks = [torch.empty_like(bank) for bank in banks]
+        padded_banks = banks + [banks[0]] * (8 - n)
+        padded_grads = grad_banks + [grad_banks[0]] * (8 - n)
+        block_d = 1024
+        _weighted_reduce_ptr_grad_bank[(batch * length * triton.cdiv(width, block_d),)](
+            grad_output,
+            weights,
+            *padded_grads,
+            batch,
+            length,
+            width,
+            weights.stride(0),
+            weights.stride(1),
+            weights.stride(2),
+            banks[0].stride(0),
+            banks[0].stride(1),
+            banks[0].stride(2),
+            BLOCK_D=block_d,
+            N=n,
+            num_warps=4,
+        )
+        _weighted_reduce_ptr_grad_weights[(n * batch * length,)](
+            grad_output,
+            *padded_banks,
+            grad_weights,
+            batch,
+            length,
+            width,
+            banks[0].stride(0),
+            banks[0].stride(1),
+            banks[0].stride(2),
+            BLOCK_D=256,
+            N=n,
+            num_warps=2,
+        )
+        return (grad_weights, *grad_banks)
+
+
+def weighted_source_reduce_pointers(weights: torch.Tensor, banks) -> torch.Tensor:
+    """Pointer reduction for a list of contiguous [B,L,D] source banks."""
+
+    if not weights.is_cuda:
+        return sum(weight.unsqueeze(-1) * bank for weight, bank in zip(weights, banks))
+    return _WeightedSourceReducePointers.apply(weights, *tuple(banks))
+
+
 @triton.jit
 def _msar_mix_forward(
     mix_ptr, s0_ptr, s1_ptr, s2_ptr, s3_ptr, out_ptr,

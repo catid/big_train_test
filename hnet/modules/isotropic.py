@@ -19,6 +19,7 @@ from hnet.modules.msar_triton import (
     fused_msar_gate,
     fused_msar_mix,
     weighted_source_reduce,
+    weighted_source_reduce_pointers,
 )
 from hnet.modules.utils import get_seq_idx, get_stage_cfg
 
@@ -401,23 +402,10 @@ class Isotropic(nn.Module):
                         stream_bank = self._msar_expand_batched([source])
                         stream_cache[source_key] = stream_bank
                     source_banks.append(stream_bank)
-                # Restore the original grouped layout [stream, source, ...]
-                # for the score/retrieval equations. The source bank is
-                # unchanged until a configured MSAR boundary, so cache these
-                # aggregate tensors too. This avoids repeating the large
-                # concatenation on every layer while retaining BF16 storage;
-                # do not cache FP32 normalized copies because they can exhaust
-                # the graph pool at the canonical batch.
-                aggregate_key = ("aggregate", tuple(source_keys))
-                stream_banks = stream_cache.get(aggregate_key)
-                if stream_banks is None:
-                    stream_banks = [
-                        torch.cat(
-                            [bank[stream_idx] for bank in source_banks], dim=0
-                        )
-                        for stream_idx in range(len(self.msar_kernels))
-                    ]
-                    stream_cache[aggregate_key] = stream_banks
+                # Keep each source bank in its own allocation. Retrieval uses
+                # the pointer reduction below, avoiding a full
+                # [sources, batch, length, width] concatenation for every
+                # stream and cached source set.
             source_scores = []
             if stream_cache is None:
                 for stream_index, stream_bank in enumerate(stream_banks):
@@ -498,13 +486,22 @@ class Isotropic(nn.Module):
             # SelectBackward nodes that allocate zero-filled source banks;
             # these views preserve source ordering without a stack/copy.
             weights_by_stream = weights.unbind(1)
-            retrieved_streams = [
-                weighted_source_reduce(
-                    weights_by_stream[stream_index],
-                    stream_bank,
-                )
-                for stream_index, stream_bank in enumerate(stream_banks)
-            ]
+            if stream_cache is None:
+                retrieved_streams = [
+                    weighted_source_reduce(
+                        weights_by_stream[stream_index],
+                        stream_bank,
+                    )
+                    for stream_index, stream_bank in enumerate(stream_banks)
+                ]
+            else:
+                retrieved_streams = [
+                    weighted_source_reduce_pointers(
+                        weights_by_stream[stream_index],
+                        [source_bank[stream_index].squeeze(0) for source_bank in source_banks],
+                    )
+                    for stream_index in range(len(self.msar_kernels))
+                ]
         else:
             if stream_cache is None:
                 stream_banks = []
