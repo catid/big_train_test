@@ -84,81 +84,13 @@ class RoutingModule(nn.Module):
         self.d_model = d_model
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        # The router compares adjacent states with two projections.  Both
-        # projections consume the same stream, so materialize both outputs in
-        # one TE GEMM and slice the q/k halves below.  This removes one launch
-        # per outer router stage without changing the projection arithmetic or
-        # the causal offset (q uses x[t], k uses x[t-1]).
-        self.qk_proj_layer = make_linear(d_model, 2 * d_model, bias=False, **factory_kwargs)
+        self.q_proj_layer = make_linear(d_model, d_model, bias=False, **factory_kwargs)
+        self.k_proj_layer = make_linear(d_model, d_model, bias=False, **factory_kwargs)
         with torch.no_grad():
-            self.qk_proj_layer.weight.copy_(torch.cat((torch.eye(d_model), torch.eye(d_model)), dim=0))
-        self.qk_proj_layer.weight._no_reinit = True
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        """Migrate checkpoints containing separate q/k TE linears."""
-        # ``make_linear`` wraps TE's Linear in AlignedTELinear, whose actual
-        # parameter key is ``linear.weight``.  Accept the bare ``weight``
-        # spelling too for older non-TE router checkpoints.
-        fused_candidates = (
-            prefix + "qk_proj_layer.linear.weight",
-            prefix + "qk_proj_layer.weight",
-        )
-        live_state = self.state_dict()
-        if not any(key in state_dict for key in fused_candidates):
-            for suffix in ("linear.weight", "weight"):
-                q_key = prefix + "q_proj_layer." + suffix
-                k_key = prefix + "k_proj_layer." + suffix
-                if q_key in state_dict and k_key in state_dict:
-                    # Select the wrapped TE parameter spelling in the live
-                    # module; a plain Linear test/checkpoint uses ``weight``.
-                    fused_key = next(
-                        (key for key in fused_candidates if key in self.state_dict()),
-                        fused_candidates[0],
-                    )
-                    q_weight = state_dict[q_key]
-                    k_weight = state_dict[k_key]
-                    # Both the TE and legacy torch Linear checkpoints expose
-                    # the output rows first for this square projection.
-                    state_dict[fused_key] = torch.cat((q_weight, k_weight), dim=0)
-                    # Transformer Engine also stores an empty extra-state
-                    # tensor for each Linear. Older checkpoints have one per
-                    # q/k module, while the fused module has one combined
-                    # entry. It carries no learned values, so use the live
-                    # module's empty entry when the legacy checkpoint did not
-                    # provide a compatible fused spelling.
-                    fused_extra = fused_key.rsplit(".", 1)[0] + "._extra_state"
-                    if fused_extra in live_state and fused_extra not in state_dict:
-                        state_dict[fused_extra] = live_state[fused_extra]
-                    # Drop all legacy q/k entries, including any TE module
-                    # metadata, so strict loading sees only the fused module.
-                    for key in list(state_dict):
-                        if key.startswith(prefix + "q_proj_layer.") or key.startswith(prefix + "k_proj_layer."):
-                            del state_dict[key]
-                    break
-        # A merged checkpoint can contain both the migrated key and legacy
-        # aliases.  The live module has no q/k submodules, so remove aliases
-        # even when the fused key was already present before this hook.
-        for key in list(state_dict):
-            if key.startswith(prefix + "q_proj_layer.") or key.startswith(prefix + "k_proj_layer."):
-                del state_dict[key]
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
+            self.q_proj_layer.weight.copy_(torch.eye(d_model))
+            self.k_proj_layer.weight.copy_(torch.eye(d_model))
+        self.q_proj_layer.weight._no_reinit = True
+        self.k_proj_layer.weight._no_reinit = True
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return RoutingModuleState(
@@ -192,9 +124,8 @@ class RoutingModule(nn.Module):
         # Cartesia's causal router scores the current state against the
         # immediately preceding state: p_t = 1/2(1-cos(W_q x_t,
         # W_k x_{t-1})). Keep the first position forced to a boundary.
-        qk = self.qk_proj_layer(hidden_states)
-        q = F.normalize(qk[:, 1:, : self.d_model].float(), dim=-1)
-        k = F.normalize(qk[:, :-1, self.d_model :].float(), dim=-1)
+        q = F.normalize(self.q_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
         cos_sim = (q * k).sum(dim=-1)
         # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
@@ -249,12 +180,8 @@ class RoutingModule(nn.Module):
     def step(self, hidden_states, inference_params):
         # hidden_states is (B, 1, D)
         hidden_states = hidden_states.squeeze(1)
-        qk = self.qk_proj_layer(
-            torch.cat((hidden_states, inference_params.last_hidden_state), dim=0)
-        )
-        batch = hidden_states.shape[0]
-        q = F.normalize(qk[:batch, : self.d_model].float(), dim=-1)
-        k = F.normalize(qk[batch:, self.d_model :].float(), dim=-1)
+        q = F.normalize(self.q_proj_layer(hidden_states).float(), dim=-1)
+        k = F.normalize(self.k_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
         cos_sim = (q * k).sum(dim=-1)
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
