@@ -1422,6 +1422,23 @@ def _clip_direct_ddp_storage(
         for parameter in frequency_parameters
         if parameter.grad is not None
     )
+    # The caller historically clipped LeRoPE first, then this helper clipped
+    # the ordinary bucket while saving/restoring the already-scaled frequency
+    # views. Do that first step here so frequency norms and scales are computed
+    # once while retaining the same arithmetic and storage ordering.
+    frequency_norm = None
+    if frequency_parameters:
+        frequency_grads = tuple(parameter.grad for parameter in frequency_parameters)
+        frequency_norm = torch.linalg.vector_norm(
+            torch.stack([gradient.float().norm() for gradient in frequency_grads])
+        )
+        frequency_coef = torch.clamp(
+            torch.as_tensor(max_norm, device=frequency_norm.device, dtype=frequency_norm.dtype)
+            / (frequency_norm + 1e-6),
+            max=1.0,
+        )
+        for gradient in frequency_grads:
+            gradient.mul_(frequency_coef.to(dtype=gradient.dtype))
     saved_frequency = tuple(
         (parameter, parameter.grad.detach().clone())
         for parameter in frequency_parameters
@@ -1447,6 +1464,8 @@ def _clip_direct_ddp_storage(
         bucket.mul_(clip_coef.to(dtype=bucket.dtype))
     for parameter, gradient in saved_frequency:
         parameter.grad.copy_(gradient)
+    if frequency_parameters:
+        return total_norm, frequency_norm
     return total_norm
 
 
@@ -2628,9 +2647,6 @@ def main():
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.
             loss.backward()
-        lerope_norm = _clip_lerope_gradients(
-            model.module if world > 1 else model, 1.0
-        )
         if graph_step is not None and graph_step._ddp_direct_storage:
             trainable_model = model.module if world > 1 else model
             frequency_parameters = getattr(trainable_model, "_hnet_lerope_parameters", None)
@@ -2641,12 +2657,15 @@ def main():
                     if getattr(parameter, "_lerope_frequency", False)
                 )
                 setattr(trainable_model, "_hnet_lerope_parameters", frequency_parameters)
-            grad_norm = _clip_direct_ddp_storage(
+            grad_norm, lerope_norm = _clip_direct_ddp_storage(
                 graph_step._ddp_storage_buckets,
                 1.0,
                 frequency_parameters=frequency_parameters,
             )
         else:
+            lerope_norm = _clip_lerope_gradients(
+                model.module if world > 1 else model, 1.0
+            )
             grad_norm = _clip_non_lerope_gradients(model, 1.0)
         finite_local = torch.isfinite(loss) & torch.isfinite(grad_norm)
         if lerope_norm is not None:
