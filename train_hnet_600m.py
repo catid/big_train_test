@@ -1426,8 +1426,8 @@ def _clip_direct_ddp_storage(
     )
     # The caller historically clipped LeRoPE first, then this helper clipped
     # the ordinary bucket while saving/restoring the already-scaled frequency
-    # views. Do that first step here so frequency norms and scales are computed
-    # once while retaining the same arithmetic and storage ordering.
+    # views. Do that first step here while retaining the same arithmetic and
+    # storage ordering.
     frequency_norm = None
     if frequency_parameters:
         frequency_grads = tuple(parameter.grad for parameter in frequency_parameters)
@@ -1466,9 +1466,9 @@ def _clip_direct_ddp_storage(
         bucket.mul_(clip_coef.to(dtype=bucket.dtype))
     for parameter, gradient in saved_frequency:
         parameter.grad.copy_(gradient)
-    if frequency_parameters:
-        return total_norm, frequency_norm
-    return total_norm
+    # Keep one return shape even if a future graph has no frequency gradient;
+    # callers can still apply the finite check without a conditional unpack.
+    return total_norm, frequency_norm
 
 
 def _pack_gradients_by_dtype(parameters, device, buckets=None):
