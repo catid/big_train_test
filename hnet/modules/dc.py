@@ -118,9 +118,16 @@ class RoutingModule(nn.Module):
                 k_key = prefix + "k_proj_layer." + suffix
                 if q_key in state_dict and k_key in state_dict:
                     fused_key = fused_candidates[0]
-                    state_dict[fused_key] = torch.cat((state_dict[q_key], state_dict[k_key]), dim=0)
-                    del state_dict[q_key]
-                    del state_dict[k_key]
+                    q_weight = state_dict[q_key]
+                    k_weight = state_dict[k_key]
+                    # Both the TE and legacy torch Linear checkpoints expose
+                    # the output rows first for this square projection.
+                    state_dict[fused_key] = torch.cat((q_weight, k_weight), dim=0)
+                    # Drop all legacy q/k entries, including any TE module
+                    # metadata, so strict loading sees only the fused module.
+                    for key in list(state_dict):
+                        if key.startswith(prefix + "q_proj_layer.") or key.startswith(prefix + "k_proj_layer."):
+                            del state_dict[key]
                     break
         super()._load_from_state_dict(
             state_dict,
