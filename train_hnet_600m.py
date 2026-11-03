@@ -2584,29 +2584,40 @@ def main():
     step_end_event = (
         torch.cuda.Event(enable_timing=True) if device.type == "cuda" else None
     )
+    # The CPU document-window sampler and pinned H2D copy are independent of
+    # the gradients produced by the current update. Keep one batch queued
+    # ahead so filling the next host slot overlaps graph replay, collectives,
+    # and the optimizer update. Direct graph buffers are safe here: ByteStream
+    # makes its copy stream wait for the capture stream before overwriting
+    # them, while the graph stream waits on the new DMA event before replay.
+    prefetched_batch = None
     for step in range(start_step, args.steps):
-        omit_graph_masks = (
-            graph_step is not None and bool(getattr(stream, "full_windows", False))
-        )
-        x, y, active_mask, loss_mask = stream.get(
-            step,
-            device,
-            omit_masks=omit_graph_masks,
-            consumer_stream=(
-                (
-                    graph_step.capture_stream
-                    if graph_step.capture_stream is not None
-                    else torch.cuda.current_stream(device)
-                )
-                if graph_step is not None
-                else None
-            ),
-            device_buffers=(
-                (graph_step.static_x, graph_step.static_y,
-                 graph_step.static_mask, graph_step.static_loss_mask)
-                if graph_step is not None else None
-            ),
-        )
+        if prefetched_batch is None:
+            omit_graph_masks = (
+                graph_step is not None and bool(getattr(stream, "full_windows", False))
+            )
+            x, y, active_mask, loss_mask = stream.get(
+                step,
+                device,
+                omit_masks=omit_graph_masks,
+                consumer_stream=(
+                    (
+                        graph_step.capture_stream
+                        if graph_step.capture_stream is not None
+                        else torch.cuda.current_stream(device)
+                    )
+                    if graph_step is not None
+                    else None
+                ),
+                device_buffers=(
+                    (graph_step.static_x, graph_step.static_y,
+                     graph_step.static_mask, graph_step.static_loss_mask)
+                    if graph_step is not None else None
+                ),
+            )
+        else:
+            x, y, active_mask, loss_mask = prefetched_batch
+            prefetched_batch = None
         lr_scale = _wsqd_scale(step, args)
         log["learning_rate_scale"].append(float(lr_scale))
         step_number = int(step) + 1
@@ -2649,6 +2660,27 @@ def main():
             # autocast scope; its backward kernels consume that state and should
             # be launched after leaving the context.
             loss.backward()
+        # Queue the next document batch while clipping, DDP reduction, and the
+        # optimizer update run. The graph has consumed the current static
+        # buffers; ByteStream's copy stream waits for the capture stream before
+        # overwriting them, and the next replay waits for the DMA event.
+        if graph_step is not None and step + 1 < args.steps:
+            prefetched_batch = stream.get(
+                step + 1,
+                device,
+                omit_masks=bool(getattr(stream, "full_windows", False)),
+                consumer_stream=(
+                    graph_step.capture_stream
+                    if graph_step.capture_stream is not None
+                    else torch.cuda.current_stream(device)
+                ),
+                device_buffers=(
+                    graph_step.static_x,
+                    graph_step.static_y,
+                    graph_step.static_mask,
+                    graph_step.static_loss_mask,
+                ),
+            )
         if graph_step is not None and graph_step._ddp_direct_storage:
             trainable_model = model.module if world > 1 else model
             frequency_parameters = getattr(trainable_model, "_hnet_lerope_parameters", None)
