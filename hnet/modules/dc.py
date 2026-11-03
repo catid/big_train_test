@@ -126,7 +126,7 @@ class RoutingModule(nn.Module):
         # W_k x_{t-1})). Keep the first position forced to a boundary.
         q = F.normalize(self.q_proj_layer(hidden_states[:, 1:]).float(), dim=-1)
         k = F.normalize(self.k_proj_layer(hidden_states[:, :-1]).float(), dim=-1)
-        cos_sim = torch.einsum("b l d, b l d -> b l", q, k)
+        cos_sim = (q * k).sum(dim=-1)
         # this clamp should no-op as long as no precision issues are encountered
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
 
@@ -182,7 +182,7 @@ class RoutingModule(nn.Module):
         hidden_states = hidden_states.squeeze(1)
         q = F.normalize(self.q_proj_layer(hidden_states).float(), dim=-1)
         k = F.normalize(self.k_proj_layer(inference_params.last_hidden_state).float(), dim=-1)
-        cos_sim = torch.einsum("b d, b d -> b", q, k)
+        cos_sim = (q * k).sum(dim=-1)
         boundary_prob = torch.clamp(((1 - cos_sim) / 2), min=0.0, max=1.0)
         inference_params.last_hidden_state.copy_(hidden_states)
         boundary_prob = torch.where(
@@ -306,20 +306,36 @@ class ChunkLayer(nn.Module):
                 )
 
             device = hidden_states.device
-            token_idx = (
-                torch.arange(L, device=device)[None, :]
-                + (~effective_boundary_mask).long() * L
-            )
-            seq_sorted_indices = torch.argsort(token_idx, dim=1)
-            sort_indices = seq_sorted_indices
-
-            next_hidden_states = torch.gather(
-                hidden_states,
-                dim=1,
-                index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
-                    -1, -1, hidden_states.shape[-1]
-                ),
-            )
+            # Boundary rows already occur in source order. For the common
+            # single-stream decode/prefill shape, exclusive prefix ranks avoid
+            # an O(L log L) argsort. Larger training batches use gather+sort:
+            # its one index tensor is cheaper than expanding scatter indices
+            # across every feature column.
+            if hidden_states.shape[0] == 1:
+                boundary_rank = effective_boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                safe_rank = boundary_rank.clamp_min(0).clamp_max(next_max_seqlen - 1)
+                next_hidden_states = hidden_states.new_zeros(
+                    (hidden_states.shape[0], next_max_seqlen, hidden_states.shape[-1])
+                )
+                next_hidden_states.scatter_add_(
+                    1,
+                    safe_rank[..., None].expand(-1, -1, hidden_states.shape[-1]),
+                    hidden_states * effective_boundary_mask[..., None].to(hidden_states.dtype),
+                )
+            else:
+                token_idx = (
+                    torch.arange(L, device=device)[None, :]
+                    + (~effective_boundary_mask).long() * L
+                )
+                seq_sorted_indices = torch.argsort(token_idx, dim=1)
+                sort_indices = seq_sorted_indices
+                next_hidden_states = torch.gather(
+                    hidden_states,
+                    dim=1,
+                    index=seq_sorted_indices[:, :next_max_seqlen, None].expand(
+                        -1, -1, hidden_states.shape[-1]
+                    ),
+                )
 
             next_mask = torch.arange(next_max_seqlen, device=device)[None, :] < num_tokens[:, None]
             next_max_seqlen = None
@@ -411,20 +427,33 @@ class DeChunkLayer(nn.Module):
             B, L = boundary_mask.shape
             seq_idx = None
 
-            if sort_indices is None:
+            if B == 1:
+                # Match ChunkLayer's prefix-rank packing for single-stream
+                # prefill. Keep positive decay on static padding so the scan
+                # never sees an infinite dt.
+                latent_len = hidden_states.shape[1]
+                boundary_rank = boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                valid_boundary = boundary_mask & (boundary_rank < latent_len)
+                num_tokens = valid_boundary.sum(dim=-1)
+                safe_rank = boundary_rank.clamp_min(0).clamp_max(latent_len - 1)
+                packed_p = p.new_zeros((B, latent_len))
+                packed_p.scatter_add_(1, safe_rank, p * valid_boundary.to(dtype=p.dtype))
+                pad_pos = torch.arange(latent_len, device=p.device)[None, :]
+                packed_p = torch.where(
+                    pad_pos < num_tokens[:, None],
+                    packed_p,
+                    torch.full_like(packed_p, 1e-4),
+                )
+                p = packed_p
+            else:
                 token_idx = (
                     torch.arange(L, device=hidden_states.device)[None, :]
                     + (~boundary_mask).long() * L
                 )
                 seq_sorted_indices = torch.argsort(token_idx, dim=1)
-            else:
-                seq_sorted_indices = sort_indices
-                if seq_sorted_indices.shape[0] != B or seq_sorted_indices.shape[1] < hidden_states.shape[1]:
-                    raise ValueError("ChunkLayer sort indices do not match dechunk shape")
-
-            p = torch.gather(
-                p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
-            )  # (B, M)
+                p = torch.gather(
+                    p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
+                )
 
         original_dtype = hidden_states.dtype
         # Reuse the fused Mamba-3-compatible state-space path for EMA

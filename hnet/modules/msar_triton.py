@@ -14,6 +14,282 @@ import triton.language as tl
 
 
 @triton.jit
+def _packed_depthwise_fwd(
+    x_ptr,
+    seq_ptr,
+    weight_ptr,
+    out_ptr,
+    batch,
+    length,
+    width,
+    x_stride_b,
+    x_stride_l,
+    x_stride_d,
+    seq_stride_b,
+    seq_stride_l,
+    weight_stride_d,
+    weight_stride_k,
+    out_stride_b,
+    out_stride_l,
+    out_stride_d,
+    BLOCK_T: tl.constexpr,
+    KERNEL: tl.constexpr,
+):
+    """Causal depthwise MSAR expansion with packed-document resets."""
+    pid = tl.program_id(0)
+    b = pid // width
+    d = pid % width
+    for tile_start in range(0, length, BLOCK_T):
+        token = tile_start + tl.arange(0, BLOCK_T)
+        token_mask = token < length
+        acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        current_seq = tl.load(
+            seq_ptr + b * seq_stride_b + token * seq_stride_l,
+            mask=token_mask,
+            other=0,
+        )
+        for coefficient in range(KERNEL):
+            lag = KERNEL - 1 - coefficient
+            source_token = token - lag
+            source_mask = token_mask & (source_token >= 0)
+            source_seq = tl.load(
+                seq_ptr + b * seq_stride_b + source_token * seq_stride_l,
+                mask=source_mask,
+                other=-1,
+            )
+            same_document = source_mask & (source_seq == current_seq)
+            value = tl.load(
+                x_ptr
+                + b * x_stride_b
+                + source_token * x_stride_l
+                + d * x_stride_d,
+                mask=same_document,
+                other=0,
+            ).to(tl.float32)
+            weight = tl.load(
+                weight_ptr + d * weight_stride_d + coefficient * weight_stride_k
+            ).to(tl.float32)
+            acc += value * weight
+        tl.store(
+            out_ptr + b * out_stride_b + token * out_stride_l + d * out_stride_d,
+            acc,
+            mask=token_mask,
+        )
+
+
+@triton.jit
+def _packed_depthwise_dx(
+    grad_out_ptr,
+    seq_ptr,
+    weight_ptr,
+    grad_x_ptr,
+    batch,
+    length,
+    width,
+    grad_out_stride_b,
+    grad_out_stride_l,
+    grad_out_stride_d,
+    seq_stride_b,
+    seq_stride_l,
+    weight_stride_d,
+    weight_stride_k,
+    grad_x_stride_b,
+    grad_x_stride_l,
+    grad_x_stride_d,
+    BLOCK_T: tl.constexpr,
+    KERNEL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    b = pid // width
+    d = pid % width
+    for tile_start in range(0, length, BLOCK_T):
+        token = tile_start + tl.arange(0, BLOCK_T)
+        token_mask = token < length
+        current_seq = tl.load(
+            seq_ptr + b * seq_stride_b + token * seq_stride_l,
+            mask=token_mask,
+            other=0,
+        )
+        acc = tl.zeros((BLOCK_T,), dtype=tl.float32)
+        for lag in range(KERNEL):
+            future_token = token + lag
+            future_mask = token_mask & (future_token < length)
+            future_seq = tl.load(
+                seq_ptr + b * seq_stride_b + future_token * seq_stride_l,
+                mask=future_mask,
+                other=-1,
+            )
+            same_document = future_mask & (future_seq == current_seq)
+            grad = tl.load(
+                grad_out_ptr
+                + b * grad_out_stride_b
+                + future_token * grad_out_stride_l
+                + d * grad_out_stride_d,
+                mask=same_document,
+                other=0,
+            ).to(tl.float32)
+            coefficient = KERNEL - 1 - lag
+            weight = tl.load(
+                weight_ptr + d * weight_stride_d + coefficient * weight_stride_k
+            ).to(tl.float32)
+            acc += grad * weight
+        tl.store(
+            grad_x_ptr + b * grad_x_stride_b + token * grad_x_stride_l + d * grad_x_stride_d,
+            acc,
+            mask=token_mask,
+        )
+
+
+@triton.jit
+def _packed_depthwise_dw(
+    x_ptr,
+    grad_out_ptr,
+    seq_ptr,
+    grad_weight_ptr,
+    batch,
+    length,
+    width,
+    x_stride_b,
+    x_stride_l,
+    x_stride_d,
+    grad_out_stride_b,
+    grad_out_stride_l,
+    grad_out_stride_d,
+    seq_stride_b,
+    seq_stride_l,
+    grad_weight_stride_d,
+    grad_weight_stride_k,
+    BLOCK_T: tl.constexpr,
+    KERNEL: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    d = pid // KERNEL
+    coefficient = pid % KERNEL
+    lag = KERNEL - 1 - coefficient
+    total = tl.zeros((), dtype=tl.float32)
+    for batch_index in range(batch):
+        for tile_start in range(0, length, BLOCK_T):
+            token = tile_start + tl.arange(0, BLOCK_T)
+            token_mask = token < length
+            source_token = token - lag
+            source_mask = token_mask & (source_token >= 0)
+            output_seq = tl.load(
+                seq_ptr + batch_index * seq_stride_b + token * seq_stride_l,
+                mask=token_mask,
+                other=0,
+            )
+            source_seq = tl.load(
+                seq_ptr + batch_index * seq_stride_b + source_token * seq_stride_l,
+                mask=source_mask,
+                other=-1,
+            )
+            same_document = source_mask & (source_seq == output_seq)
+            value = tl.load(
+                x_ptr
+                + batch_index * x_stride_b
+                + source_token * x_stride_l
+                + d * x_stride_d,
+                mask=same_document,
+                other=0,
+            ).to(tl.float32)
+            grad = tl.load(
+                grad_out_ptr
+                + batch_index * grad_out_stride_b
+                + token * grad_out_stride_l
+                + d * grad_out_stride_d,
+                mask=same_document,
+                other=0,
+            ).to(tl.float32)
+            total += tl.sum(value * grad, axis=0)
+    tl.store(
+        grad_weight_ptr + d * grad_weight_stride_d + coefficient * grad_weight_stride_k,
+        total,
+    )
+
+
+class _PackedCausalDepthwise(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight, seq_idx):
+        if x.ndim != 3 or weight.ndim != 2 or seq_idx.ndim != 2:
+            raise ValueError("packed MSAR expects x=(B,L,D), weight=(D,K), seq_idx=(B,L)")
+        if not (x.is_cuda and weight.is_cuda and seq_idx.is_cuda):
+            raise RuntimeError("packed MSAR expansion requires CUDA tensors")
+        if x.shape[:2] != seq_idx.shape or x.shape[-1] != weight.shape[0]:
+            raise ValueError("packed MSAR tensors have incompatible shapes")
+        x = x.contiguous()
+        weight = weight.contiguous()
+        seq_idx = seq_idx.contiguous()
+        batch, length, width = x.shape
+        kernel = weight.shape[-1]
+        output = torch.empty_like(x)
+        _packed_depthwise_fwd[(batch * width,)](
+            x,
+            seq_idx,
+            weight,
+            output,
+            batch,
+            length,
+            width,
+            *x.stride(),
+            *seq_idx.stride(),
+            *weight.stride(),
+            *output.stride(),
+            BLOCK_T=256,
+            KERNEL=kernel,
+            num_warps=4,
+        )
+        ctx.save_for_backward(x, weight, seq_idx)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        x, weight, seq_idx = ctx.saved_tensors
+        grad_output = grad_output.contiguous()
+        batch, length, width = x.shape
+        kernel = weight.shape[-1]
+        grad_x = torch.empty_like(x)
+        grad_weight = torch.empty_like(weight)
+        _packed_depthwise_dx[(batch * width,)](
+            grad_output,
+            seq_idx,
+            weight,
+            grad_x,
+            batch,
+            length,
+            width,
+            *grad_output.stride(),
+            *seq_idx.stride(),
+            *weight.stride(),
+            *grad_x.stride(),
+            BLOCK_T=256,
+            KERNEL=kernel,
+            num_warps=4,
+        )
+        _packed_depthwise_dw[(width * kernel,)](
+            x,
+            grad_output,
+            seq_idx,
+            grad_weight,
+            batch,
+            length,
+            width,
+            *x.stride(),
+            *grad_output.stride(),
+            *seq_idx.stride(),
+            *grad_weight.stride(),
+            BLOCK_T=256,
+            KERNEL=kernel,
+            num_warps=4,
+        )
+        return grad_x, grad_weight, None
+
+
+def packed_causal_depthwise_conv1d(x, weight, seq_idx):
+    """Depthwise causal convolution that resets at packed document boundaries."""
+    return _PackedCausalDepthwise.apply(x, weight, seq_idx)
+
+
+@triton.jit
 def _causal_depthwise_dy(
     x_ptr,
     weight_ptr,

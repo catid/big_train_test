@@ -141,6 +141,7 @@ class Mamba3Wrapper(Mamba3):
             inference_params is None
             and cu_seqlens is None
             and graph_capture_enabled()
+            and torch.is_grad_enabled()
         ):
             projected = self.in_proj(u)
             y = self._compiled_core_forward(projected)
