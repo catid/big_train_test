@@ -954,6 +954,12 @@ class AnchorMuon(torch.optim.Optimizer):
         return summary
 
     def _soda_anchor(self, p: torch.Tensor) -> torch.Tensor:
+        # Coordinate-system parameters such as shared LeRoPE frequencies must
+        # not be pulled toward their initialization by SODA.  Returning the
+        # FP32 master itself keeps the update a no-op while preserving the
+        # stable master-parameter arithmetic used by the fallback path.
+        if getattr(p, "_no_soda", False):
+            return self._master_param(p)
         state = self.state[p]
         master = self._master_param(p)
         anchor = state.get("soda_z0")
@@ -1526,6 +1532,7 @@ class AnchorMuon(torch.optim.Optimizer):
                 p.dtype,
                 p.shape,
                 bool(getattr(p, "_no_weight_decay", False)),
+                bool(getattr(p, "_no_soda", False)),
             )
             buckets[key].append(p)
 
@@ -1838,6 +1845,7 @@ def build_param_groups(
                 "param_names": matrix_names,
                 "use_matrix_update": True,
                 "lr": lr,
+                "base_lr": lr,
                 "momentum": momentum,
                 "pmuoneq_beta": pmuoneq_beta,
                 "row_gamma": row_gamma,
@@ -1858,6 +1866,7 @@ def build_param_groups(
                 "param_names": fallback_names,
                 "use_matrix_update": False,
                 "lr": fallback_lr,
+                "base_lr": fallback_lr,
                 "betas": fallback_betas,
                 "fallback_weight_decay": fallback_weight_decay,
                 "eps": eps,
