@@ -473,7 +473,7 @@ class ByteStream:
         value ^= value >> 27
         return int(value % (max_start + 1))
 
-    def get(self, step, device, *, omit_masks=False):
+    def get(self, step, device, *, omit_masks=False, consumer_stream=None):
         if omit_masks and not self.full_windows:
             raise ValueError("omit_masks requires a full-window document stream")
         epoch, offset = divmod(int(step), self.n_batches)
@@ -531,8 +531,15 @@ class ByteStream:
                 )
             self._stage_events[slot].record(self._copy_stream)
         # Asynchronous dependency insertion; the host remains free while the
-        # copy stream performs DMA and the graph stream can continue prior work.
-        torch.cuda.current_stream(device).wait_event(self._stage_events[slot])
+        # copy stream performs DMA.  CUDA-graph replay can wait on the DMA
+        # event directly from its capture stream.  Waiting on the default
+        # stream here would force replay to add a second cross-stream
+        # dependency (capture_stream.wait_stream(default)) before launching
+        # the graph, even though no default-stream work produces these inputs.
+        wait_stream = consumer_stream
+        if wait_stream is None:
+            wait_stream = torch.cuda.current_stream(device)
+        wait_stream.wait_event(self._stage_events[slot])
         self._stage_used[slot] = True
         if omit_masks:
             outputs.extend((None, None))
@@ -2500,7 +2507,12 @@ def main():
             graph_step is not None and bool(getattr(stream, "full_windows", False))
         )
         x, y, active_mask, loss_mask = stream.get(
-            step, device, omit_masks=omit_graph_masks
+            step,
+            device,
+            omit_masks=omit_graph_masks,
+            consumer_stream=(
+                graph_step.capture_stream if graph_step is not None else None
+            ),
         )
         lr_scale = _wsqd_scale(step, args)
         log["learning_rate_scale"].append(float(lr_scale))
