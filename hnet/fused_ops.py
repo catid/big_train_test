@@ -11,6 +11,55 @@ import triton.language as tl
 
 
 @triton.jit
+def _residual_add_bf16_fp32(
+    out_ptr,
+    residual_ptr,
+    result_ptr,
+    elements,
+    BLOCK: tl.constexpr,
+):
+    """Add an FP32 residual to BF16 output and narrow in one launch."""
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < elements
+    out = tl.load(out_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    residual = tl.load(residual_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    tl.store(result_ptr + offsets, out + residual, mask=mask)
+
+
+class _ResidualAdd(torch.autograd.Function):
+    """Graph-safe BF16+FP32 residual add with the canonical STE gradient."""
+
+    @staticmethod
+    def forward(ctx, out, residual, boundary_prob):
+        if (
+            not out.is_cuda
+            or out.dtype != torch.bfloat16
+            or residual.dtype != torch.float32
+            or out.shape != residual.shape
+        ):
+            raise ValueError("canonical residual add expects matching CUDA BF16/FP32 tensors")
+        result = torch.empty_like(out)
+        _residual_add_bf16_fp32[(triton.cdiv(out.numel(), 256),)](
+            out, residual, result, out.numel(), BLOCK=256, num_warps=4
+        )
+        ctx.save_for_backward(out, boundary_prob)
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        out, boundary_prob = ctx.saved_tensors
+        grad_boundary = (grad_output.float() * out.float()).sum_to_size(
+            boundary_prob.shape
+        )
+        return grad_output, grad_output, grad_boundary
+
+
+def fused_residual_add(out, residual, boundary_prob):
+    """Fuse the FP32 residual accumulation and BF16 narrowing boundary."""
+    return _ResidualAdd.apply(out, residual, boundary_prob)
+
+
+@triton.jit
 def _fp32_to_bf16_ptrs(
     source_ptrs,
     destination_ptrs,

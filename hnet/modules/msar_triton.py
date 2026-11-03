@@ -729,18 +729,28 @@ def _msar_gate_forward(
 @triton.jit
 def _msar_gate_backward(
     grad_result_ptr, start_ptr, output_ptr, residual_ptr, scale_ptr,
-    grad_start_ptr, grad_output_ptr, grad_residual_ptr, elements,
+    grad_start_ptr, grad_output_ptr, grad_residual_ptr, grad_scale_partials_ptr,
+    elements,
     BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     offsets = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     grad_result = tl.load(grad_result_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    start = tl.load(start_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    output = tl.load(output_ptr + offsets, mask=mask, other=0).to(tl.float32)
+    residual = tl.load(residual_ptr + offsets, mask=mask, other=0).to(tl.float32)
     scale = tl.load(scale_ptr).to(tl.float32)
     grad_output = grad_result * scale
     tl.store(grad_start_ptr + offsets, grad_result * (1.0 - scale), mask=mask)
     tl.store(grad_output_ptr + offsets, grad_output, mask=mask)
     tl.store(grad_residual_ptr + offsets, grad_output, mask=mask)
+    # Keep the scale derivative in the same pass as the activation gradients.
+    # The old spelling widened three complete activations and launched a
+    # second reduction after this kernel.  One FP32 partial per program keeps
+    # the reduction deterministic while avoiding those full-size temporaries.
+    partial = tl.sum(grad_result * (output + residual - start), axis=0)
+    tl.store(grad_scale_partials_ptr + pid, partial)
 
 
 class _MSARGate(torch.autograd.Function):
@@ -775,11 +785,16 @@ class _MSARGate(torch.autograd.Function):
         grad_start, grad_output, grad_residual = (
             torch.empty_like(start), torch.empty_like(output), torch.empty_like(residual)
         )
-        _msar_gate_backward[(triton.cdiv(elements, 256),)](
-            grad_result, start, output, residual, scale,
-            grad_start, grad_output, grad_residual, elements, BLOCK=256, num_warps=4
+        blocks = triton.cdiv(elements, 256)
+        grad_scale_partials = torch.empty(
+            (blocks,), device=grad_result.device, dtype=torch.float32
         )
-        grad_scale = (grad_result * (output.float() + residual.float() - start.float())).sum()
+        _msar_gate_backward[(blocks,)](
+            grad_result, start, output, residual, scale,
+            grad_start, grad_output, grad_residual, grad_scale_partials,
+            elements, BLOCK=256, num_warps=4
+        )
+        grad_scale = grad_scale_partials.sum()
         return grad_start, grad_output, grad_residual, grad_scale, None
 
 

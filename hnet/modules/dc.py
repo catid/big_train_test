@@ -364,6 +364,14 @@ class DeChunkLayer(nn.Module):
             -torch.ones(self.nheads, dtype=torch.float32, device=device),
             persistent=False,
         )
+        # The dechunk scan's C coefficient is identically one. Keep one scalar
+        # buffer and broadcast it with zero strides instead of allocating and
+        # filling a full (batch, latent) tensor on every FBT pass.
+        self.register_buffer(
+            "C",
+            torch.ones((), dtype=self.dtype, device=device),
+            persistent=False,
+        )
 
     def allocate_inference_cache(self, batch_size, max_seqlen, device, dtype=None):
         return DeChunkState(
@@ -424,7 +432,7 @@ class DeChunkLayer(nn.Module):
         dt = torch.log(1 / (1 - p)).to(self.dtype)
         x = (hidden_states / dt[..., None]).to(self.dtype)
         b = p.to(self.dtype)
-        c = torch.ones_like(b)
+        c = self.C.expand_as(b)
 
         out = mamba_chunk_scan_combined(
             rearrange(x, "b l (h p) -> b l h p", p=self.headdim),

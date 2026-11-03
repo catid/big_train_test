@@ -15,31 +15,10 @@ from hnet.modules.dc import (
     DeChunkState,
 )
 from hnet.modules.utils import apply_optimization_params
+from hnet.fused_ops import fused_residual_add
 from hnet.te import fp8_context, make_linear
 
 from .config_hnet import HNetConfig
-
-
-class ResidualSTE(torch.autograd.Function):
-    """Residual gate with a straight-through boundary gradient.
-
-    The old implementation materialized a full ``ones_like(p)`` tensor and
-    multiplied it into the decoded activation.  The forward value is exactly
-    ``out + residual``; only the backward pass needs the gate derivative.  A
-    custom function keeps that derivative while eliminating the wide ones and
-    multiply kernels from every FBT pass.
-    """
-
-    @staticmethod
-    def forward(ctx, out, residual, p):
-        ctx.save_for_backward(out, p)
-        return out + residual
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        out, p = ctx.saved_tensors
-        grad_p = (grad_output * out).sum_to_size(p.shape)
-        return grad_output, grad_output, grad_p
 
 
 @dataclass
@@ -141,7 +120,7 @@ class HNet(nn.Module):
             self.residual_proj.weight._no_reinit = True
             self.residual_proj.bias._no_reinit = True
 
-            self.residual_func = ResidualSTE.apply
+            self.residual_func = fused_residual_add
             # Full-bandwidth feedback is attached only at the outer boundary
             # before the deepest main network. It never changes router masks,
             # chunk counts, or the encoder/decoder residual path.
@@ -599,8 +578,8 @@ class HNet(nn.Module):
                 sort_indices=chunk_sort_indices,
             )
             decoded = self.residual_func(
-                decoded.to(dtype=residual.dtype), residual, effective_selected_probs
-            ).to(decoded.dtype)
+                decoded, residual, effective_selected_probs
+            )
             decoded = self.decoder(
                 decoded,
                 cu_seqlens=cu_seqlens,
@@ -765,8 +744,8 @@ class HNet(nn.Module):
         )
 
         hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, effective_selected_probs
-        ).to(hidden_states.dtype)
+            hidden_states, residual, effective_selected_probs
+        )
 
         hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)
         hidden_states = hidden_states[..., :D]
