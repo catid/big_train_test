@@ -693,6 +693,7 @@ class LeRoPEFrequencies(torch.nn.Module):
         # weight decay and to apply its separate gradient clipping norm.
         self.log_scale._lerope_frequency = True
         self.log_scale._no_weight_decay = True
+        self.log_scale._no_soda = True
         self._table_cache = {}
 
     def begin_forward(self):
