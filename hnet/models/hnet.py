@@ -112,6 +112,7 @@ class HNet(nn.Module):
             self.dechunk_layer = DeChunkLayer(
                 self.d_model,
                 static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None),
+                device=device,
             )
 
             # do the residual in fp32
@@ -343,15 +344,22 @@ class HNet(nn.Module):
             if pass_idx > 0:
                 # Shift within each packed document; no cross-document latent
                 # state is allowed to enter a new byte stream.
-                shifted = torch.zeros_like(previous_inner)
                 if next_cu_seqlens is None:
+                    shifted = torch.zeros_like(previous_inner)
                     shifted[:, 1:] = previous_inner[:, :-1]
                 else:
-                    starts = next_cu_seqlens[:-1]
-                    ends = next_cu_seqlens[1:]
-                    for start, end in zip(starts.tolist(), ends.tolist()):
-                        if end > start + 1:
-                            shifted[start + 1 : end] = previous_inner[start : end - 1]
+                    # Packed feedback is one flat token stream.  A single
+                    # roll followed by zeroing document starts is equivalent
+                    # to the old Python loop, but avoids synchronizing
+                    # ``cu_seqlens`` to the host and launching one slice copy
+                    # per document.
+                    shifted = torch.roll(previous_inner, shifts=1, dims=0)
+                    starts = torch.zeros(
+                        previous_inner.shape[0], dtype=torch.bool,
+                        device=previous_inner.device,
+                    )
+                    starts[next_cu_seqlens[:-1]] = True
+                    shifted = shifted.masked_fill(starts[:, None], 0)
                 if self.training and getattr(self.config, "fbt_jitter", 0.0) > 0:
                     shifted = shifted + torch.empty_like(shifted).uniform_(
                         -float(self.config.fbt_jitter), float(self.config.fbt_jitter)
@@ -383,9 +391,24 @@ class HNet(nn.Module):
                             # mask is available (legacy eager packed input).
                             plain[:, : pass_input.shape[1] // 2] = True
                     else:
-                        for start, end in zip(next_cu_seqlens[:-1].tolist(), next_cu_seqlens[1:].tolist()):
-                            prefix = int(torch.randint(0, end - start + 1, ()).item())
-                            plain[start : start + prefix] = True
+                        # Draw one uniformly random cutoff per document on the
+                        # device.  Searchsorted maps each flat token to its
+                        # document, avoiding Python ``.item()`` calls and
+                        # preserving document-local prefix boundaries.
+                        doc_starts = next_cu_seqlens[:-1]
+                        doc_ends = next_cu_seqlens[1:]
+                        lengths = doc_ends - doc_starts
+                        prefix = torch.floor(
+                            torch.rand(lengths.shape, device=pass_input.device)
+                            * (lengths.float() + 1.0)
+                        ).to(dtype=lengths.dtype)
+                        positions = torch.arange(
+                            pass_input.shape[0], device=pass_input.device,
+                            dtype=next_cu_seqlens.dtype,
+                        )
+                        doc_idx = torch.searchsorted(doc_ends, positions, right=True)
+                        offsets = positions - doc_starts.index_select(0, doc_idx)
+                        plain = offsets < prefix.index_select(0, doc_idx)
                     pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
                 pass_input,
