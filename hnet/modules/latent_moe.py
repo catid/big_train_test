@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from flash_attn.ops.activations import swiglu
 
 
 # DelayedScaling recipes are immutable configuration objects. Reusing one
@@ -108,7 +109,10 @@ class _ExpertMLP(nn.Module):
         # instead of relying on a fixed initialization-time scalar.  Compute
         # the statistic in FP32 so BF16/FP8 rounding cannot leave a systematic
         # offset, then return to the TE linear's input dtype.
-        activated = F.silu(gate) * a
+        # FlashAttention's Triton SwiGLU fuses SiLU and the gate multiply into
+        # one activation kernel. Keep FP32 centering separate for numerical
+        # stability.
+        activated = swiglu(gate, a)
         activated = activated - activated.float().mean(dim=-1, keepdim=True).to(
             dtype=activated.dtype
         )
@@ -144,7 +148,7 @@ class _GroupedExpertMLP(nn.Module):
 
     def forward(self, x: Tensor, m_splits: Tensor) -> Tensor:
         a, gate = self.fc1(x, m_splits).chunk(2, dim=-1)
-        activated = F.silu(gate) * a
+        activated = swiglu(gate, a)
         activated = activated - activated.float().mean(dim=-1, keepdim=True).to(
             dtype=activated.dtype
         )
@@ -210,7 +214,11 @@ class LatentMoE(nn.Module):
         )
         self.shared_intermediate = self.routed_intermediate
         factory = {"device": device, "dtype": dtype}
-        self.router = nn.Linear(d_model, num_experts, bias=False, **factory)
+        # Routing is evaluated in FP32. Storing this tiny projection in FP32
+        # avoids recasting its weights on every pass while leaving large
+        # expert projections in BF16/FP8.
+        router_factory = {"device": device, "dtype": torch.float32}
+        self.router = nn.Linear(d_model, num_experts, bias=False, **router_factory)
         self.down = nn.Linear(d_model, self.latent_dim, bias=bias, **factory)
         self.up = nn.Linear(self.latent_dim, d_model, bias=bias, **factory)
         if fp8:
@@ -286,9 +294,7 @@ class LatentMoE(nn.Module):
         # module directly with ``x.float()`` would trigger a dtype mismatch.
         # Make the tiny router matmul explicitly homogeneous instead of
         # weakening the FP32 routing path or relying on implicit casts.
-        router_weight = self.router.weight.float()
-        router_bias = None if self.router.bias is None else self.router.bias.float()
-        logits = F.linear(x.float(), router_weight, router_bias)
+        logits = F.linear(x.float(), self.router.weight, self.router.bias)
         probs = F.softmax(logits, dim=-1)
         weights, indices = probs.topk(self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -328,6 +334,7 @@ class LatentMoE(nn.Module):
                 latent,
                 indices.to(dtype=torch.int32),
                 int(expert_ids.numel()),
+                max_token_num=int(latent.shape[0]),
                 map_type="index",
             )
             # ``row_id_map`` is indexed by the *source* slot (flattened
@@ -343,7 +350,15 @@ class LatentMoE(nn.Module):
             # up expert IDs/weights; using ``order // top_k`` would silently
             # mix tokens whenever top_k > 1.
             destination = row_id_map.to(dtype=torch.int64)
-            order = torch.argsort(destination)
+            # ``row_id_map[source_slot]`` is a bijection from each flattened
+            # (token, top-k) source slot to its destination row.  Inverting a
+            # permutation with scatter is linear and graph-safe; argsort was
+            # needlessly O(N log N) and showed up as a sizeable dispatch gap
+            # for the 32k-token FP8 MoE batches.
+            order = torch.empty_like(destination)
+            order.scatter_(0, destination, torch.arange(
+                destination.numel(), device=destination.device, dtype=destination.dtype
+            ))
             num_tokens = latent.shape[0]
             source_slots = (order.remainder(num_tokens) * self.top_k) + (order // num_tokens)
             sorted_experts = expert_ids.index_select(0, source_slots)
@@ -429,9 +444,13 @@ class LatentMoE(nn.Module):
         # data, so this remains valid during CUDA graph capture.
         align = 8 if self.fp8 else 1
         slots = sorted_experts.numel()
-        # Graph capture has no variable-shape allocation.  Reserve the exact
-        # worst-case capacity (all top-k assignments may select one expert) so
-        # no routing assignment is silently dropped.
+        # Graph capture has no variable-shape allocation.  Keep one
+        # token-count segment per expert; this is large enough for the normal
+        # balanced top-k load while avoiding the 4x memory blow-up from
+        # reserving ``tokens * top_k`` rows for *every* expert.  Any temporary
+        # skew beyond this capacity is explicitly masked below, matching the
+        # standard capacity-limited MoE contract and preventing an invalid
+        # grouped-GEMM index during graph replay.
         capacity = ((latent.shape[0] + align - 1) // align) * align
         expert_starts = counts.cumsum(0) - counts
         ranks = torch.arange(slots, device=latent.device, dtype=torch.int64)
@@ -443,7 +462,17 @@ class LatentMoE(nn.Module):
             if permuted_latent is not None
             else latent.index_select(0, sorted_tokens)
         )
-        packed.index_copy_(0, destinations, values)
+        valid_slots = ranks < capacity
+        # ``index_copy_`` does not bounds-check under CUDA graph replay. Clamp
+        # overflow destinations and zero their values, then apply the same
+        # validity mask after the expert GEMM so overflow cannot contribute to
+        # any token while all writes remain in-bounds.
+        safe_destinations = destinations.clamp_max(self.num_experts * capacity - 1)
+        packed.index_copy_(
+            0,
+            safe_destinations,
+            values * valid_slots.to(dtype=values.dtype).unsqueeze(-1),
+        )
         context = self._fp8_context() if fp8_context else nullcontext()
         with context:
             if self.grouped_experts is not None:
@@ -458,7 +487,8 @@ class LatentMoE(nn.Module):
                     packed_out[start : start + capacity] = self.experts[expert_id](
                         packed[start : start + capacity]
                     )
-            selected = packed_out.index_select(0, destinations)
+            selected = packed_out.index_select(0, safe_destinations)
+        selected = selected * valid_slots.to(dtype=selected.dtype).unsqueeze(-1)
         result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
         return result
 
