@@ -312,7 +312,11 @@ class Isotropic(nn.Module):
         streams = [source_bank]
         for kernel_idx, kernel in enumerate(self.msar_kernels[1:]):
             weight = self.msar_conv[kernel_idx].to(dtype=x.dtype)
-            grouped_weight = weight.repeat(n_sources, 1).unsqueeze(1)
+            grouped_weight = (
+                weight.unsqueeze(1)
+                if n_sources == 1
+                else weight.repeat(n_sources, 1).unsqueeze(1)
+            )
             # Symmetric convolution padding produces the same causal prefix
             # as explicit left padding, while avoiding the full-width F.pad
             # copy.  Keep only the causal output positions; the slice is a
@@ -557,8 +561,10 @@ class Isotropic(nn.Module):
         # exact multiply/add ordering for that stream while removing one
         # graph replay FillFunctor launch and its write bandwidth.  The
         # remaining streams retain the in-place addcmul path.
-        fused = fused_msar_mix(mix, retrieved_streams)
-        return fused.to(sources[-1].dtype)
+        fused = fused_msar_mix(
+            mix, retrieved_streams, result_dtype=sources[-1].dtype
+        )
+        return fused
 
     def _msar_mix_recompute(
         self, sources, layer_idx, cu_seqlens=None, stream_cache=None

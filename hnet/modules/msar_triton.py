@@ -1002,7 +1002,7 @@ def _msar_mix_grad_fused(
 
 class _MSARMix(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, mix, s0, s1, s2, s3):
+    def forward(ctx, mix, s0, s1, s2, s3, result_dtype=None):
         if not all(x.is_cuda for x in (mix, s0, s1, s2, s3)):
             raise RuntimeError("MSAR mix requires CUDA tensors")
         mix, s0, s1, s2, s3 = (x.contiguous() for x in (mix, s0, s1, s2, s3))
@@ -1013,7 +1013,14 @@ class _MSARMix(torch.autograd.Function):
         # [tokens,D].  The flattened storage contract is identical.
         width = shape[-1]
         tokens = s0.numel() // width
-        out = torch.empty_like(s0)
+        # The recurrent MSAR state is consumed at the block's parameter
+        # precision.  Allocate that destination directly so the graph does
+        # not launch a separate full activation cast after the mix kernel.
+        out = torch.empty(
+            s0.shape,
+            device=s0.device,
+            dtype=s0.dtype if result_dtype is None else result_dtype,
+        )
         grid = (tokens * triton.cdiv(width, 256),)
         _msar_mix_forward[grid](mix, s0, s1, s2, s3, out, tokens, width, BLOCK_D=256, num_warps=4)
         ctx.save_for_backward(mix, s0, s1, s2, s3)
@@ -1041,14 +1048,14 @@ class _MSARMix(torch.autograd.Function):
             BLOCK_D=256,
             num_warps=4,
         )
-        return (grad_mix, *grads)
+        return (grad_mix, *grads, None)
 
 
-def fused_msar_mix(mix: torch.Tensor, streams):
+def fused_msar_mix(mix: torch.Tensor, streams, result_dtype=None):
     """Fuse the canonical four-stream MSAR weighted sum."""
     if len(streams) != 4:
         raise ValueError(f"production MSAR expects four streams, got {len(streams)}")
-    return _MSARMix.apply(mix, *streams)
+    return _MSARMix.apply(mix, *streams, result_dtype)
 
 
 @triton.jit
