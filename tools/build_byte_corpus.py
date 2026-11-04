@@ -37,6 +37,7 @@ import os
 import re
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -49,6 +50,10 @@ from urllib.parse import urlsplit
 
 
 BUILDER_VERSION = "hnet-byte-corpus/1"
+COMPACT_INDEX_MAGIC = b"HNETIDX2"
+COMPACT_INDEX_VERSION = 1
+COMPACT_INDEX_RECORD_SIZE = 56
+COMPACT_INDEX_HEADER = struct.Struct("<8sIIQ")
 _TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 _SCALAR_TYPES = (str, int, float, bool)
 _METADATA_FIELDS = (
@@ -459,14 +464,45 @@ def _split_is_validation(record: Record, fraction: float, seed: int) -> bool:
     return value < int(fraction * (1 << 64))
 
 
-def _manifest(path: Path, payload: Path, documents: list[dict[str, Any]], split: str, sources: list[Source]) -> dict[str, Any]:
+def _manifest(
+    path: Path,
+    payload: Path,
+    documents: list[dict[str, Any]],
+    split: str,
+    sources: list[Source],
+    *,
+    compact_index: Path | None = None,
+    document_count: int | None = None,
+    total_token_equivalents: int | None = None,
+) -> dict[str, Any]:
+    if compact_index is None:
+        version = 1
+        index_fields = {"documents": documents}
+        count = len(documents)
+        tokens = sum(int(doc["token_count"]) for doc in documents)
+    else:
+        version = 2
+        count = int(document_count or 0)
+        tokens = int(total_token_equivalents or 0)
+        index_fields = {
+            "document_index": {
+                "path": compact_index.name,
+                "size": compact_index.stat().st_size,
+                "sha256": _sha256_file(compact_index),
+                "count": count,
+                "record_size": COMPACT_INDEX_RECORD_SIZE,
+                "total_token_equivalents": tokens,
+                "format": "HNETIDX2",
+                "version": COMPACT_INDEX_VERSION,
+            }
+        }
     return {
-        "version": 1,
+        "version": version,
         "data_path": payload.name,
         "data_size": payload.stat().st_size,
         "data_sha256": _sha256_file(payload),
-        "total_token_equivalents": sum(int(doc["token_count"]) for doc in documents),
-        "documents": documents,
+        "total_token_equivalents": tokens,
+        **index_fields,
         "split": split,
         "builder": BUILDER_VERSION,
         "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -486,12 +522,15 @@ def build(args: argparse.Namespace) -> Stats:
     weighted = bool(args.target_bytes > 0 and any(source.weight for source in sources))
     target_by_group: dict[str, int] = {}
     if weighted:
-        total_weight = sum(source.weight for source in sources)
-        groups: dict[str, Source] = {}
+        # A glob expands one mixture entry into many files.  Count that
+        # entry's weight once; otherwise a 15-shard FineWeb source would
+        # receive fifteen times its intended quota.
+        group_weights: dict[str, float] = {}
         for source in sources:
-            groups.setdefault(source.group, source)
-        for group, source in groups.items():
-            target_by_group[group] = int(args.target_bytes * source.weight / total_weight)
+            group_weights.setdefault(source.group, source.weight)
+        total_weight = sum(group_weights.values())
+        for group, weight in group_weights.items():
+            target_by_group[group] = int(args.target_bytes * weight / total_weight)
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -501,10 +540,26 @@ def build(args: argparse.Namespace) -> Stats:
     stats = Stats()
     documents: dict[str, list[dict[str, Any]]] = {"train": [], "validation": []}
     handles: dict[str, BinaryIO] = {}
+    compact_handles: dict[str, BinaryIO] = {}
+    metadata_handles: dict[str, TextIO] = {}
+    compact_counts = {"train": 0, "validation": 0}
+    compact_tokens = {"train": 0, "validation": 0}
     bytes_by_group: dict[str, int] = {}
     try:
         for split in documents:
             handles[split] = (staging / f"{split}.bin").open("wb")
+            if args.compact_index:
+                compact_path = staging / f"{split}.index"
+                compact_handles[split] = compact_path.open("w+b")
+                metadata_handles[split] = (staging / f"{split}.documents.jsonl").open(
+                    "w", encoding="utf-8", newline="\n"
+                )
+                compact_handles[split].write(
+                    COMPACT_INDEX_HEADER.pack(
+                        COMPACT_INDEX_MAGIC, COMPACT_INDEX_VERSION,
+                        COMPACT_INDEX_RECORD_SIZE, 0,
+                    )
+                )
         for source_index, source in enumerate(sources):
             for path in [source.path]:
                 if weighted and bytes_by_group.get(source.group, 0) >= target_by_group[source.group]:
@@ -555,7 +610,23 @@ def build(args: argparse.Namespace) -> Stats:
                         "language": record.source.language,
                         **record.metadata,
                     }
-                    documents[split].append(doc)
+                    if args.compact_index:
+                        metadata_handles[split].write(
+                            json.dumps(doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+                        )
+                        compact_handles[split].write(
+                            struct.pack(
+                                "<QQQ32s",
+                                int(doc["offset"]),
+                                int(doc["length"]),
+                                int(doc["token_count"]),
+                                bytes.fromhex(doc["sha256"]),
+                            )
+                        )
+                        compact_counts[split] += 1
+                        compact_tokens[split] += int(doc["token_count"])
+                    else:
+                        documents[split].append(doc)
                     stats.written += 1
                     bytes_by_group[source.group] = bytes_by_group.get(source.group, 0) + len(encoded)
                     if split == "train":
@@ -567,12 +638,40 @@ def build(args: argparse.Namespace) -> Stats:
             handle.flush()
             os.fsync(handle.fileno())
             handle.close()
+        if args.compact_index:
+            for split, handle in compact_handles.items():
+                handle.seek(0)
+                handle.write(
+                    COMPACT_INDEX_HEADER.pack(
+                        COMPACT_INDEX_MAGIC, COMPACT_INDEX_VERSION,
+                        COMPACT_INDEX_RECORD_SIZE, compact_counts[split],
+                    )
+                )
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
+            for handle in metadata_handles.values():
+                handle.flush()
+                os.fsync(handle.fileno())
+                handle.close()
         index.commit()
         for split in documents:
             payload = staging / f"{split}.bin"
-            if not documents[split]:
+            empty_split = compact_counts[split] == 0 if args.compact_index else not documents[split]
+            if empty_split:
                 raise BuildError(f"no documents selected for {split}; adjust validation fraction or inputs")
-            manifest = _manifest(staging / f"{split}.manifest.json", payload, documents[split], split, sources)
+            compact_path = staging / f"{split}.index" if args.compact_index else None
+            manifest = _manifest(
+                staging / f"{split}.manifest.json", payload, documents[split], split, sources,
+                compact_index=compact_path,
+                document_count=compact_counts[split],
+                total_token_equivalents=compact_tokens[split],
+            )
+            if args.compact_index:
+                metadata_path = staging / f"{split}.documents.jsonl"
+                manifest["document_metadata_path"] = metadata_path.name
+                manifest["document_metadata_size"] = metadata_path.stat().st_size
+                manifest["document_metadata_sha256"] = _sha256_file(metadata_path)
             manifest_path = staging / f"{split}.manifest.json"
             with manifest_path.open("w", encoding="utf-8") as handle:
                 json.dump(manifest, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -584,7 +683,13 @@ def build(args: argparse.Namespace) -> Stats:
         # remove an old marker while the new set is being installed.
         ready = output / "READY"
         ready.unlink(missing_ok=True)
-        for name in ("train.bin", "train.manifest.json", "validation.bin", "validation.manifest.json"):
+        names = ["train.bin", "train.manifest.json", "validation.bin", "validation.manifest.json"]
+        if args.compact_index:
+            names.extend((
+                "train.index", "validation.index",
+                "train.documents.jsonl", "validation.documents.jsonl",
+            ))
+        for name in names:
             os.replace(staging / name, output / name)
         with (output / "build_stats.json").open("w", encoding="utf-8") as handle:
             json.dump({**stats.__dict__, "sources": len(sources)}, handle, indent=2, sort_keys=True)
@@ -592,6 +697,9 @@ def build(args: argparse.Namespace) -> Stats:
         ready.write_text("hnet-byte-corpus/1\n", encoding="ascii")
     except Exception:
         for handle in handles.values():
+            with contextlib.suppress(Exception):
+                handle.close()
+        for handle in metadata_handles.values():
             with contextlib.suppress(Exception):
                 handle.close()
         raise
@@ -612,6 +720,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--skip-invalid", action="store_true")
     parser.add_argument("--near-dedup", action="store_true", help="enable conservative SimHash near-duplicate filtering")
     parser.add_argument("--near-max-hamming", type=int, default=3)
+    parser.add_argument(
+        "--compact-index",
+        action="store_true",
+        help="write a version-2 manifest with a fixed-width binary document index",
+    )
     return parser.parse_args(argv)
 
 

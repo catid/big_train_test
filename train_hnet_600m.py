@@ -19,6 +19,7 @@ import importlib.metadata
 import json
 import math
 import os
+import struct
 import subprocess
 import sys
 import time
@@ -244,6 +245,52 @@ class DocumentManifest:
     documents: tuple[dict, ...]
     total_token_equivalents: int
     manifest_sha256: str
+    version: int = 1
+    document_count: int = 0
+    compact_index: torch.Tensor | None = None
+
+
+_COMPACT_INDEX_MAGIC = b"HNETIDX2"
+_COMPACT_INDEX_VERSION = 1
+_COMPACT_INDEX_RECORD_SIZE = 56  # uint64 offset/length/tokens + SHA-256
+_COMPACT_INDEX_HEADER = struct.Struct("<8sIIQ")
+
+
+def _load_compact_index(index_path: Path, expected_size: int, expected_count: int) -> torch.Tensor:
+    """Validate and memory-map a compact document index.
+
+    The index is immutable and covered by the manifest hash.  Its fixed-width
+    records avoid keeping millions of Python dictionaries alive during a long
+    run while retaining byte ranges and token accounting for every document.
+    """
+    actual_size = int(index_path.stat().st_size)
+    if actual_size != int(expected_size):
+        raise ValueError(
+            f"document index size mismatch: manifest={expected_size}, actual={actual_size}"
+        )
+    if actual_size < _COMPACT_INDEX_HEADER.size or actual_size % 8:
+        raise ValueError("compact document index has an invalid size")
+    with index_path.open("rb") as handle:
+        header = handle.read(_COMPACT_INDEX_HEADER.size)
+    magic, version, record_size, count = _COMPACT_INDEX_HEADER.unpack(header)
+    if magic != _COMPACT_INDEX_MAGIC or version != _COMPACT_INDEX_VERSION:
+        raise ValueError("unsupported compact document index header")
+    if record_size != _COMPACT_INDEX_RECORD_SIZE or count != int(expected_count):
+        raise ValueError("compact document index record/count mismatch")
+    expected = _COMPACT_INDEX_HEADER.size + count * record_size
+    if actual_size != expected:
+        raise ValueError("compact document index is truncated or has trailing data")
+    words = torch.from_file(str(index_path), shared=False, size=actual_size // 8, dtype=torch.int64)
+    records = words[3:].view(count, 7)[:, :3]
+    if count <= 0:
+        raise ValueError("compact document index must contain at least one document")
+    offsets = records[:, 0]
+    lengths = records[:, 1]
+    if bool(torch.any(offsets < 0)) or bool(torch.any(lengths < 2)):
+        raise ValueError("compact document index contains an invalid byte range")
+    if bool(torch.any(offsets[1:] < offsets[:-1] + lengths[:-1])):
+        raise ValueError("compact document index contains overlapping ranges")
+    return records
 
 
 def _verify_document_hashes(data_path: Path, documents: list[dict]) -> None:
@@ -280,8 +327,8 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
         raw = json.loads(manifest_path.read_text())
     except json.JSONDecodeError as exc:
         raise ValueError(f"invalid JSON manifest: {manifest_path}") from exc
-    if not isinstance(raw, dict) or int(raw.get("version", -1)) != 1:
-        raise ValueError("document manifest requires integer version=1")
+    if not isinstance(raw, dict) or int(raw.get("version", -1)) not in (1, 2):
+        raise ValueError("document manifest requires integer version=1 or 2")
     declared_data = raw.get("data_path")
     if not isinstance(declared_data, str) or not declared_data:
         raise ValueError("document manifest requires a non-empty data_path")
@@ -316,50 +363,100 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
             f"manifest data_sha256 mismatch: manifest={declared_hash}, actual={data_sha256}"
         )
     documents = raw.get("documents")
-    if not isinstance(documents, list) or not documents:
-        raise ValueError("document manifest requires a non-empty documents list")
-    normalized = []
-    intervals = []
-    seen_ids = set()
-    for index, document in enumerate(documents):
-        if not isinstance(document, dict):
-            raise ValueError(f"manifest document {index} must be an object")
-        required = ("id", "offset", "length", "token_count", "source", "license", "language", "sha256")
-        missing = [key for key in required if key not in document]
-        if missing:
-            raise ValueError(f"manifest document {index} missing fields: {missing}")
-        doc_id = document["id"]
-        if not isinstance(doc_id, str) or not doc_id or doc_id in seen_ids:
-            raise ValueError(f"manifest document {index} has a missing or duplicate id")
-        seen_ids.add(doc_id)
-        offset = int(document["offset"])
-        length = int(document["length"])
-        token_count = int(document["token_count"])
-        if offset < 0 or length < 2 or offset + length > data_size:
-            raise ValueError(
-                f"manifest document {doc_id!r} has invalid byte range "
-                f"offset={offset}, length={length}, data_size={data_size}"
-            )
-        if token_count < 0:
-            raise ValueError(f"manifest document {doc_id!r} has negative token_count")
-        for key in ("source", "license", "language"):
-            if not isinstance(document[key], str) or not document[key]:
-                raise ValueError(f"manifest document {doc_id!r} requires non-empty {key}")
-        doc_hash = document["sha256"]
-        if not isinstance(doc_hash, str) or len(doc_hash) != 64:
-            raise ValueError(f"manifest document {doc_id!r} requires a 64-character sha256")
-        normalized_doc = dict(document)
-        normalized_doc.update(offset=offset, length=length, token_count=token_count)
-        normalized.append(normalized_doc)
-        intervals.append((offset, offset + length, doc_id))
-    intervals.sort()
-    for previous, current in zip(intervals, intervals[1:]):
-        if current[0] < previous[1]:
-            raise ValueError(
-                f"manifest document ranges overlap: {previous[2]!r} and {current[2]!r}"
-            )
-    _verify_document_hashes(data_path, normalized)
-    total_tokens = sum(document["token_count"] for document in normalized)
+    compact_index = None
+    if isinstance(documents, list) and documents:
+        normalized = []
+        intervals = []
+        seen_ids = set()
+        for index, document in enumerate(documents):
+            if not isinstance(document, dict):
+                raise ValueError(f"manifest document {index} must be an object")
+            required = ("id", "offset", "length", "token_count", "source", "license", "language", "sha256")
+            missing = [key for key in required if key not in document]
+            if missing:
+                raise ValueError(f"manifest document {index} missing fields: {missing}")
+            doc_id = document["id"]
+            if not isinstance(doc_id, str) or not doc_id or doc_id in seen_ids:
+                raise ValueError(f"manifest document {index} has a missing or duplicate id")
+            seen_ids.add(doc_id)
+            offset = int(document["offset"])
+            length = int(document["length"])
+            token_count = int(document["token_count"])
+            if offset < 0 or length < 2 or offset + length > data_size:
+                raise ValueError(
+                    f"manifest document {doc_id!r} has invalid byte range "
+                    f"offset={offset}, length={length}, data_size={data_size}"
+                )
+            if token_count < 0:
+                raise ValueError(f"manifest document {doc_id!r} has negative token_count")
+            for key in ("source", "license", "language"):
+                if not isinstance(document[key], str) or not document[key]:
+                    raise ValueError(f"manifest document {doc_id!r} requires non-empty {key}")
+            doc_hash = document["sha256"]
+            if not isinstance(doc_hash, str) or len(doc_hash) != 64:
+                raise ValueError(f"manifest document {doc_id!r} requires a 64-character sha256")
+            normalized_doc = dict(document)
+            normalized_doc.update(offset=offset, length=length, token_count=token_count)
+            normalized.append(normalized_doc)
+            intervals.append((offset, offset + length, doc_id))
+        intervals.sort()
+        for previous, current in zip(intervals, intervals[1:]):
+            if current[0] < previous[1]:
+                raise ValueError(
+                    f"manifest document ranges overlap: {previous[2]!r} and {current[2]!r}"
+                )
+        _verify_document_hashes(data_path, normalized)
+        document_count = len(normalized)
+        total_tokens = sum(document["token_count"] for document in normalized)
+    else:
+        spec = raw.get("document_index")
+        if not isinstance(spec, dict):
+            raise ValueError("document manifest requires documents or document_index")
+        index_name = spec.get("path")
+        if not isinstance(index_name, str) or not index_name or Path(index_name).is_absolute():
+            raise ValueError("document_index.path must be a relative path")
+        index_path = (manifest_path.parent / index_name).resolve()
+        try:
+            index_path.relative_to(manifest_path.parent)
+        except ValueError as exc:
+            raise ValueError("document_index.path escapes its manifest directory") from exc
+        if not index_path.is_file():
+            raise FileNotFoundError(f"document index not found: {index_path}")
+        index_count = int(spec.get("count", 0))
+        index_size = int(spec.get("size", index_path.stat().st_size))
+        index_hash = spec.get("sha256")
+        if not isinstance(index_hash, str) or len(index_hash) != 64:
+            raise ValueError("document_index requires a 64-character sha256")
+        if _sha256_file(index_path) != index_hash.lower():
+            raise ValueError("document index sha256 mismatch")
+        compact_index = _load_compact_index(index_path, index_size, index_count)
+        if bool(torch.any(compact_index[:, 0] + compact_index[:, 1] > data_size)):
+            raise ValueError("compact document index extends past payload")
+        document_count = index_count
+        normalized = []
+        total_tokens = int(spec.get("total_token_equivalents", raw.get("total_token_equivalents", 0)))
+        if total_tokens < 0:
+            raise ValueError("document_index total token count cannot be negative")
+        if int(compact_index[:, 2].sum().item()) != total_tokens:
+            raise ValueError("document_index token total does not match manifest")
+        metadata_name = raw.get("document_metadata_path")
+        metadata_size = raw.get("document_metadata_size")
+        metadata_hash = raw.get("document_metadata_sha256")
+        if not isinstance(metadata_name, str) or not metadata_name or Path(metadata_name).is_absolute():
+            raise ValueError("compact manifest requires a relative document_metadata_path")
+        metadata_path = (manifest_path.parent / metadata_name).resolve()
+        try:
+            metadata_path.relative_to(manifest_path.parent)
+        except ValueError as exc:
+            raise ValueError("document_metadata_path escapes its manifest directory") from exc
+        if not metadata_path.is_file():
+            raise FileNotFoundError(f"document metadata sidecar not found: {metadata_path}")
+        if not isinstance(metadata_hash, str) or len(metadata_hash) != 64:
+            raise ValueError("compact manifest requires a document metadata sha256")
+        if metadata_size is None or int(metadata_size) != int(metadata_path.stat().st_size):
+            raise ValueError("document metadata sidecar size mismatch")
+        if _sha256_file(metadata_path) != metadata_hash.lower():
+            raise ValueError("document metadata sidecar sha256 mismatch")
     declared_tokens = raw.get("total_token_equivalents", total_tokens)
     if int(declared_tokens) != total_tokens:
         raise ValueError(
@@ -373,6 +470,9 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
         documents=tuple(normalized),
         total_token_equivalents=total_tokens,
         manifest_sha256=_sha256_file(manifest_path),
+        version=int(raw.get("version", 1)),
+        document_count=document_count,
+        compact_index=compact_index,
     )
 
 
@@ -389,15 +489,21 @@ class ByteStream:
         # while filling every batch adds avoidable interpreter work once the
         # pinned DMA path is enabled.  These tuples preserve the exact
         # document-index contract used by the epoch permutation.
-        self._document_offsets = tuple(int(document["offset"]) for document in self.documents)
-        self._document_lengths = tuple(int(document["length"]) for document in self.documents)
+        if manifest.compact_index is None:
+            self._document_offsets = tuple(int(document["offset"]) for document in self.documents)
+            self._document_lengths = tuple(int(document["length"]) for document in self.documents)
+            self._document_tokens = tuple(int(document["token_count"]) for document in self.documents)
+        else:
+            self._document_offsets = manifest.compact_index[:, 0]
+            self._document_lengths = manifest.compact_index[:, 1]
+            self._document_tokens = manifest.compact_index[:, 2]
         self.seq = seq
         self.batch = batch
         self.rank = rank
         self.world = world
         self.seed = int(seed)
         self.stride = batch * seq
-        self.document_count = len(self.documents)
+        self.document_count = int(manifest.document_count or len(self.documents))
         # A document-local window has no padding when every document contains
         # at least one complete input/target pair of the configured length.
         # The canonical FineWeb shards commonly satisfy this invariant.  In
@@ -405,7 +511,10 @@ class ByteStream:
         # rebuilt, copied to the device, or copied into the graph-owned input
         # tensors on every replay.  Keep the general masked path below for
         # manifests containing short documents.
-        self.full_windows = all(length >= int(seq) + 1 for length in self._document_lengths)
+        if manifest.compact_index is None:
+            self.full_windows = all(length >= int(seq) + 1 for length in self._document_lengths)
+        else:
+            self.full_windows = bool(torch.all(self._document_lengths >= int(seq) + 1))
         global_rows = batch * world
         # Round the epoch up to a complete global batch. Repeating only the
         # first few document indices is preferable to silently dropping the
@@ -467,6 +576,29 @@ class ByteStream:
         return self._permutation
 
     @staticmethod
+    def _splitmix64(value: int) -> int:
+        value = (int(value) + 0x9E3779B97F4A7C15) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+        return (value ^ (value >> 31)) & 0xFFFFFFFFFFFFFFFF
+
+    def _compact_permutation(self, epoch: int, position: int) -> int:
+        """Return a deterministic bijective document order without randperm."""
+        count = self.document_count
+        if count <= 1:
+            return 0
+        key = (int(self.seed) ^ (int(epoch) * 0xD1B54A32D192ED03)) & 0xFFFFFFFFFFFFFFFF
+        a = self._splitmix64(key) % count
+        if a == 0:
+            a = 1
+        while math.gcd(a, count) != 1:
+            a = (a + 1) % count
+            if a == 0:
+                a = 1
+        b = self._splitmix64(key ^ 0xA24BAED4963EE407) % count
+        return (a * (int(position) % count) + b) % count
+
+    @staticmethod
     def _window_start(seed: int, epoch: int, document_index: int, length: int, seq: int) -> int:
         max_start = max(0, length - (seq + 1))
         if max_start == 0:
@@ -510,9 +642,15 @@ class ByteStream:
                 if not isinstance(buffer, torch.Tensor) or buffer.device != device or tuple(buffer.shape) != shape:
                     raise ValueError(f"device_buffers[{index}] has incompatible shape/device")
         epoch, offset = divmod(int(step), self.n_batches)
-        permutation = self._epoch_permutation(epoch)
         first = (offset * self.world + self.rank) * self.batch
-        document_indices = permutation[first : first + self.batch]
+        if self.manifest.compact_index is None:
+            permutation = self._epoch_permutation(epoch)
+            document_indices = permutation[first : first + self.batch]
+        else:
+            document_indices = [
+                self._compact_permutation(epoch, first + row)
+                for row in range(self.batch)
+            ]
         slot = self._stage_index
         self._stage_index = (slot + 1) % self._stage_count
         if self._pinned and self._stage_used[slot]:
@@ -525,14 +663,16 @@ class ByteStream:
             y_cpu.zero_()
             active_cpu.zero_()
             loss_cpu.zero_()
-        for row, document_index in enumerate(document_indices.tolist()):
+        if isinstance(document_indices, torch.Tensor):
+            document_indices = document_indices.tolist()
+        for row, document_index in enumerate(document_indices):
             document_index = int(document_index)
-            document_length = self._document_lengths[document_index]
+            document_length = int(self._document_lengths[document_index])
             start = self._window_start(
                 self.seed, epoch, document_index, document_length, self.seq
             )
             available = min(self.seq, document_length - 1)
-            document_offset = self._document_offsets[document_index]
+            document_offset = int(self._document_offsets[document_index])
             span = self.data[document_offset + start : document_offset + start + available + 1]
             x_cpu[row, :available].copy_(span[:-1])
             y_cpu[row, :available].copy_(span[1:])
@@ -862,8 +1002,8 @@ def _runtime_provenance(
         "manifest_path": str(manifest.path),
         "manifest_size": int(manifest.path.stat().st_size),
         "manifest_sha256": manifest.manifest_sha256,
-        "manifest_version": 1,
-        "manifest_doc_count": len(manifest.documents),
+        "manifest_version": int(manifest.version),
+        "manifest_doc_count": int(manifest.document_count or len(manifest.documents)),
         "manifest_total_token_equivalents": manifest.total_token_equivalents,
         # Record the concrete MoE routing operators used by the canonical
         # trainer.  This prevents a run log from being mistaken for a fused
@@ -2381,7 +2521,7 @@ def main():
         )
     manifest = _load_manifest(args.manifest, args.data)
     args.data = str(manifest.data_path)
-    args._manifest_doc_count = len(manifest.documents)
+    args._manifest_doc_count = int(manifest.document_count or len(manifest.documents))
     runtime = _runtime_provenance(args.data, manifest)
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

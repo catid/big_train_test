@@ -9,7 +9,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from build_byte_corpus import BuildError, build, parse_args
+try:
+    from .build_byte_corpus import BuildError, build, parse_args
+except ImportError:  # direct ``python test_build_byte_corpus.py`` execution
+    from build_byte_corpus import BuildError, build, parse_args
 
 
 class BuildByteCorpusTest(unittest.TestCase):
@@ -109,6 +112,37 @@ class BuildByteCorpusTest(unittest.TestCase):
             out = root / "out"
             build(parse_args(["--sources", str(spec), "--output", str(out), "--validation-fraction", "0.2"]))
             self.assertTrue((out / "READY").exists())
+
+    def test_compact_index_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data.jsonl"
+            rows = [
+                {"id": str(i), "text": f"compact document {i} with enough bytes", "token_count": i + 2}
+                for i in range(12)
+            ]
+            data.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+            spec = self._source_spec(root, data)
+            out = root / "out"
+            build(parse_args([
+                "--sources", str(spec), "--output", str(out),
+                "--validation-fraction", "0.25", "--compact-index",
+            ]))
+            for split in ("train", "validation"):
+                manifest = json.loads((out / f"{split}.manifest.json").read_text())
+                self.assertEqual(manifest["version"], 2)
+                index = manifest["document_index"]
+                index_path = out / index["path"]
+                self.assertEqual(index["record_size"], 56)
+                self.assertEqual(index_path.stat().st_size, 24 + index["count"] * 56)
+                self.assertEqual(index["sha256"], __import__("hashlib").sha256(index_path.read_bytes()).hexdigest())
+                metadata_path = out / manifest["document_metadata_path"]
+                self.assertEqual(manifest["document_metadata_size"], metadata_path.stat().st_size)
+                self.assertEqual(
+                    manifest["document_metadata_sha256"],
+                    __import__("hashlib").sha256(metadata_path.read_bytes()).hexdigest(),
+                )
+                self.assertNotIn("documents", manifest)
 
 
 if __name__ == "__main__":

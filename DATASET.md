@@ -42,3 +42,11 @@ The repository contains code and the manifest schema only. Downloaded shards,
 payloads, manifests for a particular run, and checkpoints belong outside the
 repository. A run records the payload and manifest hashes in its provenance;
 resuming with a changed corpus is rejected.
+
+For the full 100B-token build, use `tools/build_byte_corpus.py --compact-index`.
+This writes a version-2 manifest plus a fixed-width `HNETIDX2` sidecar containing
+byte offset, byte length, token-equivalent count, and document SHA-256 for each
+row. The trainer memory-maps that sidecar and uses a bounded deterministic
+permutation, so startup and resident memory do not scale with a Python document
+dictionary or a full `randperm` tensor. Version-1 JSON manifests remain valid
+for small pilots and compatibility checks.
