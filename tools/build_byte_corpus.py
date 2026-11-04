@@ -256,7 +256,12 @@ def _load_sources(path: Path) -> list[Source]:
         paths = _expand_path(item["path"])
         if not paths:
             raise BuildError(f"source entry {index} matched no files: {item['path']}")
-        group = f"{item['source']}@{item.get('revision', '')}"
+        # Keep quality tiers as separate mixture buckets even when they are
+        # materialized from the same upstream revision (FineWeb-Edu score>=3
+        # and score==2 are the canonical example).  Otherwise the first tier
+        # would silently consume the combined quota for both entries.
+        tier_name = str(item.get("tier", ""))
+        group = f"{item['source']}@{item.get('revision', '')}@{tier_name}"
         default_priority = {
             "edu3": 0, "edu2": 1, "educational": 1, "base": 2,
             "dolma": 3, "multilingual": 4, "reference": 5,
@@ -500,6 +505,8 @@ def build(args: argparse.Namespace) -> Stats:
             handles[split] = (staging / f"{split}.bin").open("wb")
         for source_index, source in enumerate(sources):
             for path in [source.path]:
+                if weighted and bytes_by_group.get(source.group, 0) >= target_by_group[source.group]:
+                    break
                 line_id = 0
                 for value in _iter_raw(path, source):
                     line_id += 1
@@ -516,7 +523,7 @@ def build(args: argparse.Namespace) -> Stats:
                             continue
                         raise BuildError(f"invalid record in {path}:{line_id}: {exc}") from exc
                     if args.target_bytes > 0 and weighted and bytes_by_group.get(source.group, 0) >= target_by_group[source.group]:
-                        continue
+                        break
                     reason = index.check_and_add(record.text, record.source.source, record.doc_id)
                     if reason == "exact":
                         stats.duplicate_exact += 1
