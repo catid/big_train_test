@@ -51,13 +51,6 @@ was revalidated on the same complete graph shape: 608.05 ms/update median
 (121,253 tokens/s/GPU), with all 15 steady updates finite and direct DDP
 storage preserved. Production-shaped MSAR forward/backward parity was exact.
 
-The MSAR pointer weight-gradient reduction is tuned for this shape with a
-1024-wide, one-warp reduction. A clean full run with that launch measured
-605.34 ms/update median (121,796 tokens/s/GPU), again with 15 finite updates
-and successful graph capture. Output and bank-gradient parity remained exact;
-the FP32 weight-gradient reduction differed only by its grouping (maximum
-3.1e-5, within the 1e-4 production tolerance).
-
 The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
 future byte cannot retroactively evict an earlier latent. The same effective
