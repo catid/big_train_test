@@ -23,7 +23,7 @@ import torch.distributed as dist
 
 # Allow ``python tools/benchmark_byte_stream.py`` from the repository root.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from train_hnet_600m import ByteStream, _load_manifest
+from train_hnet_600m import ByteStream, _load_manifest, _load_manifest_distributed
 
 
 def _distributed_context() -> tuple[int, int, torch.device]:
@@ -56,7 +56,18 @@ def main() -> int:
     if args.batch < 1 or args.seq < 2 or args.steps < 1 or args.warmup < 0:
         raise ValueError("batch, steps, and warmup must be positive; seq must be at least 2")
     rank, world, device = _distributed_context()
-    manifest = _load_manifest(args.manifest)
+    # Match the production trainer's startup contract: rank zero verifies the
+    # large immutable payload/index/metadata digests once, while other ranks
+    # perform structural checks and compare the resulting identity.  Calling
+    # ``_load_manifest`` directly here made an eight-rank benchmark hash the
+    # entire corpus eight times before measuring the loader.
+    manifest = _load_manifest_distributed(
+        args.manifest,
+        None,
+        rank,
+        world,
+        hash_mode="rank0" if world > 1 else "strict",
+    )
     stream = ByteStream(manifest, args.seq, args.batch, rank, world, seed=args.seed)
     direct = device.type == "cuda"
     buffers = None
