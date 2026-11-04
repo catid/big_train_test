@@ -45,6 +45,12 @@ all 15 steady updates were finite. The current MSAR path removes a redundant
 backward activation cast and uses the validated two-warp MSAR weight-gradient
 reduction. A matched pre-change HEAD run measured 616.0 ms/update.
 
+The committed direct-MSAR-destination optimization (writing the fused mix at
+the block's BF16 destination and removing a singleton grouped-weight repeat)
+was revalidated on the same complete graph shape: 608.05 ms/update median
+(121,253 tokens/s/GPU), with all 15 steady updates finite and direct DDP
+storage preserved. Production-shaped MSAR forward/backward parity was exact.
+
 The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
 future byte cannot retroactively evict an earlier latent. The same effective
