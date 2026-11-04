@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument(
+        "--skip-manifest-hash",
+        action="store_true",
+        help="skip startup content hashing after the manifest was independently verified",
+    )
     return parser.parse_args()
 
 
@@ -61,13 +66,16 @@ def main() -> int:
     # perform structural checks and compare the resulting identity.  Calling
     # ``_load_manifest`` directly here made an eight-rank benchmark hash the
     # entire corpus eight times before measuring the loader.
-    manifest = _load_manifest_distributed(
-        args.manifest,
-        None,
-        rank,
-        world,
-        hash_mode="rank0" if world > 1 else "strict",
-    )
+    if args.skip_manifest_hash:
+        manifest = _load_manifest(args.manifest, verify_hashes=False)
+    else:
+        manifest = _load_manifest_distributed(
+            args.manifest,
+            None,
+            rank,
+            world,
+            hash_mode="rank0" if world > 1 else "strict",
+        )
     stream = ByteStream(manifest, args.seq, args.batch, rank, world, seed=args.seed)
     direct = device.type == "cuda"
     buffers = None

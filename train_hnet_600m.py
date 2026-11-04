@@ -681,6 +681,12 @@ class ByteStream:
         self.world = world
         self.seed = int(seed)
         self.stride = batch * seq
+        # Contiguous production payloads use a sequential virtual-byte cursor
+        # instead of an independent random draw for every row.  The coprime
+        # stride visits the packed byte range evenly over epochs while keeping
+        # adjacent batches close on disk, avoiding cold random mmap reads on a
+        # corpus with hundreds of millions of documents.
+        self._cursor_stride = self._choose_cursor_stride(self.seq, manifest.data_size)
         # A document-local window has no padding when every document contains
         # at least one complete input/target pair of the configured length.
         # The canonical FineWeb shards commonly satisfy this invariant.  In
@@ -737,6 +743,19 @@ class ByteStream:
         value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
         return (value ^ (value >> 31)) & 0xFFFFFFFFFFFFFFFF
 
+    @staticmethod
+    def _choose_cursor_stride(seq: int, data_size: int) -> int:
+        """Choose a small odd stride coprime to the packed payload length."""
+        data_size = int(data_size)
+        if data_size <= 1:
+            return 1
+        stride = max(1, 2 * int(seq) + 1)
+        if stride % 2 == 0:
+            stride += 1
+        while math.gcd(stride, data_size) != 1:
+            stride += 2
+        return stride
+
     def _is_contiguous_payload(self) -> bool:
         """Return whether document ranges exactly cover the byte payload."""
         if self.document_count <= 0:
@@ -788,26 +807,42 @@ class ByteStream:
                 return index
         return self.document_count - 1
 
-    def _weighted_document_indices(self, epoch: int, positions: list[int]) -> list[int]:
-        """Vectorize compact-index lookup while keeping the index mmap-backed."""
-        if self._contiguous_payload and isinstance(self._document_offsets, torch.Tensor):
-            draws = []
-            for position in positions:
-                key = (
-                    int(self.seed)
-                    ^ (int(epoch) * 0xD1B54A32D192ED03)
-                    ^ (int(position) * 0xA24BAED4963EE407)
-                ) & 0xFFFFFFFFFFFFFFFF
-                value = self._splitmix64(key)
-                # Reduce in Python before converting to signed int64: the
-                # unsigned hash may exceed int64's representable range.
-                draws.append(value % int(self.manifest.data_size))
-            draws = torch.tensor(draws, dtype=torch.int64)
+    def _contiguous_draws(self, epoch: int, positions: list[int]) -> torch.Tensor:
+        """Return sequential virtual-byte draws for one global batch."""
+        data_size = int(self.manifest.data_size)
+        base = self._splitmix64(
+            int(self.seed) ^ (int(epoch) * 0xD1B54A32D192ED03)
+        ) % data_size
+        return torch.tensor(
+            [
+                (base + int(position) * int(self._cursor_stride)) % data_size
+                for position in positions
+            ],
+            dtype=torch.int64,
+        )
+
+    def _document_indices_for_draws(self, draws: torch.Tensor) -> list[int]:
+        """Map packed-payload byte draws to document rows."""
+        if isinstance(self._document_offsets, torch.Tensor):
             return (
                 torch.searchsorted(self._document_offsets_search, draws, right=True)
                 .sub(1)
                 .tolist()
             )
+        indices = []
+        for draw in draws.tolist():
+            index = 0
+            for candidate, offset in enumerate(self._document_offsets):
+                if int(offset) > int(draw):
+                    break
+                index = candidate
+            indices.append(index)
+        return indices
+
+    def _weighted_document_indices(self, epoch: int, positions: list[int]) -> list[int]:
+        """Map global rows to deterministic document rows."""
+        if self._contiguous_payload:
+            return self._document_indices_for_draws(self._contiguous_draws(epoch, positions))
         return [self._weighted_document_index(epoch, position) for position in positions]
 
     @staticmethod
@@ -864,8 +899,12 @@ class ByteStream:
                     raise ValueError(f"device_buffers[{index}] has incompatible shape/device")
         epoch, offset = divmod(int(step), self.n_batches)
         first = (offset * self.world + self.rank) * self.batch
-        document_indices = self._weighted_document_indices(
-            epoch, [first + row for row in range(self.batch)]
+        positions = [first + row for row in range(self.batch)]
+        sample_draws = self._contiguous_draws(epoch, positions) if self._contiguous_payload else None
+        document_indices = (
+            self._document_indices_for_draws(sample_draws)
+            if sample_draws is not None
+            else self._weighted_document_indices(epoch, positions)
         )
         slot = self._stage_index
         self._stage_index = (slot + 1) % self._stage_count
@@ -884,12 +923,19 @@ class ByteStream:
         for row, document_index in enumerate(document_indices):
             document_index = int(document_index)
             document_length = int(self._document_lengths[document_index])
-            start = self._window_start(
-                self.seed, epoch, document_index, document_length, self.seq,
-                sample_position=first + row,
-            )
-            available = min(self.seq, document_length - 1)
             document_offset = int(self._document_offsets[document_index])
+            max_start = max(0, document_length - (self.seq + 1))
+            if sample_draws is not None and max_start:
+                # The cursor draw lies inside this document.  Reusing its
+                # local position keeps payload reads near the cursor while
+                # still visiting every valid window over successive epochs.
+                start = (int(sample_draws[row]) - document_offset) % (max_start + 1)
+            else:
+                start = self._window_start(
+                    self.seed, epoch, document_index, document_length, self.seq,
+                    sample_position=first + row,
+                )
+            available = min(self.seq, document_length - 1)
             span = self.data[document_offset + start : document_offset + start + available + 1]
             x_cpu[row, :available].copy_(span[:-1])
             y_cpu[row, :available].copy_(span[1:])

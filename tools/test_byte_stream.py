@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import struct
 import sys
 import tempfile
@@ -263,6 +264,18 @@ class ByteStreamTest(unittest.TestCase):
                 rank1_x, *_ = rank1.get(step, torch.device("cpu"))
                 self.assertTrue(torch.equal(global_x[0], rank0_x[0]))
                 self.assertTrue(torch.equal(global_x[1], rank1_x[0]))
+
+    def test_contiguous_cursor_is_coprime_and_epoch_shifted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _load_manifest(self._weighted_manifest(Path(directory)))
+            stream = ByteStream(manifest, seq=8, batch=2, rank=0, world=1, seed=53)
+            self.assertEqual(math.gcd(stream._cursor_stride, manifest.data_size), 1)
+            first = stream._contiguous_draws(0, [0, 1, 2])
+            second = stream._contiguous_draws(1, [0, 1, 2])
+            self.assertFalse(torch.equal(first, second))
+            self.assertEqual(
+                int((first[1] - first[0]) % manifest.data_size), stream._cursor_stride
+            )
 
 
 if __name__ == "__main__":

@@ -55,14 +55,16 @@ manifest.
 
 This writes a version-2 manifest plus a fixed-width `HNETIDX2` sidecar containing
 byte offset, byte length, token-equivalent count, and document SHA-256 for each
-row. The trainer memory-maps that sidecar and draws a deterministic virtual
-payload byte for each global batch row, mapping it with `searchsorted` to a
-document range. This weights sampling by document byte length without an O(N)
-cumulative table or a full `randperm` tensor. Version-1 JSON manifests remain
-valid for small pilots and compatibility checks; a non-contiguous payload uses a
-bounded cumulative window table instead. For a compact contiguous manifest the
-loader materializes only the int64 offset column once (8 bytes per document) so
-the hot path does not recopy the strided index on every batch.
+row. The trainer memory-maps that sidecar and walks a deterministic virtual
+payload-byte cursor for each global batch row, mapping it with `searchsorted` to
+a document range. Each epoch changes the cursor base and uses a coprime stride,
+so the byte-weighted distribution is retained while adjacent batches stay local
+on disk. This avoids an O(N) cumulative table and a full `randperm` tensor.
+Version-1 JSON manifests remain valid for small pilots and compatibility checks;
+a non-contiguous payload uses a bounded cumulative window table instead. For a
+compact contiguous manifest the loader materializes only the int64 offset column
+once (8 bytes per document) so the hot path does not recopy the strided index on
+every batch.
 
 Each manifest records the source-spec SHA-256, sampling seed, validation
 fraction, deduplication mode, and builder commit. Validation grouping is
@@ -72,10 +74,10 @@ place the same host in opposite splits.
 
 Run `tools/benchmark_byte_stream.py` before a long job to verify the actual
 manifest and batch shape. The validated eight-GPU B300 path at `B=18, S=4096`
-writes directly into persistent CUDA-graph inputs and measured `0.56 ms` per
-batch at the slowest rank over 200 warmed steps in the latest run (the exact
-value depends on page-cache state and host contention). The stream must keep
-active and loss masks enabled
+writes directly into persistent CUDA-graph inputs and measured `0.734 ms` per
+batch at the slowest rank over 100 warmed steps on the finalized 123M-document
+corpus (the exact value depends on page-cache state and host contention). The
+stream must keep active and loss masks enabled
 for the production mixture: the loader's document-local pilot had only 23.1%
 of documents long enough to fill a complete 4096-byte window.
 
