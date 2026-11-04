@@ -539,8 +539,19 @@ def build(args: argparse.Namespace) -> Stats:
         for source in sources:
             group_weights.setdefault(source.group, source.weight)
         total_weight = sum(group_weights.values())
-        for group, weight in group_weights.items():
-            target_by_group[group] = int(target_total * weight / total_weight)
+        # Use a largest-remainder allocation so integer quotas still add up to
+        # the requested total.  A plain ``int`` floor would silently discard
+        # token/byte budget when a mixture has several source groups.
+        allocations = []
+        for group, weight in sorted(group_weights.items()):
+            exact = target_total * weight / total_weight
+            floor = int(exact)
+            allocations.append((exact - floor, group, floor))
+        remainder = target_total - sum(item[2] for item in allocations)
+        for _, group, floor in allocations:
+            target_by_group[group] = floor
+        for _, group, _ in sorted(allocations, key=lambda item: (-item[0], item[1]))[:remainder]:
+            target_by_group[group] += 1
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -645,6 +656,20 @@ def build(args: argparse.Namespace) -> Stats:
                     else:
                         stats.validation_bytes += len(encoded)
             index.commit()
+        if weighted:
+            underfilled = {
+                group: {
+                    "target": int(target),
+                    "realized": int(metric_by_group.get(group, 0)),
+                }
+                for group, target in target_by_group.items()
+                if target > 0 and metric_by_group.get(group, 0) < target
+            }
+            if underfilled:
+                raise BuildError(
+                    "weighted source quota could not be met after filtering/deduplication: "
+                    + json.dumps(underfilled, sort_keys=True)
+                )
         for handle in handles.values():
             handle.flush()
             os.fsync(handle.fileno())
@@ -709,6 +734,13 @@ def build(args: argparse.Namespace) -> Stats:
                     "sources": len(sources),
                     "budget_metric": "bytes" if target_bytes else "token_equivalents" if target_tokens else None,
                     "budget_target": target_total,
+                    "budget_groups": {
+                        group: {
+                            "target": int(target),
+                            "realized": int(metric_by_group.get(group, 0)),
+                        }
+                        for group, target in sorted(target_by_group.items())
+                    },
                 },
                 handle,
                 indent=2,
@@ -718,6 +750,9 @@ def build(args: argparse.Namespace) -> Stats:
         ready.write_text("hnet-byte-corpus/1\n", encoding="ascii")
     except Exception:
         for handle in handles.values():
+            with contextlib.suppress(Exception):
+                handle.close()
+        for handle in compact_handles.values():
             with contextlib.suppress(Exception):
                 handle.close()
         for handle in metadata_handles.values():

@@ -43,7 +43,7 @@ class BuildByteCorpusTest(unittest.TestCase):
             output = root / "out"
             stats = build(parse_args([
                 "--sources", str(self._source_spec(root, first, second)),
-                "--output", str(output), "--target-bytes", "100000",
+                "--output", str(output),
                 "--validation-fraction", "0.25", "--near-dedup",
             ]))
             self.assertEqual(stats.duplicate_exact, 1)
@@ -191,6 +191,40 @@ class BuildByteCorpusTest(unittest.TestCase):
                 )
             self.assertEqual(sum(int(doc["token_count"]) for doc in metadata), 300)
             self.assertEqual({doc["source"] for doc in metadata}, {"first", "second"})
+            stats_json = json.loads((out / "build_stats.json").read_text())
+            self.assertEqual(stats_json["budget_metric"], "token_equivalents")
+            self.assertEqual(stats_json["budget_target"], 300)
+            self.assertEqual(
+                sum(group["realized"] for group in stats_json["budget_groups"].values()),
+                300,
+            )
+
+    def test_weighted_budget_underfill_fails_before_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "short.jsonl"
+            data.write_text(
+                "\n".join(
+                    json.dumps({
+                        "id": f"short-{i}",
+                        "text": f"short source document {i}",
+                        "token_count": 3,
+                        "repository_id": f"repo-{i}",
+                    })
+                    for i in range(20)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            spec = self._source_spec(root, data)
+            out = root / "out"
+            with self.assertRaises(BuildError):
+                build(parse_args([
+                    "--sources", str(spec), "--output", str(out),
+                    "--target-token-equivalents", "10000",
+                    "--validation-fraction", "0.5", "--compact-index",
+                ]))
+            self.assertFalse((out / "READY").exists())
 
     def test_budget_flags_are_mutually_exclusive(self) -> None:
         with self.assertRaises(SystemExit):
