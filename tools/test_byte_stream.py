@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import struct
 import sys
 import tempfile
 import unittest
@@ -93,6 +94,70 @@ class ByteStreamTest(unittest.TestCase):
         )
         return manifest
 
+    def _compact_weighted_manifest(self, root: Path) -> Path:
+        """Build the same HNETIDX2 shape used by the production loader."""
+        lengths = [10, 20, 30]
+        payload = b"".join(bytes([65 + index]) * length for index, length in enumerate(lengths))
+        data = root / "train.bin"
+        data.write_bytes(payload)
+        index_path = root / "train.index"
+        records = []
+        metadata = []
+        offset = 0
+        for index, length in enumerate(lengths):
+            body = payload[offset : offset + length]
+            records.append((offset, length, length, hashlib.sha256(body).digest()))
+            metadata.append(
+                {
+                    "id": f"doc-{index}",
+                    "offset": offset,
+                    "length": length,
+                    "token_count": length,
+                    "source": "test",
+                    "license": "test",
+                    "language": "en",
+                }
+            )
+            offset += length
+        with index_path.open("wb") as handle:
+            handle.write(struct.pack("<8sIIQ", b"HNETIDX2", 1, 56, len(records)))
+            for record_offset, length, token_count, digest in records:
+                handle.write(struct.pack("<QQQ", record_offset, length, token_count))
+                handle.write(digest)
+        metadata_path = root / "train.documents.jsonl"
+        metadata_path.write_text(
+            "".join(json.dumps(item) + "\n" for item in metadata), encoding="utf-8"
+        )
+        manifest = root / "compact.manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "data_path": data.name,
+                    "data_size": len(payload),
+                    "data_sha256": hashlib.sha256(payload).hexdigest(),
+                    "total_token_equivalents": sum(lengths),
+                    "document_index": {
+                        "path": index_path.name,
+                        "size": index_path.stat().st_size,
+                        "sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(),
+                        "count": len(records),
+                        "record_size": 56,
+                        "total_token_equivalents": sum(lengths),
+                        "format": "HNETIDX2",
+                        "version": 1,
+                    },
+                    "document_metadata_path": metadata_path.name,
+                    "document_metadata_size": metadata_path.stat().st_size,
+                    "document_metadata_sha256": hashlib.sha256(
+                        metadata_path.read_bytes()
+                    ).hexdigest(),
+                }
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
     def test_windows_never_cross_document_boundaries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             manifest = _load_manifest(self._manifest(Path(directory)))
@@ -129,6 +194,19 @@ class ByteStreamTest(unittest.TestCase):
                 counts[int(x[0, 0]) - 65] += 1
             # The packed byte ranges have lengths 10:20:30.  Sampling a
             # virtual payload byte should preserve that ratio to within 10%.
+            total = sum(counts)
+            expected = [total / 6.0, total / 3.0, total / 2.0]
+            for actual, target in zip(counts, expected):
+                self.assertLess(abs(actual - target), target * 0.10)
+
+    def test_compact_index_uses_weighted_mmap_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = _load_manifest(self._compact_weighted_manifest(Path(directory)))
+            stream = ByteStream(manifest, seq=8, batch=1, rank=0, world=1, seed=41)
+            counts = [0, 0, 0]
+            for step in range(3000):
+                x, *_ = stream.get(step, torch.device("cpu"))
+                counts[int(x[0, 0]) - 65] += 1
             total = sum(counts)
             expected = [total / 6.0, total / 3.0, total / 2.0]
             for actual, target in zip(counts, expected):
