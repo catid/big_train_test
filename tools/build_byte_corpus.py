@@ -19,10 +19,13 @@ Example source specification::
      "language": "en", "weight": 0.45, "tier": "base"}
   ]
 
-For a production mixture, pass ``--target-bytes`` and ``--near-dedup``.  The
-builder uses a deterministic normalized-text filter and a small SimHash LSH
-index for near duplicates.  The LSH filter is intentionally conservative and
-only rejects a candidate after an exact Hamming-distance check.
+For a production mixture, pass either ``--target-bytes`` or
+``--target-token-equivalents`` together with ``--near-dedup``.  The latter is
+the natural accounting unit for a 100B-token target when every record carries
+a pinned ``token_count``.  The builder uses a deterministic normalized-text
+filter and a small SimHash LSH index for near duplicates.  The LSH filter is
+intentionally conservative and only rejects a candidate after an exact
+Hamming-distance check.
 """
 
 from __future__ import annotations
@@ -516,10 +519,17 @@ def build(args: argparse.Namespace) -> Stats:
         raise BuildError("validation fraction must be in [0,1)")
     if args.near_max_hamming < 0 or args.near_max_hamming > 16:
         raise BuildError("near max Hamming distance must be in [0,16]")
-    # Weights describe a mixture when a byte budget is supplied. Without a
-    # budget, process every input record; this makes a one-source validation
-    # build useful without inventing a truncation point.
-    weighted = bool(args.target_bytes > 0 and any(source.weight for source in sources))
+    # Weights describe a mixture when a byte or token-equivalent budget is
+    # supplied. Without a budget, process every input record; this makes a
+    # one-source validation build useful without inventing a truncation point.
+    target_bytes = int(getattr(args, "target_bytes", 0))
+    target_tokens = int(getattr(args, "target_token_equivalents", 0))
+    if target_bytes < 0 or target_tokens < 0:
+        raise BuildError("target bytes and token equivalents must be non-negative")
+    if target_bytes and target_tokens:
+        raise BuildError("choose either --target-bytes or --target-token-equivalents")
+    target_total = target_bytes or target_tokens
+    weighted = bool(target_total > 0 and any(source.weight for source in sources))
     target_by_group: dict[str, int] = {}
     if weighted:
         # A glob expands one mixture entry into many files.  Count that
@@ -530,7 +540,7 @@ def build(args: argparse.Namespace) -> Stats:
             group_weights.setdefault(source.group, source.weight)
         total_weight = sum(group_weights.values())
         for group, weight in group_weights.items():
-            target_by_group[group] = int(args.target_bytes * weight / total_weight)
+            target_by_group[group] = int(target_total * weight / total_weight)
 
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -544,7 +554,7 @@ def build(args: argparse.Namespace) -> Stats:
     metadata_handles: dict[str, TextIO] = {}
     compact_counts = {"train": 0, "validation": 0}
     compact_tokens = {"train": 0, "validation": 0}
-    bytes_by_group: dict[str, int] = {}
+    metric_by_group: dict[str, int] = {}
     try:
         for split in documents:
             handles[split] = (staging / f"{split}.bin").open("wb")
@@ -562,7 +572,7 @@ def build(args: argparse.Namespace) -> Stats:
                 )
         for source_index, source in enumerate(sources):
             for path in [source.path]:
-                if weighted and bytes_by_group.get(source.group, 0) >= target_by_group[source.group]:
+                if weighted and metric_by_group.get(source.group, 0) >= target_by_group[source.group]:
                     break
                 line_id = 0
                 for value in _iter_raw(path, source):
@@ -584,7 +594,7 @@ def build(args: argparse.Namespace) -> Stats:
                         if args.skip_invalid:
                             continue
                         raise BuildError(f"invalid record in {path}:{line_id}: {exc}") from exc
-                    if args.target_bytes > 0 and weighted and bytes_by_group.get(source.group, 0) >= target_by_group[source.group]:
+                    if weighted and metric_by_group.get(source.group, 0) >= target_by_group[source.group]:
                         break
                     reason = index.check_and_add(record.text, record.source.source, record.doc_id)
                     if reason == "exact":
@@ -628,7 +638,8 @@ def build(args: argparse.Namespace) -> Stats:
                     else:
                         documents[split].append(doc)
                     stats.written += 1
-                    bytes_by_group[source.group] = bytes_by_group.get(source.group, 0) + len(encoded)
+                    selected_metric = len(encoded) if target_bytes else int(record.token_count)
+                    metric_by_group[source.group] = metric_by_group.get(source.group, 0) + selected_metric
                     if split == "train":
                         stats.train_bytes += len(encoded)
                     else:
@@ -692,7 +703,17 @@ def build(args: argparse.Namespace) -> Stats:
         for name in names:
             os.replace(staging / name, output / name)
         with (output / "build_stats.json").open("w", encoding="utf-8") as handle:
-            json.dump({**stats.__dict__, "sources": len(sources)}, handle, indent=2, sort_keys=True)
+            json.dump(
+                {
+                    **stats.__dict__,
+                    "sources": len(sources),
+                    "budget_metric": "bytes" if target_bytes else "token_equivalents" if target_tokens else None,
+                    "budget_target": target_total,
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
             handle.write("\n")
         ready.write_text("hnet-byte-corpus/1\n", encoding="ascii")
     except Exception:
@@ -713,7 +734,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--sources", required=True, help="JSON list of source specifications")
     parser.add_argument("--output", required=True, help="external output directory for payloads/manifests")
-    parser.add_argument("--target-bytes", type=int, default=0, help="total selected bytes; required for weighted mixtures")
+    budget = parser.add_mutually_exclusive_group()
+    budget.add_argument(
+        "--target-bytes", type=int, default=0,
+        help="total selected raw UTF-8 bytes; quotas are split by source weight",
+    )
+    budget.add_argument(
+        "--target-token-equivalents", type=int, default=0,
+        help=(
+            "total selected token_count equivalents; quotas are split by source "
+            "weight and require a token_count in every selected record"
+        ),
+    )
     parser.add_argument("--validation-fraction", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=1729)
     parser.add_argument("--allow-estimated-token-count", action="store_true")

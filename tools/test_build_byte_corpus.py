@@ -144,6 +144,61 @@ class BuildByteCorpusTest(unittest.TestCase):
                 )
                 self.assertNotIn("documents", manifest)
 
+    def test_token_equivalent_budget_uses_token_count_and_source_quotas(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first = root / "first.jsonl"
+            second = root / "second.jsonl"
+            first.write_text(
+                "\n".join(json.dumps({
+                    "id": f"first-{i}", "text": f"first document {i} with distinct content",
+                    "token_count": 30, "url": f"https://first.example/doc/{i}",
+                    "repository_id": f"first-repo-{i}",
+                }) for i in range(10)) + "\n", encoding="utf-8"
+            )
+            second.write_text(
+                "\n".join(json.dumps({
+                    "id": f"second-{i}", "text": f"second document {i} with distinct content",
+                    "token_count": 30, "url": f"https://second.example/doc/{i}",
+                    "repository_id": f"second-repo-{i}",
+                }) for i in range(10)) + "\n", encoding="utf-8"
+            )
+            spec = root / "sources.json"
+            spec.write_text(json.dumps([
+                {
+                    "path": str(first), "source": "first", "revision": "r1",
+                    "license": "ODC-By 1.0", "language": "en", "weight": 1.0,
+                    "tier": "base",
+                },
+                {
+                    "path": str(second), "source": "second", "revision": "r2",
+                    "license": "ODC-By 1.0", "language": "en", "weight": 1.0,
+                    "tier": "base",
+                },
+            ]), encoding="utf-8")
+            out = root / "out"
+            stats = build(parse_args([
+                "--sources", str(spec), "--output", str(out),
+                "--target-token-equivalents", "300", "--validation-fraction", "0.5",
+                "--compact-index",
+            ]))
+            self.assertEqual(stats.written, 10)
+            metadata = []
+            for split in ("train", "validation"):
+                metadata.extend(
+                    json.loads(line)
+                    for line in (out / f"{split}.documents.jsonl").read_text().splitlines()
+                )
+            self.assertEqual(sum(int(doc["token_count"]) for doc in metadata), 300)
+            self.assertEqual({doc["source"] for doc in metadata}, {"first", "second"})
+
+    def test_budget_flags_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit):
+            parse_args([
+                "--sources", "sources.json", "--output", "out",
+                "--target-bytes", "100", "--target-token-equivalents", "100",
+            ])
+
 
 if __name__ == "__main__":
     unittest.main()

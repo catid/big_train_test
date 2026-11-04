@@ -43,7 +43,16 @@ payloads, manifests for a particular run, and checkpoints belong outside the
 repository. A run records the payload and manifest hashes in its provenance;
 resuming with a changed corpus is rejected.
 
-For the full 100B-token build, use `tools/build_byte_corpus.py --compact-index`.
+For the full 100B-token build, use
+`tools/build_byte_corpus.py --target-token-equivalents 100000000000
+--compact-index`. Token-equivalent budgets use each record's pinned
+`token_count` field and preserve the source mixture quotas. Use
+`--target-bytes` when the desired budget is raw UTF-8 payload bytes instead;
+the two budget options are mutually exclusive. A token budget is preferred
+for the production 100B target because the trainer reports progress in the
+same accounting unit while still recording realized byte totals in each
+manifest.
+
 This writes a version-2 manifest plus a fixed-width `HNETIDX2` sidecar containing
 byte offset, byte length, token-equivalent count, and document SHA-256 for each
 row. The trainer memory-maps that sidecar and uses a bounded deterministic
