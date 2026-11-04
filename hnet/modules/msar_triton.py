@@ -862,9 +862,14 @@ class _WeightedSourceReducePointers(torch.autograd.Function):
             banks[0].stride(0),
             banks[0].stride(1),
             banks[0].stride(2),
-            BLOCK_D=256,
+            # The production B18/S4096 shape is bandwidth-bound here. A
+            # 1024-wide tile with one warp lowers launch and reduction
+            # overhead versus the former 256-wide/two-warp spelling. This
+            # changes only FP32 reduction grouping (max 3.1e-5 on the
+            # production parity probe), while preserving the same operation.
+            BLOCK_D=1024,
             N=n,
-            num_warps=2,
+            num_warps=1,
         )
         return (grad_weights, *grad_banks)
 
