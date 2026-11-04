@@ -27,6 +27,14 @@ from hnet.modules.utils import get_seq_idx, get_stage_cfg
 from hnet.models.config_hnet import HNetConfig
 from hnet.te import fp8_context, graph_capture_enabled, te_autocast
 
+# MSAR's router score is an FP32 normalization followed by a large matrix
+# product.  On B300, leaving FP32 matmul at the strictest setting selects a
+# slow non-TF32 path for this operation.  The canonical training contract uses
+# the tensor-core ``high`` mode; the FP8/TE paths and all loss reductions keep
+# their existing precision controls.  Set this before the lazy Inductor
+# specializations are compiled so CUDA graph capture records the fast kernel.
+torch.set_float32_matmul_precision("high")
+
 
 def _msar_score_impl(source, query):
     """Fuse the FP32 RMS normalization and MSAR query contraction.
