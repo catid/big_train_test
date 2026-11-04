@@ -1,6 +1,8 @@
 # Base code imported from
 # https://github.com/state-spaces/mamba
 from functools import partial
+import importlib
+import inspect
 from typing import Optional
 
 import torch
@@ -13,6 +15,77 @@ from mamba_ssm.modules.mamba3 import Mamba3, mamba3_siso_combined
 from .mha import CausalMHA
 from .latent_moe import LatentMoE
 from hnet.te import graph_capture_enabled, make_linear
+
+
+_MAMBA3_EMPTY_WORKSPACES_ENABLED = False
+
+
+def _enable_mamba3_empty_workspaces() -> None:
+    """Avoid redundant dense clears in the canonical Mamba-3 SISO forward.
+
+    The upstream SISO forward allocates ``SSM_States`` and
+    ``DA_CS_SUM_Store`` with ``torch.zeros``.  In the fixed dense training
+    path, the Triton kernel stores every element of both buffers before either
+    buffer is consumed by backward, so those clears only add graph launches
+    and memory traffic.  Keep this narrowly scoped to the reviewed Mamba-SSM
+    implementation: fail closed if the source no longer contains the two
+    expected allocations instead of silently applying the optimization to a
+    different dependency version.
+    """
+    global _MAMBA3_EMPTY_WORKSPACES_ENABLED
+    if _MAMBA3_EMPTY_WORKSPACES_ENABLED:
+        return
+    module = importlib.import_module(
+        "mamba_ssm.ops.triton.mamba3.mamba3_siso_fwd"
+    )
+    source = inspect.getsource(module.mamba3_siso_fwd)
+    required = (
+        "SSM_States = torch.zeros(",
+        "DA_CS_SUM_Store = torch.zeros(",
+    )
+    # A locally reviewed source patch may already use empty allocation. In
+    # that case there is no namespace patch to install, but the same source
+    # contract has already been established.
+    if all(marker not in source for marker in required) and all(
+        marker in source
+        for marker in (
+            "SSM_States = torch.empty(",
+            "DA_CS_SUM_Store = torch.empty(",
+        )
+    ):
+        _MAMBA3_EMPTY_WORKSPACES_ENABLED = True
+        return
+    if any(marker not in source for marker in required):
+        raise RuntimeError(
+            "the pinned Mamba-3 SISO source changed; refusing to apply the "
+            "canonical empty-workspace optimization"
+        )
+    real_torch = module.__dict__.get("torch")
+    if real_torch is not torch:
+        raise RuntimeError(
+            "the pinned Mamba-3 SISO module does not expose the expected "
+            "torch allocation namespace"
+        )
+
+    class _Mamba3TorchAllocationProxy:
+        def __getattr__(self, name):
+            return getattr(real_torch, name)
+
+        def zeros(self, *args, **kwargs):
+            shape = args[0] if args else kwargs.get("size")
+            dtype = kwargs.get("dtype")
+            # These are the only zero allocations in the reviewed SISO
+            # forward with these canonical signatures. The Triton forward
+            # writes both buffers completely, including padded rows/chunks.
+            if isinstance(shape, (tuple, list)) and (
+                (len(shape) == 4 and dtype is torch.bfloat16)
+                or (len(shape) == 3 and dtype is torch.float32)
+            ):
+                return real_torch.empty(*args, **kwargs)
+            return real_torch.zeros(*args, **kwargs)
+
+    module.__dict__["torch"] = _Mamba3TorchAllocationProxy()
+    _MAMBA3_EMPTY_WORKSPACES_ENABLED = True
 
 
 class Mamba3Wrapper(Mamba3):
@@ -33,6 +106,7 @@ class Mamba3Wrapper(Mamba3):
         # to the same aligned TE FP8 path used by the rest of H-Net while the
         # native dimensions, dtype, and initialization are still available.
         super().__init__(*args, **kwargs)
+        _enable_mamba3_empty_workspaces()
         for name in ("in_proj", "out_proj"):
             native = getattr(self, name)
             if not isinstance(native, nn.Linear):
