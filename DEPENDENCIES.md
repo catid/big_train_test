@@ -14,6 +14,10 @@ floating Git revisions during a training run.
   0.1.9 is ABI-incompatible with nvidia-cutlass-dsl 4.8.1)
 - causal-conv1d 1.7.0
 - einops, optree, regex, omegaconf
+- Dataset building only: `pyarrow==26.0.1` (wheel SHA-256
+  `7ae48ab53610b85e004b03bccff593fbdf22186d0ab48ed42c90797915dac814`).
+  This is kept out of the training runtime and is used only to stream the
+  pinned FineWeb/FineWeb-Edu Parquet shards.
 - Transformer Engine from `/home/catid/fp8/TransformerEngine` at commit
   `9646c3ef22455b6948cbe870f1aaf20fc8238d69`, rebuilt against this environment
 - cuDNN `9.23.2.1` (the packed fused FP8 DPA backend requires cuDNN >= 9.23 on B300)
