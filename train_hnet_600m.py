@@ -383,6 +383,14 @@ class ByteStream:
         )
         self.manifest = manifest
         self.documents = manifest.documents
+        # Keep the hot sampling loop on compact immutable arrays.  The
+        # manifest dictionaries are useful for provenance and validation, but
+        # repeatedly looking up ``offset``/``length`` through Python dicts
+        # while filling every batch adds avoidable interpreter work once the
+        # pinned DMA path is enabled.  These tuples preserve the exact
+        # document-index contract used by the epoch permutation.
+        self._document_offsets = tuple(int(document["offset"]) for document in self.documents)
+        self._document_lengths = tuple(int(document["length"]) for document in self.documents)
         self.seq = seq
         self.batch = batch
         self.rank = rank
@@ -397,10 +405,7 @@ class ByteStream:
         # rebuilt, copied to the device, or copied into the graph-owned input
         # tensors on every replay.  Keep the general masked path below for
         # manifests containing short documents.
-        self.full_windows = all(
-            int(document["length"]) >= int(seq) + 1
-            for document in self.documents
-        )
+        self.full_windows = all(length >= int(seq) + 1 for length in self._document_lengths)
         global_rows = batch * world
         # Round the epoch up to a complete global batch. Repeating only the
         # first few document indices is preferable to silently dropping the
@@ -521,10 +526,14 @@ class ByteStream:
             active_cpu.zero_()
             loss_cpu.zero_()
         for row, document_index in enumerate(document_indices.tolist()):
-            document = self.documents[int(document_index)]
-            start = self._window_start(self.seed, epoch, int(document_index), document["length"], self.seq)
-            available = min(self.seq, document["length"] - 1)
-            span = self.data[document["offset"] + start : document["offset"] + start + available + 1]
+            document_index = int(document_index)
+            document_length = self._document_lengths[document_index]
+            start = self._window_start(
+                self.seed, epoch, document_index, document_length, self.seq
+            )
+            available = min(self.seq, document_length - 1)
+            document_offset = self._document_offsets[document_index]
+            span = self.data[document_offset + start : document_offset + start + available + 1]
             x_cpu[row, :available].copy_(span[:-1])
             y_cpu[row, :available].copy_(span[1:])
             if not omit_masks:
