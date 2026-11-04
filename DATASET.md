@@ -60,7 +60,9 @@ payload byte for each global batch row, mapping it with `searchsorted` to a
 document range. This weights sampling by document byte length without an O(N)
 cumulative table or a full `randperm` tensor. Version-1 JSON manifests remain
 valid for small pilots and compatibility checks; a non-contiguous payload uses a
-bounded cumulative window table instead.
+bounded cumulative window table instead. For a compact contiguous manifest the
+loader materializes only the int64 offset column once (8 bytes per document) so
+the hot path does not recopy the strided index on every batch.
 
 Each manifest records the source-spec SHA-256, sampling seed, validation
 fraction, deduplication mode, and builder commit. Validation grouping is
