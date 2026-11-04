@@ -1,0 +1,61 @@
+[
+  {
+    "path": "/data/raw/fineweb_edu/**/*.parquet",
+    "source": "fineweb-edu",
+    "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+    "license": "ODC-By 1.0 / Common Crawl terms",
+    "language": "en",
+    "weight": 0.20,
+    "tier": "edu3",
+    "min_score": 3.0
+  },
+  {
+    "path": "/data/raw/fineweb_edu/**/*.parquet",
+    "source": "fineweb-edu",
+    "revision": "87f09149ef4734204d70ed1d046ddc9ca3f2b8f9",
+    "license": "ODC-By 1.0 / Common Crawl terms",
+    "language": "en",
+    "weight": 0.10,
+    "tier": "edu2",
+    "max_score": 3.0,
+    "min_score": 2.0
+  },
+  {
+    "path": "/data/raw/fineweb/**/*.parquet",
+    "source": "fineweb",
+    "revision": "9bb295ddab0e05d785b879661af7260fed5140fc",
+    "license": "ODC-By 1.0 / Common Crawl terms",
+    "language": "en",
+    "weight": 0.45,
+    "tier": "base"
+  },
+  {
+    "path": "/data/raw/dolma/**/*.jsonl.gz",
+    "source": "dolma",
+    "revision": "7f48140530a023e9ea4c5cfb141160922727d4d3",
+    "license": "ODC-By plus source terms",
+    "language": "en",
+    "weight": 0.10,
+    "tier": "dolma",
+    "allow_estimated_token_count": true
+  },
+  {
+    "path": "/data/raw/fineweb2/**/*.parquet",
+    "source": "fineweb-2",
+    "revision": "af9c13333eb981300149d5ca60a8e9d659b276b9",
+    "license": "ODC-By 1.0 / Common Crawl terms",
+    "language": "multilingual",
+    "weight": 0.10,
+    "tier": "multilingual"
+  },
+  {
+    "path": "/data/raw/reference/**/*.jsonl.gz",
+    "source": "licensed-reference",
+    "revision": "pin-per-source",
+    "license": "record-per-source",
+    "language": "en",
+    "weight": 0.05,
+    "tier": "reference",
+    "allow_estimated_token_count": true
+  }
+]

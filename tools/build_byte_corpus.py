@@ -78,6 +78,7 @@ class Source:
     max_score: float | None
     min_int_score: int | None
     max_int_score: int | None
+    allow_estimated_token_count: bool
 
 
 @dataclass
@@ -309,6 +310,7 @@ def _load_sources(path: Path) -> list[Source]:
                 max_score=max_score,
                 min_int_score=min_int_score,
                 max_int_score=max_int_score,
+                allow_estimated_token_count=bool(item.get("allow_estimated_token_count", False)),
             ))
     if any(source.weight for source in sources):
         total = sum(source.weight for source in sources)
@@ -515,7 +517,12 @@ def build(args: argparse.Namespace) -> Stats:
                         stats.filtered += 1
                         continue
                     try:
-                        record = _record_from_json(value, source, line_id, args.allow_estimated_token_count)
+                        record = _record_from_json(
+                            value,
+                            source,
+                            line_id,
+                            bool(args.allow_estimated_token_count or source.allow_estimated_token_count),
+                        )
                         encoded = record.text.encode("utf-8", errors="strict")
                     except (UnicodeError, BuildError) as exc:
                         stats.invalid += 1
