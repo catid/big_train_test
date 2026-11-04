@@ -60,6 +60,12 @@ permutation, so startup and resident memory do not scale with a Python document
 dictionary or a full `randperm` tensor. Version-1 JSON manifests remain valid
 for small pilots and compatibility checks.
 
+Each manifest records the source-spec SHA-256, sampling seed, validation
+fraction, deduplication mode, and builder commit. Validation grouping is
+source-independent: repository identifiers or normalized URL hosts (including
+`www.` variants) are assigned together so derived FineWeb-Edu records cannot
+place the same host in opposite splits.
+
 Run `tools/benchmark_byte_stream.py` before a long job to verify the actual
 manifest and batch shape. The validated eight-GPU B300 path at `B=18, S=4096`
 writes directly into persistent CUDA-graph inputs and measured `0.464 ms` per
