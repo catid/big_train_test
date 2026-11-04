@@ -66,3 +66,8 @@ writes directly into persistent CUDA-graph inputs and measured `0.464 ms` per
 batch at the slowest rank. The stream must keep active and loss masks enabled
 for the production mixture: the loader's document-local pilot had only 23.1%
 of documents long enough to fill a complete 4096-byte window.
+
+The active 100B build uses exact and normalized deduplication across all three
+available pools. The conservative SimHash near-dedup pass remains available for
+smaller audits; its SQLite locality-sensitive index is too slow for a
+multi-hundred-gigabyte production pass.
