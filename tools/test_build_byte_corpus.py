@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 try:
-    from .build_byte_corpus import BuildError, build, parse_args
+    from .build_byte_corpus import (
+        BuildError, Record, Source, _split_is_validation, build, parse_args,
+    )
 except ImportError:  # direct ``python test_build_byte_corpus.py`` execution
-    from build_byte_corpus import BuildError, build, parse_args
+    from build_byte_corpus import BuildError, Record, Source, _split_is_validation, build, parse_args
 
 
 class BuildByteCorpusTest(unittest.TestCase):
@@ -232,6 +235,59 @@ class BuildByteCorpusTest(unittest.TestCase):
                 "--sources", "sources.json", "--output", "out",
                 "--target-bytes", "100", "--target-token-equivalents", "100",
             ])
+
+    def test_validation_group_is_source_independent_and_normalized(self) -> None:
+        source_a = Source(
+            path=Path("a"), source="fineweb", license="x", language="en",
+            revision=None, weight=1.0, tier="base", text_field="text", id_field="id",
+            group="a", priority=0, min_score=None, max_score=None,
+            min_int_score=None, max_int_score=None, allow_estimated_token_count=False,
+        )
+        source_b = Source(
+            path=Path("b"), source="fineweb-edu", license="x", language="en",
+            revision=None, weight=1.0, tier="edu", text_field="text", id_field="id",
+            group="b", priority=0, min_score=None, max_score=None,
+            min_int_score=None, max_int_score=None, allow_estimated_token_count=False,
+        )
+        first = Record(
+            text="one", doc_id="a", source=source_a,
+            metadata={"url": "https://WWW.Example.com:443/path"}, token_count=1,
+        )
+        second = Record(
+            text="two", doc_id="b", source=source_b,
+            metadata={"url": "https://example.com/other"}, token_count=1,
+        )
+        self.assertEqual(
+            _split_is_validation(first, 0.5, 1729),
+            _split_is_validation(second, 0.5, 1729),
+        )
+
+    def test_manifest_records_build_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = root / "data.jsonl"
+            data.write_text(
+                "\n".join(
+                    json.dumps({
+                        "id": str(i), "text": f"provenance test {i}",
+                        "token_count": 3, "url": f"https://host-{i}.example/doc",
+                    }) for i in range(20)
+                ) + "\n", encoding="utf-8",
+            )
+            spec = self._source_spec(root, data)
+            spec_hash = hashlib.sha256(spec.read_bytes()).hexdigest()
+            out = root / "out"
+            build(parse_args([
+                "--sources", str(spec), "--output", str(out),
+                "--validation-fraction", "0.5", "--compact-index",
+                "--source-spec-sha256", spec_hash,
+            ]))
+            manifest = json.loads((out / "train.manifest.json").read_text())
+            self.assertEqual(manifest["source_spec_sha256"], spec_hash)
+            self.assertEqual(manifest["seed"], 1729)
+            self.assertEqual(manifest["validation_fraction"], 0.5)
+            self.assertEqual(manifest["dedup_mode"], "exact+normalized")
+            self.assertTrue(manifest["builder_git_commit"])
 
 
 if __name__ == "__main__":

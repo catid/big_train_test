@@ -458,13 +458,62 @@ def _split_is_validation(record: Record, fraction: float, seed: int) -> bool:
         return True
     url = record.metadata.get("url")
     group = record.metadata.get("repository_id") or record.metadata.get("repo_id")
-    if not group and isinstance(url, str) and url:
-        group = urlsplit(url).netloc
+    if group:
+        group = str(group).strip().casefold()
+        while group.startswith("www."):
+            group = group[4:]
+    elif isinstance(url, str) and url:
+        try:
+            parsed = urlsplit(url)
+            group = parsed.hostname or parsed.netloc
+        except ValueError:
+            group = None
+        if group:
+            group = str(group).strip().casefold().rstrip(".")
+            while group.startswith("www."):
+                group = group[4:]
     if not group:
         group = record.doc_id
-    key = f"{seed}:{record.source.source}:{group}".encode("utf-8", errors="strict")
+    # Do not include source: FineWeb-Edu is derived from FineWeb, and the same
+    # host must not land in different splits merely because it has two source
+    # records.
+    key = f"{seed}:{group}".encode("utf-8", errors="strict")
     value = int.from_bytes(hashlib.blake2b(key, digest_size=8).digest(), "big")
     return value < int(fraction * (1 << 64))
+
+
+def _builder_git_commit() -> str | None:
+    repo = Path(__file__).resolve().parent.parent
+    try:
+        value = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return value or None
+
+
+def _build_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    spec_path = Path(args.sources).expanduser().resolve()
+    if not spec_path.is_file():
+        raise BuildError(f"source specification is not a regular file: {spec_path}")
+    spec_hash = _sha256_file(spec_path)
+    expected = getattr(args, "source_spec_sha256", None)
+    if expected is not None:
+        expected = str(expected).lower()
+        if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+            raise BuildError("source-spec-sha256 must be a 64-character hexadecimal digest")
+        if expected != spec_hash:
+            raise BuildError(f"source-spec-sha256 mismatch: expected={expected}, actual={spec_hash}")
+    return {
+        "source_spec_sha256": spec_hash,
+        "seed": int(args.seed),
+        "validation_fraction": float(args.validation_fraction),
+        "dedup_mode": "exact+normalized+simhash" if args.near_dedup else "exact+normalized",
+        "near_max_hamming": int(args.near_max_hamming) if args.near_dedup else None,
+        "builder_git_commit": _builder_git_commit(),
+    }
 
 
 def _manifest(
@@ -477,6 +526,7 @@ def _manifest(
     compact_index: Path | None = None,
     document_count: int | None = None,
     total_token_equivalents: int | None = None,
+    build_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if compact_index is None:
         version = 1
@@ -510,11 +560,13 @@ def _manifest(
         "builder": BUILDER_VERSION,
         "built_at": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "source_revisions": sorted({f"{s.source}@{s.revision}" for s in sources if s.revision}),
+        **(build_metadata or {}),
     }
 
 
 def build(args: argparse.Namespace) -> Stats:
     sources = _load_sources(Path(args.sources).resolve())
+    build_metadata = _build_metadata(args)
     if args.validation_fraction < 0.0 or args.validation_fraction >= 1.0:
         raise BuildError("validation fraction must be in [0,1)")
     if args.near_max_hamming < 0 or args.near_max_hamming > 16:
@@ -702,6 +754,7 @@ def build(args: argparse.Namespace) -> Stats:
                 compact_index=compact_path,
                 document_count=compact_counts[split],
                 total_token_equivalents=compact_tokens[split],
+                build_metadata=build_metadata,
             )
             if args.compact_index:
                 metadata_path = staging / f"{split}.documents.jsonl"
@@ -741,6 +794,7 @@ def build(args: argparse.Namespace) -> Stats:
                         }
                         for group, target in sorted(target_by_group.items())
                     },
+                    **build_metadata,
                 },
                 handle,
                 indent=2,
@@ -783,6 +837,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--validation-fraction", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=1729)
+    parser.add_argument(
+        "--source-spec-sha256", default=None,
+        help="optional expected SHA-256 for the source specification; computed automatically",
+    )
     parser.add_argument("--allow-estimated-token-count", action="store_true")
     parser.add_argument("--skip-invalid", action="store_true")
     parser.add_argument("--near-dedup", action="store_true", help="enable conservative SimHash near-duplicate filtering")
