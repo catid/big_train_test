@@ -71,6 +71,16 @@ def parse_args():
         help="upper bound for power-calibration candidates (validated complete-step cap is 18)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
+    p.add_argument(
+        "--manifest-hash-mode",
+        choices=("strict", "rank0"),
+        default="rank0",
+        help=(
+            "strictly hash the payload on every rank, or use the shared "
+            "immutable-filesystem contract (default) and hash large files only "
+            "on rank 0"
+        ),
+    )
     p.add_argument("--steps", type=int, default=100000)
     p.add_argument("--warmup", type=int, default=2000)
     p.add_argument("--lr", type=float, default=1.2e-3)
@@ -248,6 +258,12 @@ class DocumentManifest:
     version: int = 1
     document_count: int = 0
     compact_index: torch.Tensor | None = None
+    compact_index_path: Path | None = None
+    compact_index_size: int | None = None
+    compact_index_sha256: str | None = None
+    metadata_path: Path | None = None
+    metadata_size: int | None = None
+    metadata_sha256: str | None = None
 
 
 _COMPACT_INDEX_MAGIC = b"HNETIDX2"
@@ -319,7 +335,20 @@ def _verify_document_hashes(data_path: Path, documents: list[dict]) -> None:
                 )
 
 
-def _load_manifest(path: str | os.PathLike[str], data_override: str | None = None) -> DocumentManifest:
+def _load_manifest(
+    path: str | os.PathLike[str],
+    data_override: str | None = None,
+    *,
+    verify_hashes: bool = True,
+) -> DocumentManifest:
+    """Load and structurally validate a corpus manifest.
+
+    ``verify_hashes`` is intentionally strict by default.  Distributed
+    startup may set it false on nonzero ranks after rank zero has performed the
+    complete payload/index/metadata digest checks; those ranks still validate
+    paths, sizes, ranges, compact-index headers, and token totals locally.
+    The caller must synchronize the rank-zero result before training.
+    """
     manifest_path = Path(path).expanduser().resolve()
     if not manifest_path.is_file():
         raise FileNotFoundError(f"manifest not found: {manifest_path}")
@@ -357,13 +386,20 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
     declared_hash = raw.get("data_sha256")
     if not isinstance(declared_hash, str) or len(declared_hash) != 64:
         raise ValueError("document manifest requires a 64-character data_sha256")
-    data_sha256 = _sha256_file(data_path)
-    if data_sha256 != declared_hash.lower():
+    data_sha256 = declared_hash.lower()
+    actual_data_sha256 = _sha256_file(data_path) if verify_hashes else data_sha256
+    if actual_data_sha256 != data_sha256:
         raise ValueError(
-            f"manifest data_sha256 mismatch: manifest={declared_hash}, actual={data_sha256}"
+            f"manifest data_sha256 mismatch: manifest={declared_hash}, actual={actual_data_sha256}"
         )
     documents = raw.get("documents")
     compact_index = None
+    compact_index_path = None
+    compact_index_size = None
+    compact_index_sha256 = None
+    metadata_path = None
+    metadata_size = None
+    metadata_sha256 = None
     if isinstance(documents, list) and documents:
         normalized = []
         intervals = []
@@ -405,7 +441,8 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
                 raise ValueError(
                     f"manifest document ranges overlap: {previous[2]!r} and {current[2]!r}"
                 )
-        _verify_document_hashes(data_path, normalized)
+        if verify_hashes:
+            _verify_document_hashes(data_path, normalized)
         document_count = len(normalized)
         total_tokens = sum(document["token_count"] for document in normalized)
     else:
@@ -427,7 +464,10 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
         index_hash = spec.get("sha256")
         if not isinstance(index_hash, str) or len(index_hash) != 64:
             raise ValueError("document_index requires a 64-character sha256")
-        if _sha256_file(index_path) != index_hash.lower():
+        compact_index_path = index_path
+        compact_index_size = index_size
+        compact_index_sha256 = index_hash.lower()
+        if verify_hashes and _sha256_file(index_path) != index_hash.lower():
             raise ValueError("document index sha256 mismatch")
         compact_index = _load_compact_index(index_path, index_size, index_count)
         if bool(torch.any(compact_index[:, 0] + compact_index[:, 1] > data_size)):
@@ -453,9 +493,13 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
             raise FileNotFoundError(f"document metadata sidecar not found: {metadata_path}")
         if not isinstance(metadata_hash, str) or len(metadata_hash) != 64:
             raise ValueError("compact manifest requires a document metadata sha256")
-        if metadata_size is None or int(metadata_size) != int(metadata_path.stat().st_size):
+        if metadata_size is None:
+            raise ValueError("compact manifest requires document metadata size")
+        metadata_size = int(metadata_size)
+        metadata_sha256 = metadata_hash.lower()
+        if int(metadata_size) != int(metadata_path.stat().st_size):
             raise ValueError("document metadata sidecar size mismatch")
-        if _sha256_file(metadata_path) != metadata_hash.lower():
+        if verify_hashes and _sha256_file(metadata_path) != metadata_hash.lower():
             raise ValueError("document metadata sidecar sha256 mismatch")
     declared_tokens = raw.get("total_token_equivalents", total_tokens)
     if int(declared_tokens) != total_tokens:
@@ -473,7 +517,108 @@ def _load_manifest(path: str | os.PathLike[str], data_override: str | None = Non
         version=int(raw.get("version", 1)),
         document_count=document_count,
         compact_index=compact_index,
+        compact_index_path=compact_index_path,
+        compact_index_size=compact_index_size,
+        compact_index_sha256=compact_index_sha256,
+        metadata_path=metadata_path,
+        metadata_size=metadata_size,
+        metadata_sha256=metadata_sha256,
     )
+
+
+def _manifest_integrity_record(manifest: DocumentManifest) -> dict[str, object]:
+    """Return the small immutable identity exchanged between DDP ranks."""
+    return {
+        "path": str(manifest.path),
+        "data_path": str(manifest.data_path),
+        "data_size": int(manifest.data_size),
+        "data_sha256": manifest.data_sha256,
+        "manifest_size": int(manifest.path.stat().st_size),
+        "manifest_sha256": manifest.manifest_sha256,
+        "version": int(manifest.version),
+        "document_count": int(manifest.document_count),
+        "total_token_equivalents": int(manifest.total_token_equivalents),
+        "compact_index_path": (
+            str(manifest.compact_index_path)
+            if manifest.compact_index_path is not None else None
+        ),
+        "compact_index_size": manifest.compact_index_size,
+        "compact_index_sha256": manifest.compact_index_sha256,
+        "metadata_path": (
+            str(manifest.metadata_path) if manifest.metadata_path is not None else None
+        ),
+        "metadata_size": manifest.metadata_size,
+        "metadata_sha256": manifest.metadata_sha256,
+    }
+
+
+def _load_manifest_distributed(
+    path: str | os.PathLike[str],
+    data_override: str | None,
+    rank: int,
+    world: int,
+    *,
+    hash_mode: str = "strict",
+) -> DocumentManifest:
+    """Load one manifest while hashing large files once per DDP job.
+
+    Rank zero performs the complete digest checks. Other ranks still perform
+    all structural checks and compare their local path/size/declared identity
+    with rank zero. The corpus is an immutable shared filesystem contract; a
+    rank-local content mutation with unchanged size is outside that contract,
+    while a changed manifest or sidecar identity is rejected before training.
+    Any rank-local parse or structural failure is synchronized so one rank
+    cannot strand the process group in the broadcast.
+    """
+    if hash_mode not in ("strict", "rank0"):
+        raise ValueError(f"unsupported manifest hash mode: {hash_mode!r}")
+    if int(world) <= 1 or hash_mode == "strict":
+        return _load_manifest(path, data_override)
+    local_manifest = None
+    local_error = None
+    local_integrity = None
+    try:
+        local_manifest = _load_manifest(
+            path, data_override, verify_hashes=(int(rank) == 0)
+        )
+        local_integrity = _manifest_integrity_record(local_manifest)
+    except Exception as exc:  # synchronize failures before raising
+        local_error = f"{type(exc).__name__}: {exc}"
+    payload = [
+        {
+            "ok": local_error is None,
+            "error": local_error,
+            "integrity": local_integrity,
+        }
+        if int(rank) == 0 else None
+    ]
+    dist.broadcast_object_list(payload, src=0)
+    root_result = payload[0]
+    if not isinstance(root_result, dict):
+        local_error = local_error or "rank zero returned an invalid manifest result"
+    elif not bool(root_result.get("ok", False)):
+        local_error = local_error or (
+            "rank zero manifest validation failed: " + str(root_result.get("error"))
+        )
+    elif local_manifest is None:
+        local_error = local_error or "local manifest validation failed without an error"
+    else:
+        expected = root_result.get("integrity")
+        actual = local_integrity
+        if expected != actual:
+            local_error = local_error or (
+                "manifest identity differs from rank zero: "
+                f"expected={expected!r}, actual={actual!r}"
+            )
+    error_flag = torch.tensor(
+        [int(local_error is not None)], dtype=torch.int32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    dist.all_reduce(error_flag, op=dist.ReduceOp.MAX)
+    if bool(error_flag.item()):
+        raise RuntimeError(local_error or "another DDP rank failed manifest validation")
+    assert local_manifest is not None
+    return local_manifest
 
 
 class ByteStream:
@@ -926,7 +1071,10 @@ def _dependency_provenance() -> dict:
 
 
 def _runtime_provenance(
-    data_path: str | os.PathLike[str], manifest: DocumentManifest
+    data_path: str | os.PathLike[str],
+    manifest: DocumentManifest,
+    *,
+    manifest_hash_mode: str = "strict",
 ):
     """Capture the runtime identity that produced a checkpoint.
 
@@ -1003,6 +1151,7 @@ def _runtime_provenance(
         "manifest_size": int(manifest.path.stat().st_size),
         "manifest_sha256": manifest.manifest_sha256,
         "manifest_version": int(manifest.version),
+        "manifest_hash_mode": manifest_hash_mode,
         "manifest_doc_count": int(manifest.document_count or len(manifest.documents)),
         "manifest_total_token_equivalents": manifest.total_token_equivalents,
         # Record the concrete MoE routing operators used by the canonical
@@ -1053,6 +1202,7 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
         "manifest_size",
         "manifest_sha256",
         "manifest_version",
+        "manifest_hash_mode",
         "manifest_doc_count",
         "manifest_total_token_equivalents",
         "dependencies",
@@ -2519,10 +2669,14 @@ def main():
             f"need at least {minimum_ratio_target:g} for seq={args.seq} and "
             f"capacity={cfg.chunk_capacity_tokens}, got {args.ratio_target:g}"
         )
-    manifest = _load_manifest(args.manifest, args.data)
+    manifest = _load_manifest_distributed(
+        args.manifest, args.data, rank, world, hash_mode=args.manifest_hash_mode
+    )
     args.data = str(manifest.data_path)
     args._manifest_doc_count = int(manifest.document_count or len(manifest.documents))
-    runtime = _runtime_provenance(args.data, manifest)
+    runtime = _runtime_provenance(
+        args.data, manifest, manifest_hash_mode=args.manifest_hash_mode
+    )
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
@@ -2627,7 +2781,11 @@ def main():
         if rank == 0:
             print(f"Resumed checkpoint {resume_path} at step {start_step}", flush=True)
     stream = ByteStream(manifest, args.seq, args.batch, rank, world, seed=args.data_seed)
-    eval_manifest = manifest if args.eval_manifest is None else _load_manifest(args.eval_manifest)
+    eval_manifest = (
+        manifest if args.eval_manifest is None else _load_manifest_distributed(
+            args.eval_manifest, None, rank, world, hash_mode=args.manifest_hash_mode
+        )
+    )
     eval_stream = ByteStream(
         eval_manifest, args.seq, args.batch, rank, world, seed=args.data_seed + 1_000_003
     )

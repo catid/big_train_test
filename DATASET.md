@@ -67,6 +67,13 @@ batch at the slowest rank. The stream must keep active and loss masks enabled
 for the production mixture: the loader's document-local pilot had only 23.1%
 of documents long enough to fill a complete 4096-byte window.
 
+The trainer's distributed default uses `--manifest-hash-mode rank0`: rank zero
+hashes the large payload, compact index, and metadata sidecar once, while every
+rank still performs local size, path, header, range, and token-total checks and
+compares the declared identity before entering model construction. Use
+`--manifest-hash-mode strict` when ranks do not share an immutable filesystem;
+that mode hashes each file on every rank.
+
 The active 100B build uses exact and normalized deduplication across all three
 available pools. The conservative SimHash near-dedup pass remains available for
 smaller audits; its SQLite locality-sensitive index is too slow for a
