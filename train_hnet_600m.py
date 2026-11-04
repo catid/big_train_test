@@ -633,22 +633,54 @@ class ByteStream:
         # repeatedly looking up ``offset``/``length`` through Python dicts
         # while filling every batch adds avoidable interpreter work once the
         # pinned DMA path is enabled.  These tuples preserve the exact
-        # document-index contract used by the epoch permutation.
+        # document-index contract used by deterministic sampling.
         if manifest.compact_index is None:
             self._document_offsets = tuple(int(document["offset"]) for document in self.documents)
             self._document_lengths = tuple(int(document["length"]) for document in self.documents)
-            self._document_tokens = tuple(int(document["token_count"]) for document in self.documents)
         else:
             self._document_offsets = manifest.compact_index[:, 0]
             self._document_lengths = manifest.compact_index[:, 1]
-            self._document_tokens = manifest.compact_index[:, 2]
+        self.document_count = int(manifest.document_count or len(self.documents))
+        # Production payloads are packed contiguously.  A virtual byte draw
+        # followed by a search over document offsets samples documents in
+        # proportion to their byte length without allocating an O(N) cumulative
+        # table for the potentially huge compact index.  Keep a cumulative
+        # window table only for validated non-contiguous manifests, where a
+        # virtual payload byte could fall in a gap and would be ambiguous.
+        self._contiguous_payload = self._is_contiguous_payload()
+        self._document_offsets_search = None
+        if self._contiguous_payload and manifest.compact_index is not None:
+            # The compact record is a strided mmap view.  Materialize just
+            # the sorted offset column once so each batch can use the fast
+            # native torch upper-bound search without copying the column on
+            # every call.  This is one int64 per document; the 56-byte index
+            # and payload remain memory-mapped.
+            self._document_offsets_search = self._document_offsets.contiguous()
+        self._window_cumulative = None
+        if not self._contiguous_payload:
+            if manifest.compact_index is None:
+                window_weights = tuple(
+                    max(1, int(length) - int(seq))
+                    for length in self._document_lengths
+                )
+                cumulative = []
+                total = 0
+                for weight in window_weights:
+                    total += int(weight)
+                    cumulative.append(total)
+                self._window_cumulative = tuple(cumulative)
+            else:
+                window_weights = torch.clamp(
+                    self._document_lengths.to(dtype=torch.int64) - int(seq), min=1
+                )
+                self._window_cumulative = torch.cumsum(window_weights, dim=0)
+            self._window_weight_total = int(self._window_cumulative[-1])
         self.seq = seq
         self.batch = batch
         self.rank = rank
         self.world = world
         self.seed = int(seed)
         self.stride = batch * seq
-        self.document_count = int(manifest.document_count or len(self.documents))
         # A document-local window has no padding when every document contains
         # at least one complete input/target pair of the configured length.
         # The canonical FineWeb shards commonly satisfy this invariant.  In
@@ -697,28 +729,6 @@ class ByteStream:
         )
         self._stage_used = [False] * self._stage_count
         self._stage_index = 0
-        self._epoch = None
-        self._permutation = None
-
-    def _epoch_permutation(self, epoch):
-        """Return a reproducible window permutation for one data epoch."""
-        if self._epoch != epoch:
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(self.seed + epoch)
-            # Permute document rows, not batches. ``get`` slices this tensor
-            # by ``batch * world``; permuting only n_batches would silently
-            # omit almost the entire manifest once there is more than one
-            # batch per epoch.
-            permutation = torch.randperm(self.document_count, generator=generator)
-            pad = self.n_documents - self.document_count
-            if pad:
-                repeats = (pad + self.document_count - 1) // self.document_count
-                permutation = torch.cat(
-                    (permutation, permutation.repeat(repeats)[:pad])
-                )
-            self._permutation = permutation
-            self._epoch = epoch
-        return self._permutation
 
     @staticmethod
     def _splitmix64(value: int) -> int:
@@ -727,28 +737,94 @@ class ByteStream:
         value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
         return (value ^ (value >> 31)) & 0xFFFFFFFFFFFFFFFF
 
-    def _compact_permutation(self, epoch: int, position: int) -> int:
-        """Return a deterministic bijective document order without randperm."""
-        count = self.document_count
-        if count <= 1:
-            return 0
-        key = (int(self.seed) ^ (int(epoch) * 0xD1B54A32D192ED03)) & 0xFFFFFFFFFFFFFFFF
-        a = self._splitmix64(key) % count
-        if a == 0:
-            a = 1
-        while math.gcd(a, count) != 1:
-            a = (a + 1) % count
-            if a == 0:
-                a = 1
-        b = self._splitmix64(key ^ 0xA24BAED4963EE407) % count
-        return (a * (int(position) % count) + b) % count
+    def _is_contiguous_payload(self) -> bool:
+        """Return whether document ranges exactly cover the byte payload."""
+        if self.document_count <= 0:
+            return False
+        first = int(self._document_offsets[0])
+        if first != 0:
+            return False
+        if self.manifest.compact_index is None:
+            previous_end = 0
+            for offset, length in zip(self._document_offsets, self._document_lengths):
+                if int(offset) != previous_end:
+                    return False
+                previous_end += int(length)
+            return previous_end == int(self.manifest.data_size)
+        offsets = self._document_offsets
+        lengths = self._document_lengths
+        if self.document_count > 1 and bool(
+            torch.any(offsets[1:] != offsets[:-1] + lengths[:-1])
+        ):
+            return False
+        return int(offsets[-1] + lengths[-1]) == int(self.manifest.data_size)
+
+    def _weighted_document_index(self, epoch: int, position: int) -> int:
+        """Map a global row to a deterministic byte-weighted document."""
+        key = (
+            int(self.seed)
+            ^ (int(epoch) * 0xD1B54A32D192ED03)
+            ^ (int(position) * 0xA24BAED4963EE407)
+        ) & 0xFFFFFFFFFFFFFFFF
+        if self._contiguous_payload:
+            draw = self._splitmix64(key) % int(self.manifest.data_size)
+            if isinstance(self._document_offsets, torch.Tensor):
+                # ``right=True`` maps an exact document boundary to the next
+                # range.  The contiguous invariant makes every draw valid.
+                return int(torch.searchsorted(self._document_offsets, draw, right=True)) - 1
+            # Avoid importing bisect on the hot path for compact indexes; the
+            # non-compact fixtures are tiny and this linear scan is exact.
+            for index, offset in enumerate(self._document_offsets):
+                if int(offset) > draw:
+                    return index - 1
+            return self.document_count - 1
+        draw = self._splitmix64(key) % self._window_weight_total
+        if isinstance(self._window_cumulative, torch.Tensor):
+            return int(torch.searchsorted(self._window_cumulative, draw, right=True))
+        total = 0
+        for index, length in enumerate(self._document_lengths):
+            total += max(1, int(length) - int(self.seq))
+            if draw < total:
+                return index
+        return self.document_count - 1
+
+    def _weighted_document_indices(self, epoch: int, positions: list[int]) -> list[int]:
+        """Vectorize compact-index lookup while keeping the index mmap-backed."""
+        if self._contiguous_payload and isinstance(self._document_offsets, torch.Tensor):
+            draws = []
+            for position in positions:
+                key = (
+                    int(self.seed)
+                    ^ (int(epoch) * 0xD1B54A32D192ED03)
+                    ^ (int(position) * 0xA24BAED4963EE407)
+                ) & 0xFFFFFFFFFFFFFFFF
+                value = self._splitmix64(key)
+                # Reduce in Python before converting to signed int64: the
+                # unsigned hash may exceed int64's representable range.
+                draws.append(value % int(self.manifest.data_size))
+            draws = torch.tensor(draws, dtype=torch.int64)
+            return (
+                torch.searchsorted(self._document_offsets_search, draws, right=True)
+                .sub(1)
+                .tolist()
+            )
+        return [self._weighted_document_index(epoch, position) for position in positions]
 
     @staticmethod
-    def _window_start(seed: int, epoch: int, document_index: int, length: int, seq: int) -> int:
+    def _window_start(
+        seed: int,
+        epoch: int,
+        document_index: int,
+        length: int,
+        seq: int,
+        sample_position: int | None = None,
+    ) -> int:
         max_start = max(0, length - (seq + 1))
         if max_start == 0:
             return 0
-        value = (int(seed) ^ (int(epoch) * 0x9E3779B1) ^ (int(document_index) * 0x85EBCA77))
+        position = int(document_index if sample_position is None else sample_position)
+        value = (int(seed) ^ (int(epoch) * 0x9E3779B1) ^ (int(document_index) * 0x85EBCA77)
+                 ^ (position * 0xC2B2AE3D27D4EB4F))
         value &= 0xFFFFFFFFFFFFFFFF
         value ^= value >> 30
         value = (value * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
@@ -788,14 +864,9 @@ class ByteStream:
                     raise ValueError(f"device_buffers[{index}] has incompatible shape/device")
         epoch, offset = divmod(int(step), self.n_batches)
         first = (offset * self.world + self.rank) * self.batch
-        if self.manifest.compact_index is None:
-            permutation = self._epoch_permutation(epoch)
-            document_indices = permutation[first : first + self.batch]
-        else:
-            document_indices = [
-                self._compact_permutation(epoch, first + row)
-                for row in range(self.batch)
-            ]
+        document_indices = self._weighted_document_indices(
+            epoch, [first + row for row in range(self.batch)]
+        )
         slot = self._stage_index
         self._stage_index = (slot + 1) % self._stage_count
         if self._pinned and self._stage_used[slot]:
@@ -814,7 +885,8 @@ class ByteStream:
             document_index = int(document_index)
             document_length = int(self._document_lengths[document_index])
             start = self._window_start(
-                self.seed, epoch, document_index, document_length, self.seq
+                self.seed, epoch, document_index, document_length, self.seq,
+                sample_position=first + row,
             )
             available = min(self.seq, document_length - 1)
             document_offset = int(self._document_offsets[document_index])
