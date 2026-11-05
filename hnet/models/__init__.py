@@ -14,6 +14,6 @@ def __getattr__(name):
         from .hnet import HNet
         return HNet
     if name == "HNetForByteCausalLM":
-        from .mixer_seq import HNetForByteCausalLM
+        from .byte_lm import HNetForByteCausalLM
         return HNetForByteCausalLM
     raise AttributeError(name)

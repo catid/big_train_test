@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from hnet.models.config_hnet import HNetConfig
-from hnet.models.mixer_seq import HNetForByteCausalLM
+from hnet.models.byte_lm import HNetForByteCausalLM
 from hnet.utils.losses import load_balancing_loss
 
 
