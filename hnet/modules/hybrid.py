@@ -35,19 +35,30 @@ class _LearnedRoPE(nn.Module):
             ** (torch.arange(0, head_dim, 2, device=device, dtype=torch.float32) / head_dim)
         )
         self.register_buffer("inv_freq", inv, persistent=False)
-        self.positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
         self.log_scale = nn.Parameter(torch.zeros(head_dim // 2, device=device))
         self.log_scale._no_weight_decay = True
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        # x [..., H, D], positions [...] or [B, T].  Keep angle evaluation in
-        # FP32, then return in the projection dtype.
-        freq = self.inv_freq.to(device=x.device) * self.log_scale.exp()
+    def cos_sin(self, positions: torch.Tensor, dtype: torch.dtype, device) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute one fixed-position rotation table for both Q and K."""
+        freq = self.inv_freq.to(device=device) * self.log_scale.exp()
         angle = positions.to(torch.float32).unsqueeze(-1) * freq
-        cos, sin = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
+        return angle.cos().to(dtype), angle.sin().to(dtype)
+
+    @staticmethod
+    def apply(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Apply a shared rotation table to a Q/K tensor."""
+        # Tables are [T, D/2]; make them broadcast over batch and heads.
+        cos = cos.view(1, -1, 1, cos.shape[-1])
+        sin = sin.view(1, -1, 1, sin.shape[-1])
+        half = x.shape[-1] // 2
+        first, second = x[..., :half], x[..., half:]
+        return torch.cat((first * cos - second * sin, first * sin + second * cos), dim=-1)
+
+    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+        # Keep angle evaluation in FP32, then return in the projection dtype.
+        cos, sin = self.cos_sin(positions, x.dtype, x.device)
         if positions.dim() == 1:
-            cos = cos.view(1, -1, 1, cos.shape[-1])
-            sin = sin.view(1, -1, 1, sin.shape[-1])
+            return self.apply(x, cos, sin)
         else:
             cos = cos.unsqueeze(-2)
             sin = sin.unsqueeze(-2)
@@ -182,8 +193,12 @@ class _AttentionBlock(nn.Module):
         v = v.view(batch, length, self.kv_heads, self.head_dim)
         if self.rope is not None:
             positions = self._positions[:length]
-            q = self.rope(q, positions)
-            k = self.rope(k, positions)
+            # Q and K use the same positions and learned frequencies. Compute
+            # the trigonometric table once instead of repeating two identical
+            # angle/exp/cos/sin paths for every local-attention block.
+            cos, sin = self.rope.cos_sin(positions, q.dtype, q.device)
+            q = self.rope.apply(q, cos, sin)
+            k = self.rope.apply(k, cos, sin)
 
         if not self.local:
             # Causal attention ensures trailing static padding cannot affect
@@ -199,21 +214,9 @@ class _AttentionBlock(nn.Module):
         window = self.window_size
         shift = self.shift % window
         right = (window - ((length + shift) % window)) % window
-        pad_left = torch.zeros(
-            (batch, shift, self.heads, self.head_dim), device=x.device, dtype=q.dtype
-        )
-        pad_left_k = torch.zeros(
-            (batch, shift, self.kv_heads, self.head_dim), device=x.device, dtype=k.dtype
-        )
-        pad_right = torch.zeros(
-            (batch, right, self.heads, self.head_dim), device=x.device, dtype=q.dtype
-        )
-        pad_right_k = torch.zeros(
-            (batch, right, self.kv_heads, self.head_dim), device=x.device, dtype=k.dtype
-        )
-        q = torch.cat((pad_left, q, pad_right), dim=1)
-        k = torch.cat((pad_left_k, k, pad_right_k), dim=1)
-        v = torch.cat((pad_left_k, v, pad_right_k), dim=1)
+        q = F.pad(q, (0, 0, 0, 0, shift, right))
+        k = F.pad(k, (0, 0, 0, 0, shift, right))
+        v = F.pad(v, (0, 0, 0, 0, shift, right))
         padded = q.shape[1]
         n_windows = padded // window
         q = q.view(batch * n_windows, window, self.heads, self.head_dim).transpose(1, 2)

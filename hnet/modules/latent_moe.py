@@ -219,6 +219,10 @@ class LatentMoE(nn.Module):
         self.register_buffer("last_aux_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_z_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self._shared_stream: Optional[torch.cuda.Stream] = None
+        # Reuse the dependency event across eager invocations. The stream is
+        # ordered before each launch, so recording the same event is safe and
+        # avoids a host-side CUDA event allocation for every MoE call.
+        self._shared_event: Optional[torch.cuda.Event] = None
         self._graph_grouped_splits: dict[int, Tensor] = {}
         # CUDA graph training sets this on all MoE modules before warmup so
         # autograd never retains dependencies on an uncaptured side stream.
@@ -272,14 +276,19 @@ class LatentMoE(nn.Module):
         probs = F.softmax(logits, dim=-1)
         weights, indices = probs.topk(self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        slots = torch.zeros_like(probs)
-        slots.scatter_(1, indices, 1.0)
         if token_mask is None:
             valid = torch.ones((x.shape[0],), device=x.device, dtype=probs.dtype)
         else:
             valid = token_mask.to(dtype=probs.dtype)
         valid_count = valid.sum().clamp_min(1.0)
-        fraction = (slots * valid[:, None]).sum(dim=0) / valid_count
+        # Count selected expert slots directly.  The previous dense one-hot
+        # [tokens, experts] tensor plus multiply/sum path needlessly moved
+        # several times the router activation volume; fixed-shape scatter_add
+        # preserves the exact top-k slot fractions with one E-wide buffer.
+        slot_valid = valid[:, None].expand(-1, self.top_k).reshape(-1)
+        fraction = torch.zeros(
+            self.num_experts, device=x.device, dtype=probs.dtype
+        ).scatter_add_(0, indices.reshape(-1), slot_valid) / valid_count
         mean_prob = (probs * valid[:, None]).sum(dim=0) / valid_count
         aux = self.aux_loss_coef * self.num_experts * (fraction * mean_prob).sum()
         z = self.z_loss_coef * (
@@ -323,7 +332,9 @@ class LatentMoE(nn.Module):
             # destination map and transpose the slot indexing before looking
             # up expert IDs/weights; using ``order // top_k`` would silently
             # mix tokens whenever top_k > 1.
-            destination = row_id_map.to(dtype=torch.int64)
+            # TE returns [top_k, num_tokens]; flatten it in that layout so
+            # the inverse permutation below is a single linear scatter.
+            destination = row_id_map.to(dtype=torch.int64).reshape(-1)
             # ``row_id_map[source_slot]`` is a bijection from each flattened
             # (token, top-k) source slot to its destination row.  Inverting a
             # permutation with scatter is linear and graph-safe; argsort was
@@ -472,7 +483,9 @@ class LatentMoE(nn.Module):
             if self._shared_stream is None or self._shared_stream.device != flat.device:
                 self._shared_stream = torch.cuda.Stream(device=flat.device)
             stream = self._shared_stream
-            event = torch.cuda.Event()
+            if self._shared_event is None:
+                self._shared_event = torch.cuda.Event()
+            event = self._shared_event
             # ``flat`` was produced on the caller's stream.  Establish the
             # producer->consumer edge before launching the independent shared
             # expert; waiting only after the main MoE branch is too late.

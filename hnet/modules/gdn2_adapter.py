@@ -10,6 +10,11 @@ the point at which the external package is required.
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import os
+import sys
+import types
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -20,6 +25,49 @@ class GDN2DependencyError(ImportError):
     """Raised when the configured external GDN-2 symbol cannot be loaded."""
 
 
+def _prepare_external_namespace(module_name: str) -> Path | None:
+    """Expose the pinned GDN2 checkout without running ``lit_gpt.__init__``.
+
+    The upstream checkout's package initializer imports the full Lit-GPT
+    application (and therefore Lightning).  H-Net only needs ``gdn2.py``;
+    creating a namespace package for the configured checkout lets Python load
+    that module while keeping the dependency boundary explicit.  We do this
+    only for the known external package prefix and only when ``GDN2_ROOT`` is
+    set, so an unrelated installed package cannot be selected silently.
+    """
+    if not module_name.startswith("lit_gpt."):
+        return None
+    root_value = os.environ.get("GDN2_ROOT")
+    if not root_value:
+        raise GDN2DependencyError(
+            "GDN2_ROOT must point to the inspected external checkout when "
+            f"loading {module_name!r}"
+        )
+    root = Path(root_value).expanduser().resolve()
+    package_dir = root / "lit_gpt"
+    if not package_dir.is_dir():
+        raise GDN2DependencyError(
+            f"GDN2_ROOT={str(root)!r} has no lit_gpt package directory"
+        )
+    existing = sys.modules.get("lit_gpt")
+    if existing is None:
+        package = types.ModuleType("lit_gpt")
+        package.__path__ = [str(package_dir)]
+        package.__package__ = "lit_gpt"
+        package.__spec__ = importlib.util.spec_from_loader(
+            "lit_gpt", loader=None, is_package=True
+        )
+        sys.modules["lit_gpt"] = package
+    else:
+        paths = getattr(existing, "__path__", ())
+        if not any(Path(path).resolve() == package_dir for path in paths):
+            raise GDN2DependencyError(
+                "an unrelated lit_gpt package is already loaded; refusing to "
+                f"mix it with GDN2_ROOT={str(root)!r}"
+            )
+    return root
+
+
 def load_gdn2_symbol(path: str):
     """Resolve a configured ``module:attribute`` GDN-2 class lazily."""
     try:
@@ -28,6 +76,7 @@ def load_gdn2_symbol(path: str):
         raise GDN2DependencyError(
             f"gdn2_module must use 'module:attribute' syntax, got {path!r}"
         ) from exc
+    root = _prepare_external_namespace(module_name)
     try:
         module = importlib.import_module(module_name)
     except Exception as exc:
@@ -35,6 +84,19 @@ def load_gdn2_symbol(path: str):
             "GDN2 blocks require the inspected external dependency "
             f"{path!r}; no in-tree fallback is provided"
         ) from exc
+    if root is not None:
+        module_file = getattr(module, "__file__", None)
+        if module_file is None:
+            raise GDN2DependencyError(
+                f"configured GDN2 module {path!r} has no source file"
+            )
+        try:
+            Path(module_file).resolve().relative_to(root)
+        except ValueError as exc:
+            raise GDN2DependencyError(
+                f"configured GDN2 module {path!r} resolved outside "
+                f"GDN2_ROOT={str(root)!r}"
+            ) from exc
     try:
         return getattr(module, attr_name)
     except AttributeError as exc:
