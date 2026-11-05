@@ -297,14 +297,18 @@ class LatentMoE(nn.Module):
         return indices, weights, aux, z
 
     def _dispatch(
-        self, latent: Tensor, indices: Tensor, weights: Tensor, *, fp8_context: bool = True
+        self,
+        latent: Tensor,
+        indices: Tensor,
+        weights: Tensor,
+        *,
+        fp8_context: bool = True,
     ) -> Tensor:
         # FP32 accumulation is essential: summing several rounded FP8 expert
         # outputs in model dtype introduces a biased gate gradient.
-        result = torch.zeros_like(latent, dtype=torch.float32)
-        token_ids = torch.arange(latent.shape[0], device=latent.device).repeat_interleave(self.top_k)
         expert_ids = indices.reshape(-1)
         slot_weights = weights.reshape(-1).float()
+        capturing = latent.is_cuda and torch.cuda.is_current_stream_capturing()
         # The pinned TE checkout provides a graph-safe fused index-map
         # permutation. It replaces the Python-visible argsort/index-select
         # sequence while preserving the exact token order and autograd path.
@@ -351,10 +355,10 @@ class LatentMoE(nn.Module):
             sorted_weights = slot_weights.index_select(0, source_slots)
         else:
             order = torch.argsort(expert_ids)
+            token_ids = torch.arange(latent.shape[0], device=latent.device).repeat_interleave(self.top_k)
             sorted_experts = expert_ids[order]
             sorted_tokens = token_ids[order]
             sorted_weights = slot_weights[order]
-        capturing = latent.is_cuda and torch.cuda.is_current_stream_capturing()
         if not capturing:
             # Eager execution can use the exact variable-size dispatch.  This
             # avoids padding work and, unlike a fixed-capacity graph buffer,
@@ -394,6 +398,19 @@ class LatentMoE(nn.Module):
             with context:
                 packed_out = self.grouped_experts(packed, m_splits)
             selected = packed_out.index_select(0, destinations)
+            if permuted_latent is not None:
+                # The TE index-map unpermute kernel performs the weighted
+                # token merge in one fused CUDA launch.  It accepts the
+                # source-slot ordering produced above together with the
+                # original [tokens, top_k] probabilities; this is the same
+                # mapping as the reference index_add_ below, while avoiding
+                # a zero allocation, multiply, and indexed accumulation.
+                return te.moe_unpermute(
+                    selected,
+                    row_id_map,
+                    merging_probs=weights.float(),
+                    map_type="index",
+                ).float()
             result = torch.zeros_like(latent, dtype=torch.float32)
             result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
             return result
@@ -450,6 +467,17 @@ class LatentMoE(nn.Module):
             packed_out = self.grouped_experts(packed, m_splits)
             selected = packed_out.index_select(0, safe_destinations)
         selected = selected * valid_slots.to(dtype=selected.dtype).unsqueeze(-1)
+        if permuted_latent is not None:
+            # As in eager dispatch, let TE merge the fixed-capacity expert
+            # results. Overflow rows are zeroed before the fused merge, so
+            # the graph path retains the same capacity-limited semantics.
+            return te.moe_unpermute(
+                selected,
+                row_id_map,
+                merging_probs=weights.float(),
+                map_type="index",
+            ).float()
+        result = torch.zeros_like(latent, dtype=torch.float32)
         result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
         return result
 

@@ -334,6 +334,11 @@ def read_power_watts():
 class GraphStep:
     def __init__(self, model, optimizer, x, y, args, capture_stream=None):
         self.model, self.optimizer, self.args = model, optimizer, args
+        # Materialize the parameter tuple once.  Walking the DDP/module tree on
+        # every replay just to clip gradients adds Python work after the graph
+        # has already synchronized; the parameter identities are fixed for the
+        # lifetime of the canonical trainer.
+        self._parameters = tuple(model.parameters())
         # The eager MoE path overlaps the shared expert on a private stream.
         # CUDA graph capture cannot import autograd dependencies created on
         # that stream during warmup, so graph training opts into the same
@@ -395,7 +400,9 @@ class GraphStep:
         # update remain live so a transient FP8/CE overflow cannot mutate all
         # optimizer state with NaNs.  The scalar finite check is intentionally
         # after synchronization and therefore does not enter the graph.
-        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self._parameters, 1.0, foreach=True
+        )
         finite = bool(torch.isfinite(self.static_loss) and torch.isfinite(grad_norm))
         if finite:
             self.optimizer.step()
@@ -438,6 +445,13 @@ def main():
                 gradient_as_bucket_view=True,
             )
     optimizer = make_optimizer(model.module if world > 1 else model, args)
+    # The canonical shape never changes during a run.  Reuse this tuple for
+    # eager gradient clipping and finite checks instead of traversing the
+    # recursive H-Net module tree every update.
+    trainable_parameters = tuple(model.parameters())
+    eager_mask = torch.ones(
+        (args.batch, args.seq), device=device, dtype=torch.bool
+    )
     stream = ByteStream(
         args.data,
         args.seq,
@@ -484,12 +498,13 @@ def main():
             if not finite:
                 log["nonfinite"].append(step)
         else:
-            mask = torch.ones_like(x, dtype=torch.bool)
-            out = model(x, mask=mask, fbt_passes=args.fbt_passes)
+            out = model(x, mask=eager_mask, fbt_passes=args.fbt_passes)
             loss, _, ratio = loss_for_output(out, y, args)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                trainable_parameters, 1.0, foreach=True
+            )
             finite = bool(torch.isfinite(loss) and torch.isfinite(grad_norm))
             if finite:
                 optimizer.step()

@@ -42,6 +42,16 @@ backward, with CUDA time dominated by matrix multiplies (18.9 ms), copies
 Those figures are useful for locating overhead but are not comparable to a
 real FP8 grouped-GEMM result.
 
+With the actual TE extension and the current fixed-shape CUDA-graph path,
+warm replay of forward/backward plus gradient clipping and GramNS/AdamATan2
+update measured approximately 179 ms per step in a three-replay sample. The
+graph capture setup took about 32 s. A real-TE eager profile measured 230–260
+ms for warm forward plus backward before the fused TE unpermute change. The
+current dispatch uses TE's index-map unpermute for the weighted expert merge;
+an isolated `N=2048`, latent-width-640 FP8 expert backward measured 8.3 ms with
+that path versus 17.6 ms with the prior `index_add_` merge. These are warm
+measurements and should be repeated after any dependency or driver change.
+
 ## Reproduction
 
 Use the canonical command in [`HNET_REPRODUCTION.md`](../HNET_REPRODUCTION.md)
