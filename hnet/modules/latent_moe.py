@@ -405,12 +405,15 @@ class LatentMoE(nn.Module):
                 # original [tokens, top_k] probabilities; this is the same
                 # mapping as the reference index_add_ below, while avoiding
                 # a zero allocation, multiply, and indexed accumulation.
+                # The TE kernel accumulates in the input dtype for BF16. Cast
+                # the selected expert rows to FP32 before invoking it so this
+                # fused merge preserves the reference FP32 reduction contract.
                 return te.moe_unpermute(
-                    selected,
+                    selected.float(),
                     row_id_map,
                     merging_probs=weights.float(),
                     map_type="index",
-                ).float()
+                )
             result = torch.zeros_like(latent, dtype=torch.float32)
             result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
             return result
@@ -471,12 +474,15 @@ class LatentMoE(nn.Module):
             # As in eager dispatch, let TE merge the fixed-capacity expert
             # results. Overflow rows are zeroed before the fused merge, so
             # the graph path retains the same capacity-limited semantics.
+            # Keep the weighted merge in FP32 even though the expert GEMM
+            # itself runs in BF16/FP8; TE's unpermute accumulator follows its
+            # input dtype.
             return te.moe_unpermute(
-                selected,
+                selected.float(),
                 row_id_map,
                 merging_probs=weights.float(),
                 map_type="index",
-            ).float()
+            )
         result = torch.zeros_like(latent, dtype=torch.float32)
         result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
         return result
