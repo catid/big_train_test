@@ -6,7 +6,13 @@ import torch.nn.functional as F
 
 from einops import repeat, rearrange
 
-from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+try:
+    from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+except (ImportError, ModuleNotFoundError):
+    # Configuration and canonical GDN2 construction remain inspectable without
+    # importing the optional scan extension. Dechunking still requires the
+    # inspected scan kernel and raises explicitly when invoked without it.
+    mamba_chunk_scan_combined = None
 
 from hnet.modules.utils import get_seq_idx
 
@@ -224,6 +230,7 @@ class ChunkLayer(nn.Module):
         assert (mask is not None) or (
             cu_seqlens is not None
         ), "Either mask or cu_seqlens must be provided"
+        self.effective_boundary_mask = boundary_mask
 
         if cu_seqlens is not None:
             next_hidden_states = hidden_states[boundary_mask]
@@ -234,7 +241,18 @@ class ChunkLayer(nn.Module):
             next_mask = None
         else:
             next_cu_seqlens = None
-            num_tokens = boundary_mask.sum(dim=-1)
+            # The canonical fixed-shape graph uses a bounded latent stream.
+            # Keeping the earliest boundaries preserves causal order while
+            # preventing a pathological router batch from turning the inner
+            # full-attention block back into an 8K quadratic pass.
+            effective_boundary_mask = boundary_mask
+            if self.static_max_seqlen is not None and self.static_max_seqlen < hidden_states.shape[1]:
+                boundary_rank = boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                effective_boundary_mask = boundary_mask & (
+                    boundary_rank < int(self.static_max_seqlen)
+                )
+            self.effective_boundary_mask = effective_boundary_mask
+            num_tokens = effective_boundary_mask.sum(dim=-1)
             # CUDA graph capture cannot depend on a host read of a
             # data-dependent max. A configured static bound keeps all inner
             # tensors at one address/shape; the mask carries the true count.
@@ -242,10 +260,9 @@ class ChunkLayer(nn.Module):
             L = hidden_states.shape[1]
             if self.static_max_seqlen is not None:
                 next_max_seqlen = int(self.static_max_seqlen)
-                if next_max_seqlen < L:
+                if next_max_seqlen <= 0:
                     raise ValueError(
-                        "static_max_seqlen must be >= the input sequence length "
-                        f"({next_max_seqlen} < {L})"
+                        "static_max_seqlen must be positive"
                     )
             else:
                 next_max_seqlen = int(num_tokens.max())
@@ -259,10 +276,10 @@ class ChunkLayer(nn.Module):
                 # row is the exclusive prefix rank of the boolean mask;
                 # scattering avoids the per-row O(L log L) argsort. The
                 # sentinel column receives invalid rows and is discarded.
-                boundary_rank = boundary_mask.to(torch.int32).cumsum(dim=1) - 1
+                boundary_rank = effective_boundary_mask.to(torch.int32).cumsum(dim=1) - 1
                 sentinel = next_max_seqlen
                 scatter_rank = torch.where(
-                    boundary_mask,
+                    effective_boundary_mask,
                     boundary_rank,
                     torch.full_like(boundary_rank, sentinel),
                 )
@@ -280,7 +297,7 @@ class ChunkLayer(nn.Module):
                 # more than the radix sort; retain the gather path there.
                 token_idx = (
                     torch.arange(L, device=device)[None]
-                    + (~boundary_mask).long() * L
+                    + (~effective_boundary_mask).long() * L
                 )
                 seq_sorted_indices = torch.argsort(token_idx, dim=1)
                 if next_max_seqlen > L:
@@ -304,6 +321,7 @@ class ChunkLayer(nn.Module):
         return next_hidden_states, next_cu_seqlens, next_max_seqlen, next_mask
 
     def step(self, hidden_states, boundary_mask):
+        self.effective_boundary_mask = boundary_mask
         return hidden_states[boundary_mask]
 
 
@@ -322,7 +340,7 @@ class DeChunkLayer(nn.Module):
         self.d_model = d_model
         self.static_max_seqlen = static_max_seqlen
 
-        # Just for Mamba2 kernel.
+        # Parameters for the inspected causal scan kernel used by dechunking.
         self.dtype = dtype
         self.block_size = block_size
         self.headdim = headdim
@@ -353,6 +371,11 @@ class DeChunkLayer(nn.Module):
         inference_params=None,
         mask=None,
     ):
+        if mamba_chunk_scan_combined is None:
+            raise RuntimeError(
+                "DeChunkLayer requires the pinned dechunk scan extension; "
+                "the canonical model does not provide a Mamba fallback"
+            )
         if inference_params is not None:
             assert (
                 mask is not None
@@ -417,7 +440,7 @@ class DeChunkLayer(nn.Module):
                 )  # (B, M)
 
         original_dtype = hidden_states.dtype
-        # Reuse Mamba2 kernel for EMA Deaggregator.
+        # Use the inspected causal scan kernel for the EMA deaggregator.
         dt = torch.log(1 / (1 - p)).to(self.dtype)
         x = (hidden_states / dt[..., None]).to(self.dtype)
         A = self._A

@@ -1,116 +1,78 @@
 # H-Net
 
-<table width="100%">
-  <tr>
-    <td><img src="assets/english.gif" alt="English" width="100%"></td>
-    <td><img src="assets/code.gif" alt="Code" width="100%"></td>
-  </tr>
-  <tr>
-    <td><img src="assets/chinese.gif" alt="Chinese" width="100%"></td>
-    <td><img src="assets/korean.gif" alt="Korean" width="100%"></td>
-  </tr>
-</table>
+This checkout contains the canonical approximately 600M-parameter raw-byte H-Net
+trainer. It reads fixed UTF-8 byte IDs, applies a non-trainable byte lift, learns
+hierarchical chunk boundaries from the first update, and predicts the next byte
+with a trainable FP32 output head. There is no BPE tokenizer or trainable input
+embedding path.
 
-> **Dynamic Chunking for End-to-End Hierarchical Sequence Modeling**\
-> Sukjun Hwang, Brandon Wang, Albert Gu\
-> Paper: https://arxiv.org/abs/2507.07955
+## Production model
 
-## About
-![H-Net](assets/arch.png "H-Net Architecture")
+The single supported configuration is
+[`configs/hnet_1stage_600m_gdn2_lol_8192.json`](configs/hnet_1stage_600m_gdn2_lol_8192.json):
 
-This repository contains code of the H-Net architecture. Most of the code lies in `hnet/`, which has the following structure:
+- fixed sequence length 8192 bytes and a 2048-row latent cap;
+- encoder and decoder: `GDN2 -> LoL -> GDN2 -> LoL`;
+- middle trunk, repeated twice with tied GDN2 and FA weights:
+  `GDN2 -> LoL -> GDN2 -> LoL -> FA`;
+- GDN2 width 3072 (48 heads of 64), and LoL/FA width 1280
+  (20 query heads, 4 KV heads of 64);
+- LoL uses learned RoPE and shifted causal windows of 128 tokens;
+- FA uses causal NoPE GQA;
+- LoL/FA feed-forward blocks are eight-expert LatentMoE with grouped FP8
+  Transformer Engine projections;
+- FBT uses two trunk passes; the outer fixed-shape path is prepared for DDP,
+  pinned byte staging, compilation, and CUDA graph forward/backward capture.
 
-```
-configs/
-hnet/
-├── models/            # Directory for H-Net
-|   ├── config_hnet.py     (defines the config for the H-Net)
-|   ├── hnet.py            (h-net as a (B, L, D) -> (B, L, D) sequence model)
-│   └── mixer_seq.py       (wrapper to turn h-net into a language model)
-└── modules/           # Directory of model components
-    ├── dc.py              (modeling code for the dynamic chunking mechanism)
-    └── isotropic.py       (code for isotropic, i.e. non-hierarchical components)
-generate.py        # Script for inference/generation
-```
+The model requires the inspected external GDN2/cuDNN/FLa checkout and a working
+Transformer Engine PyTorch FP8 extension. Construction fails clearly when these
+pinned runtime dependencies are unavailable; no alternate architecture is
+silently substituted.
 
-## Installation
+## Training
 
-### Requirements:
-- PyTorch >= 2.5.1
-
-Clone the repository and install package.
-``` sh
-git clone https://github.com/goombalab/hnet
-cd hnet
-pip install -e .
-```
-
-
-We strongly recommend building **mamba_ssm** package from [**the latest source**](https://github.com/state-spaces/mamba) as follows:
-``` sh
-git clone https://github.com/state-spaces/mamba
-cd mamba
-pip install .
-```
-
-## Pretrained Models
-
-Pretrained models are uploaded to
-[Hugging Face](https://huggingface.co/cartesia-ai): `hnet_1stage_L`, `hnet_2stage_L`,
-`hnet_1stage_XL`, `hnet_2stage_XL`.
-We trained our models on the 100B-Token subset of [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu). <em>Large</em> and <em>XL</em> are compute-matched to GPT-3 <em>Large</em> and <em>XL</em>, respectively.
-
-We also provide model weights for Chinese and Code, each trained using the 46B-Token subset of [FineWeb-Edu Chinese V2.1](https://huggingface.co/datasets/opencsg/Fineweb-Edu-Chinese-V2.1) and [Pile Github](https://huggingface.co/datasets/EleutherAI/pile): `hnet_2stage_XL_chinese`, `hnet_2stage_XL_code`.
-
-You can find specifics of these models at [configs](configs), and more details from the paper.
-
-
-## Text Generation
-
-We provide [generate.py](generate.py) for text generation that you can use with the pretrained checkpoints.
-
-### Examples
-``` sh
-python generate.py --model-path [MODEL_CKPT] --config-path [CONFIG]
-python generate.py --model-path hnet_2stage_XL.pt --config-path configs/hnet_2stage_XL.json --max-tokens 1024 --temperature 1.0 --top-p 1.0
-```
-
-## Reproducing the byte-level check
-
-The Cartesia posts report large scaling ladders, so reproducing the exact
-curves requires their training data, distributed training runs, and evaluation
-suite. The released implementation and checkpoints do make the core result
-directly testable: an H-Net reads UTF-8 bytes, learns boundaries end to end, and
-produces byte logits. `scripts/reproduce_hnet.py` reports bits per byte,
-learned bytes per chunk, parameter count, and a deterministic completion.
-
-Download the authors' 1-stage Large checkpoint (2.7 GB), then run:
+Install the package in an environment containing the pinned CUDA extensions:
 
 ```sh
-mkdir -p checkpoints
-curl -L -o checkpoints/hnet_1stage_L.pt \
-  https://huggingface.co/cartesia-ai/hnet_1stage_L/resolve/main/hnet_1stage_L.pt
-python scripts/reproduce_hnet.py \
-  --checkpoint checkpoints/hnet_1stage_L.pt \
-  --config configs/hnet_1stage_L.json \
-  --text "The capital of France is" --generate 16
+uv pip install -e .
 ```
 
-On the Cartesia authors' checkpoint, the model has 679,405,312 parameters and
-greedy generation begins with `Paris.`. The exact bpb and chunk ratio depend on
-the supplied text. The blog's headline scaling results are the reported fitted
-multipliers: 1.28x H-Net vs. BPE on validation loss, 2.06x on OLMES, and 1.61x
-for validation-to-OLMES transfer. In the larger two-stage comparison, the
-reported H-Net is 3.67B parameters and 4.44 GFLOPs/byte versus SmolLM3's 3.08B
-and 4.36 GFLOPs/byte, reaching its final score after about 1T rather than 11T
-tokens.
+Prepare a raw UTF-8 byte file (for example from FineWeb-derived text) and run
+the complete fixed-shape model:
 
+```sh
+CUDA_VISIBLE_DEVICES=1 \
+GDN2_ROOT=/home/catid/gdn2 \
+PYTHONPATH=/home/catid/gdn2:/home/catid/gdn2-gb300/flash-linear-attention:/home/catid/cudnn132:/home/catid/cudnn132/nvidia_cutlass_dsl/dsl_packages \
+uv run python scripts/train_hnet_600m.py \
+  --data /path/to/fineweb.bytes \
+  --config configs/hnet_1stage_600m_gdn2_lol_8192.json \
+  --seq 8192 --batch 1
+```
+
+The trainer reports CE, bits per byte, routing loss, gradient norm, tokens per
+second, power, and held-out evaluation every 40 optimizer steps by default.
+Artifacts and checkpoints belong outside this source repository.
+
+## Layout
+
+```text
+configs/                         canonical model configuration
+hnet/models/                     H-Net hierarchy and byte language-model wrapper
+hnet/modules/dc.py               learned chunking and dechunking
+hnet/modules/gdn2_adapter.py     pinned external GDN2 loader
+hnet/modules/hybrid.py           GDN2, LoL, FA, and fixed-shape block stack
+hnet/modules/latent_moe.py       eight-expert FP8 LatentMoE
+hnet/utils/losses.py             router regularizer
+scripts/train_hnet_600m.py       full-system trainer
+scripts/optimizer_experiments.py GramNS/AnchorMuon and AdamATan2
+```
 
 ## Citation
 
-If you use this codebase, or otherwise find our work valuable, please cite H-Net:
+If you use the H-Net dynamic-chunking mechanism, cite:
 
-```
+```bibtex
 @article{hnet,
   title={Dynamic Chunking for End-to-End Hierarchical Sequence Modeling},
   author={Hwang, Sukjun and Wang, Brandon and Gu, Albert},

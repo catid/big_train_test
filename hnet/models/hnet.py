@@ -1,10 +1,9 @@
 from dataclasses import dataclass
-from typing import Union, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from hnet.modules.isotropic import Isotropic, IsotropicInferenceParams
 from hnet.modules.dc import (
     RoutingModule,
     ChunkLayer,
@@ -13,8 +12,6 @@ from hnet.modules.dc import (
     DeChunkState,
 )
 from hnet.modules.utils import apply_optimization_params
-from hnet.modules.rotary import LeRoPERegistry
-
 from .config_hnet import HNetConfig
 
 
@@ -34,11 +31,11 @@ def ste_func(x):
 
 @dataclass
 class HNetState:
-    encoder_state: Optional[IsotropicInferenceParams] = None
+    encoder_state: Optional[object] = None
     routing_module_state: Optional[RoutingModuleState] = None
-    main_network_state: Optional[Union["HNetState", IsotropicInferenceParams]] = None
+    main_network_state: Optional[object] = None
     dechunk_state: Optional[DeChunkState] = None
-    decoder_state: Optional[IsotropicInferenceParams] = None
+    decoder_state: Optional[object] = None
 
 
 class HNet(nn.Module):
@@ -48,7 +45,6 @@ class HNet(nn.Module):
         stage_idx: int,
         device=None,
         dtype=None,
-        lerope_registry=None,
     ) -> None:
         super().__init__()
 
@@ -57,12 +53,6 @@ class HNet(nn.Module):
 
         self.stage_idx = stage_idx
         self.d_model = config.d_model[stage_idx]
-        # The top-level hierarchy owns the shared LeRoPE bank.  Recursive
-        # stages receive the same object without registering another copy.
-        if lerope_registry is None:
-            self.lerope_registry = LeRoPERegistry()
-            lerope_registry = self.lerope_registry
-
         arch_layout = config.arch_layout
         for _ in range(stage_idx):
             arch_layout = arch_layout[1]
@@ -79,7 +69,9 @@ class HNet(nn.Module):
 
         for _name, _layout in zip(sub_model_names, arch_layout):
             if self.is_innermost or _name in ("encoder", "decoder"):
-                SubModel = Isotropic
+                # Every production stack is built from the explicit GDN2,
+                # LoL, and FA library.  There is no alternate mixer factory.
+                from hnet.modules.hybrid import HybridStack as SubModel
                 _stage_idx = stage_idx
                 _pos_idx = None
                 if _name == "encoder":
@@ -99,19 +91,48 @@ class HNet(nn.Module):
                 config=config,
                 stage_idx=_stage_idx,
                 **_pos_idx_dict,
-                lerope_registry=lerope_registry,
                 **factory_kwargs,
             )
             self.add_module(_name, _sub_model)
 
         if not self.is_innermost:
+            # Named-library stages intentionally use a 3072-channel byte
+            # stream and a 1280-channel latent trunk.  The original H-Net
+            # implementation only padded upward, which would feed a wider
+            # tensor into a narrower inner stack and fail at its first norm.
+            # Make the hierarchy boundary explicit and reversible.
+            inner_width = int(self.main_network.d_model)
+            if inner_width != self.d_model:
+                self.main_network_input_proj = nn.Linear(
+                    self.d_model, inner_width, bias=False, **factory_kwargs
+                )
+                self.main_network_output_proj = nn.Linear(
+                    inner_width, self.d_model, bias=False, **factory_kwargs
+                )
+            else:
+                self.main_network_input_proj = nn.Identity()
+                self.main_network_output_proj = nn.Identity()
+
             self.routing_module = RoutingModule(self.d_model, **factory_kwargs)
-            self.chunk_layer = ChunkLayer(
-                static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None)
-            )
+            # ``max_seq_len`` is the byte-stream capacity.  The inner FA must
+            # use the separately configured latent capacity; conflating these
+            # two values silently turns an 8K byte batch into an 8K latent
+            # quadratic pass.
+            static_latent_seqlen = None
+            if getattr(config, "static_chunking", False):
+                static_latent_seqlen = getattr(config, "latent_max_seq_len", None)
+                if static_latent_seqlen is None:
+                    static_latent_seqlen = config.max_seq_len
+                static_latent_seqlen = int(static_latent_seqlen)
+                if static_latent_seqlen <= 0 or static_latent_seqlen > int(config.max_seq_len):
+                    raise ValueError(
+                        "latent_max_seq_len must be positive and no larger than max_seq_len "
+                        f"({static_latent_seqlen}, {config.max_seq_len})"
+                    )
+            self.chunk_layer = ChunkLayer(static_max_seqlen=static_latent_seqlen)
             self.dechunk_layer = DeChunkLayer(
                 self.d_model,
-                static_max_seqlen=(config.max_seq_len if getattr(config, "static_chunking", False) else None),
+                static_max_seqlen=static_latent_seqlen,
                 device=device,
             )
 
@@ -198,6 +219,8 @@ class HNet(nn.Module):
             init_linear_modules(self.decoder, n_residuals)
                     
             self.main_network._init_weights(initializer_range, n_residuals)
+            init_linear_modules(self.main_network_input_proj, n_residuals)
+            init_linear_modules(self.main_network_output_proj, n_residuals)
     
 
     def _apply_lr_multiplier(self, lr_multiplier: list[float]) -> None:
@@ -211,48 +234,16 @@ class HNet(nn.Module):
         if not self.is_innermost:
             self.main_network._apply_lr_multiplier(lr_multiplier)
 
-    def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
-        """
-        Allocate the inference cache for the HNet.
-
-        Arguments:
-            batch_size: int. The number of sequences in the batch.
-            max_seqlen: int. The maximum sequence length in the batch.
-            dtype: torch.dtype. The dtype of the inference cache.
-
-        The structure of the inference cache is as follows:
-            - [encoder state]
-            - [routing module state]
-            - [main network state]
-            - [dechunk state]
-            - [decoder state]
-        It is thus a list of length 5.
-        """
-        if self.is_innermost:
-            return HNetState(
-                main_network_state=self.main_network.allocate_inference_cache(
-                    batch_size, max_seqlen, dtype=dtype
-                )
-            )
-        else:
-            device = self.residual_proj.weight.device
-            return HNetState(
-                encoder_state=self.encoder.allocate_inference_cache(
-                    batch_size, max_seqlen, dtype=dtype
-                ),
-                routing_module_state=self.routing_module.allocate_inference_cache(
-                    batch_size, max_seqlen, device, dtype=dtype
-                ),
-                main_network_state=self.main_network.allocate_inference_cache(
-                    batch_size, max_seqlen, dtype=dtype
-                ),
-                dechunk_state=self.dechunk_layer.allocate_inference_cache(
-                    batch_size, max_seqlen, device, dtype=dtype
-                ),
-                decoder_state=self.decoder.allocate_inference_cache(
-                    batch_size, max_seqlen, dtype=dtype
-                ),
-            )
+    def compile_blocks(self, *, mode="max-autotune-no-cudagraphs"):
+        """Compile unique static LoL/FA blocks before DDP/graph capture."""
+        count = 0
+        for module in self.modules():
+            if module is self:
+                continue
+            compile_fn = getattr(module, "compile_blocks", None)
+            if compile_fn is not None and module.__class__.__name__ == "HybridStack":
+                count += int(compile_fn(mode=mode))
+        return count
 
     def forward(
         self,
@@ -321,6 +312,10 @@ class HNet(nn.Module):
         hidden_states, next_cu_seqlens, next_max_seqlen, next_mask = self.chunk_layer(
             hidden_states, bpred_output.boundary_mask, cu_seqlens, mask=mask
         )
+        # ChunkLayer may enforce the canonical static latent capacity.  The
+        # dechunker must consume the same effective boundary set, otherwise it
+        # would index a shorter latent stream with the uncapped route mask.
+        bpred_output.boundary_mask = self.chunk_layer.effective_boundary_mask
 
         n_passes = max(1, int(fbt_passes)) if self.fbt_enabled else 1
         # A normal one-pass prefill must populate the allocated recurrent/KV
@@ -387,8 +382,8 @@ class HNet(nn.Module):
                             )[None, :]
                             plain = (positions < prefix[:, None]) & next_mask
                         else:
-                            # A fixed midpoint is used only when no valid-count
-                            # mask is available (legacy eager packed input).
+                            # A fixed midpoint is used when no valid-count mask
+                            # is available for an eager packed input.
                             plain[:, : pass_input.shape[1] // 2] = True
                     else:
                         # Draw one uniformly random cutoff per document on the
@@ -410,14 +405,16 @@ class HNet(nn.Module):
                         offsets = positions - doc_starts.index_select(0, doc_idx)
                         plain = offsets < prefix.index_select(0, doc_idx)
                     pass_input = torch.where(plain.unsqueeze(-1), base_chunk_states, pass_input)
+            inner_input = self.main_network_input_proj(pass_input)
             inner_out, prev_boundary_predictions = self.main_network(
-                pass_input,
+                inner_input,
                 cu_seqlens=next_cu_seqlens,
                 max_seqlen=next_max_seqlen,
                 mask=next_mask,
                 inference_params=cached_main_state,
                 **mixer_kwargs,
             )
+            inner_out = self.main_network_output_proj(inner_out)
             previous_inner = inner_out
             final_prev_boundary_predictions = prev_boundary_predictions
 
@@ -449,58 +446,3 @@ class HNet(nn.Module):
         if return_feedback:
             return hidden_states, result, feedback_logits
         return hidden_states, result
-
-    def step(self, hidden_states, inference_params):
-        D = hidden_states.shape[-1]
-
-        if self.pad_dimension is not None:
-            hidden_states = torch.cat(
-                (
-                    hidden_states,
-                    self.pad_dimension.expand(hidden_states.shape[:-1] + (-1,)),
-                ),
-                dim=-1,
-            )
-
-        if self.is_innermost:
-            hidden_states = self.main_network.step(
-                hidden_states, inference_params.main_network_state
-            )
-            hidden_states = hidden_states[..., :D]
-            return hidden_states, []
-
-        hidden_states = self.encoder.step(hidden_states, inference_params.encoder_state)
-        hidden_states_for_residual = hidden_states.to(
-            dtype=self.residual_proj.weight.dtype
-        )
-        residual = self.residual_proj(hidden_states_for_residual)
-
-        bpred_output = self.routing_module.step(
-            hidden_states, inference_params.routing_module_state
-        )
-        hidden_states_inner = self.chunk_layer.step(
-            hidden_states, bpred_output.boundary_mask
-        )
-
-        if hidden_states_inner.shape[0] > 0:
-            hidden_states_inner, prev_boundary_predictions = self.main_network.step(
-                hidden_states_inner, inference_params.main_network_state
-            )
-        else:
-            prev_boundary_predictions = []
-
-        hidden_states = self.dechunk_layer.step(
-            hidden_states_inner,
-            bpred_output.boundary_mask,
-            bpred_output.boundary_prob,
-            inference_params.dechunk_state,
-        )
-
-        hidden_states = self.residual_func(
-            hidden_states.to(dtype=residual.dtype), residual, bpred_output.selected_probs
-        ).to(hidden_states.dtype)
-
-        hidden_states = self.decoder.step(hidden_states, inference_params.decoder_state)
-        hidden_states = hidden_states[..., :D]
-
-        return hidden_states, [bpred_output, *prev_boundary_predictions]

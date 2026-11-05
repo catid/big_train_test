@@ -22,16 +22,19 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from hnet.models.config_hnet import AttnConfig, HNetConfig, SSMConfig
+from hnet.models.config_hnet import HNetConfig
 from hnet.models.mixer_seq import HNetForByteCausalLM
-from hnet.utils.train import load_balancing_loss
+from hnet.utils.losses import load_balancing_loss
 
 
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", required=True, help="raw UTF-8 byte stream")
-    p.add_argument("--config", default="configs/hnet_1stage_600m_loop2.json")
-    p.add_argument("--seq", type=int, default=4096)
+    p.add_argument(
+        "--config", default="configs/hnet_1stage_600m_gdn2_lol_8192.json",
+        help="canonical fixed-shape GDN2/LoL/FA H-Net configuration",
+    )
+    p.add_argument("--seq", type=int, default=8192)
     p.add_argument("--batch", type=int, default=1)
     p.add_argument("--steps", type=int, default=100000)
     p.add_argument("--warmup", type=int, default=2000)
@@ -82,6 +85,11 @@ class ByteStream:
         # buffer is actually being reused.  The ring is tiny relative to the
         # model and lets the next H2D copy overlap the previous step.
         if torch.cuda.is_available():
+            # Keep host-to-device copies on a dedicated stream.  The caller's
+            # compute stream waits on the per-slot event below, allowing the
+            # next batch transfer to overlap the previous forward/backward
+            # replay instead of queueing behind it.
+            self._copy_stream = torch.cuda.Stream(device=torch.cuda.current_device())
             self._staged = [
                 (
                     torch.empty((batch, seq), dtype=torch.uint8, pin_memory=True),
@@ -126,10 +134,14 @@ class ByteStream:
         sx, sy = self._staged[slot]
         sx.copy_(x)
         sy.copy_(y)
-        stream = torch.cuda.current_stream(device)
-        out_x = sx.to(device=device, non_blocking=True)
-        out_y = sy.to(device=device, non_blocking=True)
-        self._stage_events[slot].record(stream)
+        with torch.cuda.stream(self._copy_stream):
+            out_x = sx.to(device=device, non_blocking=True)
+            out_y = sy.to(device=device, non_blocking=True)
+            self._stage_events[slot].record(self._copy_stream)
+        # This is an asynchronous dependency insertion, not a host
+        # synchronization.  The graph/eager consumer can now overlap
+        # the transfer with work already queued on other streams.
+        torch.cuda.current_stream(device).wait_event(self._stage_events[slot])
         self._stage_used[slot] = True
         return out_x, out_y
 
@@ -150,21 +162,22 @@ class ByteStream:
         sx, sy = self._staged[slot]
         sx.copy_(x)
         sy.copy_(y)
-        stream = torch.cuda.current_stream(device)
-        out_x = sx.to(device=device, non_blocking=True)
-        out_y = sy.to(device=device, non_blocking=True)
-        self._stage_events[slot].record(stream)
+        with torch.cuda.stream(self._copy_stream):
+            out_x = sx.to(device=device, non_blocking=True)
+            out_y = sy.to(device=device, non_blocking=True)
+            self._stage_events[slot].record(self._copy_stream)
+        torch.cuda.current_stream(device).wait_event(self._stage_events[slot])
         self._stage_used[slot] = True
         return out_x, out_y
 
 
 def load_config(path):
     raw = json.loads(Path(path).read_text())
-    return HNetConfig(
-        **{k: v for k, v in raw.items() if k not in {"attn_cfg", "ssm_cfg"}},
-        attn_cfg=AttnConfig(**raw["attn_cfg"]),
-        ssm_cfg=SSMConfig(**raw["ssm_cfg"]),
-    )
+    config = HNetConfig(**raw)
+    # Validate the canonical dimensions before DDP workers and CUDA extensions
+    # are initialized.
+    config.validate_static_shapes(seq_len=config.max_seq_len)
+    return config
 
 
 def init_dist():
@@ -182,13 +195,8 @@ def annotate_decay(model):
         if (
             name.endswith(".bias")
             or "norm" in name.lower()
-            or "msar_bias" in name
-            or getattr(p, "_lerope_frequency", False)
         ):
             p._no_weight_decay = True
-            # LeRoPE explicitly excludes its log-frequency scales from
-            # AnchorMuon's SODA pull toward the initialization.
-            p._no_soda = True
 
 
 def make_optimizer(model, args):
@@ -339,6 +347,13 @@ class GraphStep:
         self.capture_stream = capture_stream or torch.cuda.Stream(device=x.device)
         self.x = torch.zeros_like(x)
         self.y = torch.zeros_like(y)
+        # Warm up and capture with a real production batch.  Routing and FBT
+        # use the byte values to populate masks and prefix metadata; warming
+        # up on all-zero tensors can therefore exercise a different route
+        # distribution from replay and leave value-dependent kernels or
+        # graph-safe dispatch buffers uninitialized for the actual stream.
+        self.x.copy_(x)
+        self.y.copy_(y)
         self.static_loss = torch.zeros((), device=x.device)
         self.static_ratio = torch.zeros((), device=x.device, dtype=torch.float32)
         self.graph = torch.cuda.CUDAGraph()
@@ -384,7 +399,7 @@ class GraphStep:
         finite = bool(torch.isfinite(self.static_loss) and torch.isfinite(grad_norm))
         if finite:
             self.optimizer.step()
-        return self.static_loss, self.static_ratio, finite
+        return self.static_loss, self.static_ratio, finite, grad_norm
 
 
 def main():
@@ -393,7 +408,12 @@ def main():
     torch.manual_seed(1729 + rank)
     cfg = load_config(args.config)
     cfg.max_seq_len = args.seq
+    cfg.validate_static_shapes(seq_len=args.seq)
     model = HNetForByteCausalLM(cfg, device=device, dtype=torch.bfloat16).train()
+    if getattr(cfg, "compile_blocks", False):
+        compiled = model.compile_blocks()
+        if rank == 0:
+            print(f"compiled static LoL/FA blocks={compiled}", flush=True)
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if rank == 0:
         print(f"H-Net params={n_params:,} trainable; byte_lift_params=0; world={world}", flush=True)
@@ -436,7 +456,9 @@ def main():
         "world": world,
         "loss": [],
         "ratio": [],
+        "grad_norm": [],
         "time_ms": [],
+        "tokens_per_sec": [],
         "nonfinite": [],
         "eval": [],
     }
@@ -458,7 +480,7 @@ def main():
         else:
             t0 = time.perf_counter()
         if graph_step is not None:
-            loss, ratio, finite = graph_step(x, y)
+            loss, ratio, finite, grad_norm = graph_step(x, y)
             if not finite:
                 log["nonfinite"].append(step)
         else:
@@ -497,11 +519,19 @@ def main():
             ratio_value = None
         log["loss"].append(reduced_value)
         log["ratio"].append(ratio_value)
+        grad_norm_value = float(grad_norm.detach().float()) if report_step else None
+        log["grad_norm"].append(grad_norm_value)
         log["time_ms"].append(elapsed)
+        tokens_per_sec = (
+            (args.batch * args.seq * world) / (elapsed / 1e3)
+            if elapsed is not None and elapsed > 0 else None
+        )
+        log["tokens_per_sec"].append(tokens_per_sec)
         if should_log:
             power = read_power_watts()
             print(
                 f"step={step} loss={reduced_value:.6f} time_ms={elapsed:.1f} "
+                f"grad_norm={grad_norm_value:.4f} tokens/s={tokens_per_sec / 1e6:.3f}M "
                 f"power_w={','.join(f'{x:.0f}' for x in power) or 'n/a'}",
                 flush=True,
             )

@@ -1,0 +1,71 @@
+{
+    "arch_layout": [
+        "GDN2,LoL,GDN2,LoL",
+        ["GDN2,LoL,GDN2,LoL,FA"],
+        "GDN2,LoL,GDN2,LoL"
+    ],
+    "d_model": [3072, 1280],
+    "vocab_size": 256,
+    "inner_loops": 2,
+    "fbt": true,
+    "fbt_jitter": 0.02,
+    "fbt_prefix_mixin": true,
+    "moe_num_experts": 8,
+    "moe_top_k": 4,
+    "moe_latent_alpha": 2,
+    "moe_matched": true,
+    "max_seq_len": 8192,
+    "latent_max_seq_len": 2048,
+    "canonical_seq_len": 8192,
+    "static_chunking": true,
+    "static_full_sequence": true,
+    "compile_blocks": true,
+
+    "gdn2_module": "lit_gpt.gdn2:GatedDeltaNet2",
+    "gdn2_hidden_size": 3072,
+    "gdn2_num_heads": 48,
+    "gdn2_head_dim": 64,
+    "gdn2_expand_v": 2.0,
+    "gdn2_backend": "cudnn",
+    "gdn2_use_short_conv": false,
+    "gdn2_fused_projections": true,
+    "gdn2_disable_recompute": true,
+    "lol_window_size": 128,
+    "lol_hidden_size": 1280,
+    "lol_ffn_width": 1536,
+    "lol_num_heads": 20,
+    "lol_kv_heads": 4,
+    "lol_head_dim": 64,
+    "fa_num_heads": 20,
+    "fa_kv_heads": 4,
+    "fa_head_dim": 64,
+
+    "library_weight_sharing": {
+        "middle_gdn2": true,
+        "middle_fa": true,
+        "middle_lol": false,
+        "bridges": false
+    },
+    "library_block_widths": {
+        "outer": 3072,
+        "latent": 1280,
+        "encoder": [3072, 1280, 3072, 1280],
+        "middle_repeat": [3072, 1280, 3072, 1280, 1280],
+        "decoder": [3072, 1280, 3072, 1280],
+        "handoff": "linear 3072<->1280 at every named-width transition"
+    },
+    "external_dependencies": {
+        "gdn2": {
+            "repository": "/home/catid/gdn2",
+            "commit": "5ec53d5",
+            "required_symbol": "lit_gpt.gdn2:GatedDeltaNet2",
+            "backend": "cudnn",
+            "note": "Load only after dependency and license checks; no in-tree fallback."
+        },
+        "lol": {
+            "repository": "/home/catid/library_of_layers",
+            "commit": "03b85f4",
+            "note": "Named LoL/FA blocks require the integrated fixed-shape dispatcher."
+        }
+    }
+}

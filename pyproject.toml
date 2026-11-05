@@ -17,9 +17,6 @@ dependencies = [
     "flash_attn==2.8.0.post2",
     "causal_conv1d @ git+https://github.com/Dao-AILab/causal-conv1d.git@e940ead2fd962c56854455017541384909ca669f",
     "einops",
-    "optree",
-    "regex",
-    "omegaconf",
 ]
 [project.urls]
 Repository = "https://github.com/goombalab/hnet"

@@ -75,21 +75,16 @@ def matched_expert_width(
 
 
 class _ExpertMLP(nn.Module):
-    """SwiGLU expert with optional Transformer Engine FP8 linears."""
+    """Full-width shared SwiGLU expert using Transformer Engine FP8 linears."""
 
-    def __init__(self, d_in: int, d_hidden: int, *, bias: bool, device, dtype, fp8: bool):
+    def __init__(self, d_in: int, d_hidden: int, *, device, dtype):
         super().__init__()
-        self.fp8 = bool(fp8)
-        if fp8:
-            try:
-                import transformer_engine.pytorch as te
-            except ImportError as exc:  # explicit configuration error, never silent fallback
-                raise ImportError("LatentMoE fp8=True requires Transformer Engine") from exc
-            self.fc1 = te.Linear(d_in, 2 * d_hidden, bias=bias, device=device, params_dtype=dtype)
-            self.fc2 = te.Linear(d_hidden, d_in, bias=bias, device=device, params_dtype=dtype)
-        else:
-            self.fc1 = nn.Linear(d_in, 2 * d_hidden, bias=bias, device=device, dtype=dtype)
-            self.fc2 = nn.Linear(d_hidden, d_in, bias=bias, device=device, dtype=dtype)
+        try:
+            import transformer_engine.pytorch as te
+        except ImportError as exc:
+            raise ImportError("LatentMoE requires Transformer Engine FP8") from exc
+        self.fc1 = te.Linear(d_in, 2 * d_hidden, bias=False, device=device, params_dtype=dtype)
+        self.fc2 = te.Linear(d_hidden, d_in, bias=False, device=device, params_dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:
         # TE's FP8 GEMM requires the flattened token dimension to be a
@@ -99,7 +94,7 @@ class _ExpertMLP(nn.Module):
         # rows afterward.  This keeps the full production FP8 path enabled
         # without changing routing probabilities or sequence boundaries.
         rows = x.shape[0]
-        pad_rows = (-rows) % 8 if self.fp8 else 0
+        pad_rows = (-rows) % 8
         if pad_rows:
             x = F.pad(x, (0, 0, 0, pad_rows))
         a, gate = self.fc1(x).chunk(2, dim=-1)
@@ -167,7 +162,6 @@ class LatentMoE(nn.Module):
     num_experts: int = 8
     latent_alpha: int = 2
     top_k: int = 4
-    num_shared_experts: int = 1
 
     def __init__(
         self,
@@ -176,12 +170,9 @@ class LatentMoE(nn.Module):
         *,
         num_experts: int = 8,
         top_k: int = 4,
-    latent_alpha: int = 2,
-        num_shared_experts: int = 1,
-        bias: bool = False,
+        latent_alpha: int = 2,
         device=None,
         dtype=None,
-        fp8: bool = False,
         aux_loss_coef: float = 1e-2,
         z_loss_coef: float = 1e-3,
     ) -> None:
@@ -192,14 +183,11 @@ class LatentMoE(nn.Module):
             raise ValueError("latent_alpha must be a positive divisor of d_model")
         if not 1 <= top_k <= num_experts:
             raise ValueError("top_k must be in [1, 8]")
-        if num_shared_experts != 1:
-            raise ValueError("The production architecture requires one shared expert")
         self.d_model = int(d_model)
         self.latent_dim = d_model // latent_alpha
         self.num_experts = num_experts
         self.top_k = top_k
         self.latent_alpha = latent_alpha
-        self.fp8 = bool(fp8)
         self.aux_loss_coef = float(aux_loss_coef)
         self.z_loss_coef = float(z_loss_coef)
         # Match the complete dense SwiGLU matrix budget while retaining the
@@ -219,26 +207,14 @@ class LatentMoE(nn.Module):
         # expert projections in BF16/FP8.
         router_factory = {"device": device, "dtype": torch.float32}
         self.router = nn.Linear(d_model, num_experts, bias=False, **router_factory)
-        self.down = nn.Linear(d_model, self.latent_dim, bias=bias, **factory)
-        self.up = nn.Linear(self.latent_dim, d_model, bias=bias, **factory)
-        if fp8:
-            if bias:
-                raise ValueError("grouped FP8 LatentMoE experts require bias=False")
-            self.grouped_experts = _GroupedExpertMLP(
-                num_experts, self.latent_dim, self.routed_intermediate,
-                device=device, dtype=dtype,
-            )
-            self.experts = None
-        else:
-            self.grouped_experts = None
-            self.experts = nn.ModuleList(
-                _ExpertMLP(self.latent_dim, self.routed_intermediate, bias=bias,
-                           device=device, dtype=dtype, fp8=False)
-                for _ in range(num_experts)
-            )
+        self.down = nn.Linear(d_model, self.latent_dim, bias=False, **factory)
+        self.up = nn.Linear(self.latent_dim, d_model, bias=False, **factory)
+        self.grouped_experts = _GroupedExpertMLP(
+            num_experts, self.latent_dim, self.routed_intermediate,
+            device=device, dtype=dtype,
+        )
         self.shared_expert = _ExpertMLP(
-            d_model, self.shared_intermediate, bias=bias,
-            device=device, dtype=dtype, fp8=fp8,
+            d_model, self.shared_intermediate, device=device, dtype=dtype,
         )
         self.register_buffer("last_aux_loss", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("last_z_loss", torch.zeros((), dtype=torch.float32), persistent=False)
@@ -271,8 +247,6 @@ class LatentMoE(nn.Module):
         return splits
 
     def _fp8_context(self):
-        if not self.fp8:
-            return nullcontext()
         global _FP8_RECIPE
         import transformer_engine.pytorch as te
         # ``common`` is a separate package in current Transformer Engine
@@ -375,22 +349,6 @@ class LatentMoE(nn.Module):
             # avoids padding work and, unlike a fixed-capacity graph buffer,
             # never drops assignments when the router is temporarily skewed.
             counts = torch.bincount(sorted_experts, minlength=self.num_experts)
-            if self.grouped_experts is None:
-                result = torch.zeros_like(latent, dtype=torch.float32)
-                start = 0
-                context = self._fp8_context() if fp8_context else nullcontext()
-                with context:
-                    for expert_id, count in enumerate(counts.tolist()):
-                        end = start + count
-                        if count:
-                            out = self.experts[expert_id](latent[sorted_tokens[start:end]])
-                            result.index_add_(
-                                0,
-                                sorted_tokens[start:end],
-                                out.float() * sorted_weights[start:end, None],
-                            )
-                        start = end
-                return result
             # Eager grouped dispatch keeps exact variable expert counts, so it
             # does not pay graph-capacity padding.  The host read is outside
             # capture and is already required by TE's grouped metadata API.
@@ -417,7 +375,7 @@ class LatentMoE(nn.Module):
             # Populate the graph-capacity metadata during eager warmup.  The
             # exact variable-size metadata remains used for this eager call.
             if self.grouped_experts is not None:
-                align = 8 if self.fp8 else 1
+                align = 8
                 graph_capacity = ((latent.shape[0] + align - 1) // align) * align
                 self._ensure_graph_grouped_splits(graph_capacity)
             m_splits = torch.tensor(rounded, dtype=torch.int64)
@@ -442,7 +400,7 @@ class LatentMoE(nn.Module):
         # Give every expert a fixed, alignment-padded segment.  The segment
         # count depends only on the static activation shape, never on routing
         # data, so this remains valid during CUDA graph capture.
-        align = 8 if self.fp8 else 1
+        align = 8
         slots = sorted_experts.numel()
         # Graph capture has no variable-shape allocation.  Keep one
         # token-count segment per expert; this is large enough for the normal
@@ -475,18 +433,10 @@ class LatentMoE(nn.Module):
         )
         context = self._fp8_context() if fp8_context else nullcontext()
         with context:
-            if self.grouped_experts is not None:
-                # A CPU split tensor is safe for TE's internal ``tolist``
-                # conversion during capture and remains constant on replay.
-                m_splits = self._ensure_graph_grouped_splits(capacity)
-                packed_out = self.grouped_experts(packed, m_splits)
-            else:
-                packed_out = torch.empty_like(packed)
-                for expert_id in range(self.num_experts):
-                    start = expert_id * capacity
-                    packed_out[start : start + capacity] = self.experts[expert_id](
-                        packed[start : start + capacity]
-                    )
+            # A CPU split tensor is safe for TE's internal ``tolist``
+            # conversion during capture and remains constant on replay.
+            m_splits = self._ensure_graph_grouped_splits(capacity)
+            packed_out = self.grouped_experts(packed, m_splits)
             selected = packed_out.index_select(0, safe_destinations)
         selected = selected * valid_slots.to(dtype=selected.dtype).unsqueeze(-1)
         result.index_add_(0, sorted_tokens, selected.float() * sorted_weights[:, None])
@@ -583,4 +533,4 @@ class LatentMoE(nn.Module):
     def extra_repr(self) -> str:
         return (f"d_model={self.d_model}, latent={self.latent_dim}, experts={self.num_experts}, "
                 f"top_k={self.top_k}, routed_m={self.routed_intermediate}, "
-                f"shared_m={self.shared_intermediate}, fp8={self.fp8}")
+                f"shared_m={self.shared_intermediate}, fp8=True")
