@@ -22,12 +22,20 @@ The single supported configuration is
 - LoL/FA feed-forward blocks are eight-expert LatentMoE with grouped FP8
   Transformer Engine projections;
 - FBT uses two trunk passes; the outer fixed-shape path is prepared for DDP,
-  pinned byte staging, compilation, and CUDA graph forward/backward capture.
+  pinned byte staging, and CUDA graph forward/backward capture. `torch.compile`
+  was benchmarked at the exact shape and is disabled in the canonical config:
+  it adds a long autotune/compile pause and is slower warm than eager execution.
 
 The model requires the inspected external GDN2/cuDNN/FLa checkout and a working
 Transformer Engine PyTorch FP8 extension. Construction fails clearly when these
 pinned runtime dependencies are unavailable; no alternate architecture is
 silently substituted.
+
+The reference audit and evidence checklist for stability work is in
+[`docs/research/stability_and_speed_references.md`](docs/research/stability_and_speed_references.md).
+It records the exact dependency revisions inspected, measured eager/graph/
+compile results, and the parity, causality, checkpoint, DDP, and numerical
+diagnostics that remain required before a long run.
 
 ## Training
 

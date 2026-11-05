@@ -90,8 +90,8 @@ class HNetConfig:
             raise ValueError("the production model requires max_seq_len=8192")
         if int(self.canonical_seq_len) != 8192 or int(self.latent_max_seq_len or 0) != 2048:
             raise ValueError("the production model requires canonical_seq_len=8192 and latent_max_seq_len=2048")
-        if not self.fbt or not self.static_full_sequence or not self.compile_blocks:
-            raise ValueError("the production model requires FBT, static shapes, and compilation")
+        if not self.fbt or not self.static_full_sequence:
+            raise ValueError("the production model requires FBT and static shapes")
         if not self.static_chunking:
             raise ValueError("canonical named-library training requires static_chunking=true")
         if len(self.d_model) < 2:

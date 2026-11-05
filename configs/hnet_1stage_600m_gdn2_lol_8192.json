@@ -19,7 +19,7 @@
     "canonical_seq_len": 8192,
     "static_chunking": true,
     "static_full_sequence": true,
-    "compile_blocks": true,
+    "compile_blocks": false,
 
     "gdn2_module": "lit_gpt.gdn2:GatedDeltaNet2",
     "gdn2_hidden_size": 3072,
