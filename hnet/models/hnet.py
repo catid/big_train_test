@@ -98,7 +98,7 @@ class HNet(nn.Module):
             self.chunk_layer = ChunkLayer(
                 static_max_seqlen=(
                     min(
-                        int(getattr(config, "max_seq_len", 4096)),
+                        int(getattr(config, "max_seq_len", 8192)),
                         int(getattr(config, "chunk_capacity_tokens", 1024)),
                     )
                     if getattr(config, "static_chunking", False)

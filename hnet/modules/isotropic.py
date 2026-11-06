@@ -70,7 +70,7 @@ _msar_score = torch.compile(
 # The production padded graph makes most of its score calls with one query
 # column (the current MSAR source).  Dynamic Inductor guards keep this helper
 # reusable for packed/eval shapes, but they also force a more conservative
-# reduction schedule for the fixed B18/S4096 graph.  Keep a static singleton
+# reduction schedule for the historical fixed B18/S4096 graph.  Keep a static singleton
 # specialization alongside the dynamic path.  It specializes only the query
 # width of one, while the source count remains a normal shape guard and is
 # compiled once for each fixed source bank during graph warmup.

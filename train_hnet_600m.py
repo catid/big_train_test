@@ -43,12 +43,13 @@ CANONICAL_CONFIG = Path(__file__).resolve().parent / "configs" / "hnet_1stage_60
 FBT_PASSES = 2
 CANONICAL_CUDA_GRAPHS = True
 ADAM_ATAN2_LR_RATIO = 0.5
-# With activation recomputation disabled, B=18 at S=4096 is the largest
-# validated complete full-model step with optimizer state on a B300. B=20
-# and larger exhaust the CUDA graph pool during the first complete update.
-# Power calibration still chooses a smaller shape when the per-GPU target is
-# reached before this bound.
-CANONICAL_MAX_BATCH = 18
+# S=8192 is the canonical byte shape. The prior S=4096 B=18 cap is not
+# transferable because activation and byte-side mixer storage scale with S.
+# The complete S=8192 graph path is finite through B=16. B=32 completes eager
+# calibration but exhausts the CUDA graph pool during MSAR capture, so keep the
+# production sweep at the highest graph-validated shape until capture-aware
+# calibration is implemented and measured.
+CANONICAL_MAX_BATCH = 16
 
 
 def parse_args():
@@ -63,12 +64,12 @@ def parse_args():
         default=None,
         help="optional explicit data path; it must match the manifest data_path",
     )
-    p.add_argument("--seq", type=int, default=4096)
+    p.add_argument("--seq", type=int, default=8192)
     p.add_argument(
         "--auto-batch-max",
         type=int,
         default=CANONICAL_MAX_BATCH,
-        help="upper bound for power-calibration candidates (validated complete-step cap is 18)",
+        help="upper bound for S=8192 power-calibration candidates (graph-validated cap is 16)",
     )
     p.add_argument("--data-seed", type=int, default=1729)
     p.add_argument(
@@ -102,8 +103,8 @@ def parse_args():
     p.add_argument(
         "--ratio-target",
         type=float,
-        default=8.0,
-        help="target byte-to-latent ratio; 8 matches 4096 tokens and 512 latent capacity",
+        default=16.0,
+        help="target byte-to-latent ratio; 16 matches 8192 bytes and 512 latent capacity",
     )
     p.add_argument(
         "--target-ce",
@@ -181,9 +182,9 @@ def parse_args():
 
 def _validate_schedule_args(args):
     """Validate the canonical warmup + WSqD schedule parameters."""
-    if int(args.seq) != 4096:
+    if int(args.seq) != 8192:
         raise ValueError(
-            "the canonical full-system trainer requires --seq=4096; "
+            "the canonical full-system trainer requires --seq=8192; "
             "shorter sequence shapes are unsupported"
         )
     if int(args.warmup) < 0:
@@ -1381,13 +1382,11 @@ def _validate_resume(checkpoint, cfg, args, n_params, world, runtime):
     if saved_cfg is not None:
         expected = _config_dict(cfg)
         saved_cfg = _config_dict(saved_cfg)
-        # Ignore max_seq_len from old checkpoints whose config was saved
-        # before the command-line sequence length was applied.
+        # Sequence length is part of the static graph and byte-loader
+        # contract. It must remain in the architecture signature: accepting a
+        # 4096-byte checkpoint here would restore weights/optimizer state into
+        # an 8192-byte graph with a different activation and data trajectory.
         if isinstance(saved_cfg, dict):
-            saved_cfg = dict(saved_cfg)
-            saved_cfg.pop("max_seq_len", None)
-            expected = dict(expected)
-            expected.pop("max_seq_len", None)
             if saved_cfg != expected:
                 raise ValueError("resume architecture/configuration does not match current config")
 
@@ -1983,14 +1982,14 @@ def calibrate_batch_to_power(model, optimizer, args, device, rank, world):
     if device.type != "cuda":
         raise RuntimeError("--auto-batch requires CUDA")
     # Keep a generous memory reserve for the real optimizer and DDP buckets.
-    # The canonical no-checkpoint B=16 graph is validated on B300; smaller
-    # devices receive a proportionally lower bound through calibration.
+    # At S=8192 the calibration sweep is bounded by CANONICAL_MAX_BATCH and
+    # every candidate runs the complete graph-compatible update.
     if int(args.auto_batch_max) < 1:
         raise ValueError("--auto-batch-max must be positive")
-    # The full model keeps its activation graph for the canonical B=16 shape;
-    # calibration catches a synchronized OOM before any collective that would
-    # deadlock a DDP rank. Use the requested bound directly; a conservative
-    # memory heuristic would reject the validated graph batch on B300.
+    # Calibration catches a synchronized OOM before any collective that would
+    # deadlock a DDP rank. Use the requested bound directly rather than a
+    # memory heuristic, because graph and FP8 workspace requirements are
+    # runtime-dependent.
     max_batch = min(max(1, int(args.auto_batch_max)), CANONICAL_MAX_BATCH)
     manifest_doc_count = int(getattr(args, "_manifest_doc_count", 0))
     if manifest_doc_count <= 0:
@@ -2776,8 +2775,8 @@ def main():
     # rank-aware deterministic partition.
     torch.manual_seed(1729)
     cfg = load_config()
-    # The canonical configuration already fixes max_seq_len=4096 and the
-    # corresponding 512-latent MoE capacity.  Keep those values immutable so
+    # The canonical configuration fixes max_seq_len=8192 while retaining the
+    # 512-latent capacity. Keep those values immutable so
     # a production run cannot quietly become a shorter partial model.
     cfg.validate_canonical()
     minimum_ratio_target = float(args.seq) / float(cfg.chunk_capacity_tokens)

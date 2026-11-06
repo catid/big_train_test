@@ -4,7 +4,7 @@ The production byte model is planned for **100B GPT-2-token equivalents**.
 That is a token-equivalent accounting target only; the model trains directly
 on UTF-8 bytes. The manifest must record the realized raw-byte total as well.
 For the proposed English-heavy mixture, 100B token equivalents will usually
-require roughly 300–500B UTF-8 bytes, or about 73–122M 4096-byte windows.
+require roughly 300–500B UTF-8 bytes, or about 37–61M 8192-byte windows.
 
 The initial mixture is:
 
@@ -73,13 +73,15 @@ source-independent: repository identifiers or normalized URL hosts (including
 place the same host in opposite splits.
 
 Run `tools/benchmark_byte_stream.py` before a long job to verify the actual
-manifest and batch shape. The validated eight-GPU B300 path at `B=18, S=4096`
+manifest and batch shape. The historical eight-GPU B300 loader path at `B=18, S=4096`
 writes directly into persistent CUDA-graph inputs and measured `0.734 ms` per
 batch at the slowest rank over 100 warmed steps on the finalized 123M-document
-corpus (the exact value depends on page-cache state and host contention). The
+corpus. That value is not an S8192 measurement; run the benchmark with its
+default `S=8192` before using it for calibration. The exact value depends on
+page-cache state and host contention. The
 stream must keep active and loss masks enabled
 for the production mixture: the loader's document-local pilot had only 23.1%
-of documents long enough to fill a complete 4096-byte window.
+of documents long enough to fill a complete 8192-byte window.
 
 The trainer's distributed default uses `--manifest-hash-mode rank0`: rank zero
 hashes the large payload, compact index, and metadata sidecar once, while every

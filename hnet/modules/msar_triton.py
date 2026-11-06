@@ -302,7 +302,7 @@ def _causal_depthwise_dy(
 ):
     """Forward causal depthwise correlation for the MSAR stream bank.
 
-    ``torch.conv1d`` was previously used here.  At the production B16/S4096
+    ``torch.conv1d`` was previously used here.  At the historical B16/S4096
     shape it selected the generic depthwise path and accounted for roughly
     29 ms of every replay.  The kernel keeps the same zero-left-padding and
     filter orientation, accumulates in FP32, and narrows once at the output.
@@ -1177,7 +1177,7 @@ def _depthwise_dw(
         channels,
         length,
         # Weight-gradient reduction is bandwidth-bound.  A 512-token tile halves the
-        # launch grid at the canonical B16/S4096 shape and benchmarks faster
+        # launch grid at the historical B16/S4096 shape and benchmarks faster
         # across the source-bank sizes while retaining the same FP32
         # accumulation and causal indexing.
         BLOCK_T=512,

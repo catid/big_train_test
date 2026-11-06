@@ -27,6 +27,27 @@ the unreleased Cartesia model.
 
 The canonical DDP + FBT2 + AnchorMuon update always uses CUDA graphs for the
 fixed full-system training shape.
+
+## S8192 validation
+
+The canonical shape is now `S=8192`. No S8192 throughput or batch-capacity
+number is recorded until a complete eight-rank run has executed the actual
+FP8 forward/backward, DDP reduction, AnchorMuon/AdamATan2 update, and CUDA-graph
+replay. The calibration command is:
+
+```sh
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+torchrun --nproc_per_node=8 train_hnet_600m.py \
+  --manifest /path/to/s8192.manifest.json --seq 8192 \
+  --auto-batch-max 1 --steps 3 --warmup 1 --eval-every 0 \
+  --ckpt-every 0 --out /tmp/hnet_s8192_run.json \
+  --checkpoint /tmp/hnet_s8192_last.pt
+```
+
+Raise `--auto-batch-max` only after the complete run is finite. Record the
+selected batch, per-GPU power, median graph step time, tokens/s/GPU, peak
+memory, and reducer storage mode in the external run report. Artifacts and
+payloads remain outside this repository.
 Router-selected chunks are left-aligned with trailing padding; causal
 attention cannot see that future padding, and active masks clear padded MLP and
 residual rows. The graph path fails during capture if a TE kernel or DDP setup
@@ -37,7 +58,8 @@ storage through capture, so replay reduces six coalesced reducer storages
 directly; if a runtime does not expose that layout, it falls back to one flat
 reduction per parameter dtype. The exact B=14/S=4096 full step measured 1.78695
 seconds (32,090 tokens/s/GPU) on eight B300 GPUs, versus 1.85275 seconds before
-preserving bucket views; all four measured updates were finite.
+preserving bucket views; all four measured updates were finite. This is a
+historical S4096 measurement and is not an S8192 capacity or throughput claim.
 
 A clean full-model B=18/S=4096 validation with optimizer state and CUDA-graph
 capture measured 611.8 ms per update (120,508 tokens/s/GPU) on eight B300 GPUs;
@@ -91,7 +113,7 @@ Example launch (artifacts stay outside this repository):
 ```sh
 torchrun --nproc_per_node=8 train_hnet_600m.py \
   --manifest /path/to/fineweb_text.manifest.json \
-  --seq 4096
+  --seq 8192
 ```
 
 The trainer emits UTC, step-numbered pretraining telemetry in the same shape as
@@ -161,7 +183,7 @@ shared expert. For the 1536-wide middle stack, LatentMoE uses a fixed 384-wide
 latent path (`d/4`), 1664 neurons per routed expert, and 512 neurons in the
 shared expert. The down/up projections and widened latent experts preserve the
 former dense width-4096 SwiGLU parameter budget while increasing total expert
-capacity; the model has 603,935,652 trainable parameters. Router logits,
+capacity; the full runtime reports 603,935,676 trainable parameters. Router logits,
 probabilities, auxiliary loss, and routed accumulation remain FP32 around FP8
 GEMMs. Eager execution schedules the shared expert on a CUDA side stream with
 explicit event ordering; the production CUDA-graph path keeps the shared and
@@ -178,7 +200,7 @@ persistent FP32 master copies for every update, SODA anchor, moment, and decay;
 checkpoint reload restores those tensors without narrowing them.
 The matrix residual stage batches the SODA pull, decoupled decay, and update
 with foreach kernels within each same-shape optimizer chunk. A deterministic
-probe over all canonical parameter shapes (603,935,652 elements) produced
+probe over all canonical parameter shapes (603,935,676 elements) produced
 bit-identical BF16 parameters and FP32 optimizer state for two updates; the
 full eight-rank B14 graph remained finite with no measured end-to-end
 regression.

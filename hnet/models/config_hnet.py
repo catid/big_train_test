@@ -64,7 +64,7 @@ class HNetConfig:
     fbt_passes: int = 2
     fbt_jitter: float = 0.02
     fbt_prefix_mixin: bool = True
-    max_seq_len: int = 4096
+    max_seq_len: int = 8192
     static_chunking: bool = True
     # Maximum number of learned latent boundaries retained by one chunking
     # stage.  The tensor remains statically sized for CUDA graphs; when the
@@ -103,8 +103,8 @@ class HNetConfig:
             raise ValueError("the canonical model is byte-level with vocab_size=256")
         if self.swa_window_size != 128 or self.inner_loops != 2:
             raise ValueError("the canonical model requires a 128-token SWA window and two inner loops")
-        if int(self.max_seq_len) != 4096:
-            raise ValueError("the canonical model requires max_seq_len=4096")
+        if int(self.max_seq_len) != 8192:
+            raise ValueError("the canonical model requires max_seq_len=8192")
         if int(self.msar_block_size) != 4:
             raise ValueError("the canonical model requires MSAR boundaries every four layers")
         if not (self.msar and self.fbt and self.static_chunking and self.fbt_passes == 2):

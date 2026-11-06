@@ -28,7 +28,7 @@
     "fbt_passes": 2,
     "fbt_jitter": 0.02,
     "fbt_prefix_mixin": true,
-    "max_seq_len": 4096,
+    "max_seq_len": 8192,
     "static_chunking": true,
     "chunk_capacity_tokens": 512,
     "msar_activation_checkpointing": false,

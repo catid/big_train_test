@@ -43,8 +43,8 @@ def _distributed_context() -> tuple[int, int, torch.device]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
-    parser.add_argument("--batch", type=int, default=18)
-    parser.add_argument("--seq", type=int, default=4096)
+    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--seq", type=int, default=8192)
     parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--seed", type=int, default=1729)
