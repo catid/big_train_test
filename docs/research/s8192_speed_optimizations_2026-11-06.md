@@ -84,3 +84,27 @@ The byte-stream and manifest regression tests also pass in the reviewed
 runtime.  The runtime image does not include `pytest`, so the repository's
 standalone test scripts were used rather than claiming a pytest suite that was
 not installed.
+## Current full-system rerun
+
+A fresh eight-rank run of the checked-in `dbed2ef` path was used as the current
+optimization baseline. It exercised the complete 603,935,676-parameter model
+at `B=16,S=8192` with FP8, FBT, LatentMoE, MSAR, CUDA graphs, DDP, and the
+AnchorMuon/AdamATan2 update. Step times were `1576.1, 924.3, 705.0, 704.7,
+705.4 ms`; the steady mean was `704.9 ms` (about `1.49M` aggregate bytes/s or
+`186.6k` bytes/s/GPU). Batch calibration selected `B=16` with roughly `348 W`
+peak per GPU, and all five updates were finite.
+
+The dominant single-rank graph costs remain Mamba-3 DQKV backward (`91.45 ms`),
+Mamba-3 forward (`40.32 ms`), generic elementwise/copy work (about `67.7 ms`),
+FP8 quantization (about `32.0 ms`), MSAR pointer gradients (`15.02 ms`), and
+Mamba rotary/bias backward (`14.65 ms`).
+
+The only new Python-level candidate, caching FP32 MSAR query/pre/bias casts for
+the recurrent loop, was rejected. Its forward and most gradients matched, but
+`msar_queries.grad` changed (maximum absolute difference `9.77e-4`, RMS
+`1.56e-4`) because the full-bank cast changed FP32 accumulation order. The
+worktree was restored to `dbed2ef`; no production speed patch was promoted.
+The DDP/data path is already covered by direct DMA, one-batch prefetch, and
+direct reducer-storage reductions. Remaining high-value work is upstream
+Mamba-3 kernel tuning or aggregation of Transformer Engine quantization
+launches, each requiring full fixed-shape parity and an eight-rank rerun.
