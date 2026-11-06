@@ -106,20 +106,23 @@ incorrect.
 6. **DDP and TE collective ordering needs explicit evidence.** The graph replay
    path launches explicit gradient all-reduces in
    `train_hnet_600m.py:2631-2667`, while `hnet/te.py:418-429` gives TE FP8
-   delayed-scaling reductions `torch.distributed.group.WORLD`. The code
-   currently starts gradient collectives asynchronously and then performs TE
-   reductions before waiting. Even if the operations are mathematically
-   independent, they share a communicator; NCCL ordering must be validated on
-   the exact S8192 graph run or moved to a separate communicator. Do not infer
-   safety from a single-rank result.
+   delayed-scaling reductions `torch.distributed.group.WORLD`. The code starts
+   gradient work asynchronously, but it does so on the same stream before
+   waiting; this should be treated as ordered execution unless a separate
+   communicator/stream experiment proves otherwise. The shared-communicator
+   contract still needs an exact S8192 multi-rank parity and deadlock check,
+   and a single-rank run is not evidence for distributed overlap safety.
 
 7. **FP8 availability is environment-specific.** Source/runtime provenance is
    pinned to GDN2 `5ec53d56`, `library_of_layers` `03b85f4`, Transformer Engine
    `9646c3ef`, and the reviewed binary manifest. On this audit host, importing
    the package failed closed because the resolved cuBLASLt reports version
-   `13.8.0` while the runtime gate requires at least `13.8.1`. A run is not
-   FP8 evidence until the reviewed CUDA patch is installed and the exact
-   binary hashes pass `assert_fp8_runtime()`.
+   `13.8.0` while the runtime gate requires at least `13.8.1`. This was an
+   audit-shell host probe; the previously recorded `/tmp/hnet-venv` S8192 run
+   used the passing reviewed runtime (`130802`). Keep both facts in the run
+   record rather than treating the host probe as a contradiction. A run is not
+   FP8 evidence until the reviewed CUDA patch is installed and the exact binary
+   hashes pass `assert_fp8_runtime()`.
 
 8. **Checkpoint state scope is limited to training state.** The trainer saves
    model/optimizer/RNG/data and runtime provenance. It does not serialize a
