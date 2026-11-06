@@ -67,3 +67,20 @@ those warnings remain a correctness/release gate and were not suppressed for
 these measurements.  Future kernel changes must repeat full eager/graph
 parity for logits, losses, gradients, updates, and optimizer state before
 being promoted.
+
+## Additional MSAR probes that were not promoted
+
+The current `_msar_expand_batched` path already materializes contiguous
+`[N,B,L,D]` stream banks.  A focused RMSNorm/score probe measured about
+`0.385 ms` for the contiguous bank versus `0.647 ms` for a strided bank, so
+removing that copy would move work into a slower hidden-copy path.  Pointer
+forward/gradient-bank launch changes were bit-identical but timing was
+inconsistent across source counts and shapes.  A flattened eager `matmul`
+score spelling was about 10% faster in isolation, while its compiled fixed
+graph specialization was slightly slower (`1.35` versus `1.38 ms`); it was
+therefore not promoted without a full graph gain.
+
+The byte-stream and manifest regression tests also pass in the reviewed
+runtime.  The runtime image does not include `pytest`, so the repository's
+standalone test scripts were used rather than claiming a pytest suite that was
+not installed.
