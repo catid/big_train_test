@@ -446,11 +446,26 @@ class DeChunkLayer(nn.Module):
                 )
                 p = packed_p
             else:
-                token_idx = (
-                    torch.arange(L, device=hidden_states.device)[None, :]
-                    + (~boundary_mask).long() * L
-                )
-                seq_sorted_indices = torch.argsort(token_idx, dim=1)
+                # ``ChunkLayer`` already computed this stable partition for
+                # the same boundary mask.  Reuse it across the FBT passes;
+                # recomputing an argsort here used to launch a second
+                # O(L log L) sort for every pass even though the order is
+                # unchanged.  Keep the old expression for callers that do
+                # not provide the paired chunk indices (inference and direct
+                # module users), while the canonical training path always
+                # supplies ``sort_indices``.
+                if sort_indices is None:
+                    token_idx = (
+                        torch.arange(L, device=hidden_states.device)[None, :]
+                        + (~boundary_mask).long() * L
+                    )
+                    seq_sorted_indices = torch.argsort(token_idx, dim=1)
+                else:
+                    if sort_indices.shape != boundary_mask.shape:
+                        raise ValueError(
+                            "sort_indices must match the boundary-mask shape"
+                        )
+                    seq_sorted_indices = sort_indices
                 p = torch.gather(
                     p, dim=1, index=seq_sorted_indices[:, : hidden_states.shape[1]]
                 )
