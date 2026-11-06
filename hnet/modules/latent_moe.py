@@ -657,7 +657,12 @@ class LatentMoE(nn.Module):
         routing_map.mul_(valid[:, None])
         self._expert_counts.add_(routing_map.sum(dim=0, dtype=torch.float32))
         self._expert_active_count.add_(active_count)
-        routing_probs = probs * routing_map.to(probs.dtype)
+        # TE's mask-map unpermute can read the original dense FP32 router
+        # probabilities through row_id_map and apply them in its FP32 merge
+        # accumulator. Do not materialize a second [tokens, experts] masked
+        # probability map or multiply every padded expert row in BF16 before
+        # unpermute; that adds a full activation-sized kernel on every routed
+        # invocation and rounds the routing weight before the merge.
         if route_counts is not None:
             route_state = route_counts[loop_idx, layer_idx]
             if decode:
@@ -699,11 +704,11 @@ class LatentMoE(nn.Module):
             self._expert_starts_cache[starts_key] = expert_starts
         pad_offsets = expert_starts - prefix_counts
         latent = self.down(flat)
-        dispatched, row_id_map, permuted_probs = self.fused_router.permute(
+        dispatched, row_id_map, _ = self.fused_router.permute(
             latent,
             routing_map,
             self.num_experts * capacity,
-            routing_probs,
+            None,
             pad_offsets,
         )
         split_key = (flat.device.type, flat.device.index, capacity)
@@ -748,15 +753,16 @@ class LatentMoE(nn.Module):
         expert_out = self.experts_fc2(
             expert_hidden, m_splits, is_first_microbatch=is_first_microbatch_fc2
         )
-        # TE returns a flattened top-1 probability vector. Apply it before
-        # unpermute so the custom op receives no narrow [N,1] probability
-        # tensor (which older TE builds cannot differentiate correctly).
-        expert_out = expert_out * permuted_probs.reshape(-1, 1).to(expert_out.dtype)
+        # The pinned TE mask-map unpermute reads the accepted route's weight
+        # directly from the original dense FP32 probability matrix and
+        # accumulates the weighted expert output in FP32. This removes the
+        # old padded-row multiply and preserves router-gradient support.
         routed_latent = self.fused_router.unpermute(
             expert_out,
             row_id_map,
             restore_shape=latent.shape,
             pad_offsets=pad_offsets,
+            merging_probs=probs,
         )
         # ``routed_latent`` already has the model activation dtype produced by
         # the grouped expert GEMM.  Feeding it directly to the BF16 up

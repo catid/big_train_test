@@ -73,6 +73,15 @@ was revalidated on the same complete graph shape: 608.05 ms/update median
 (121,253 tokens/s/GPU), with all 15 steady updates finite and direct DDP
 storage preserved. Production-shaped MSAR forward/backward parity was exact.
 
+The S8192 LatentMoE route-weight optimization passes the original FP32 router
+probabilities directly to TE's mask-map unpermute. This removes the padded
+expert-row weighting multiply and keeps the merge accumulation in FP32. A
+fresh full eight-rank `B=16,S=8192` run stayed finite and measured 1576.9,
+885.1, and 706.1 ms for its first three steps; the final step reached 185,622
+tokens/s/GPU. The first step includes graph optimizer initialization, so use
+the latter two for steady-state comparisons. Eager output/gradient parity and
+CUDA-graph replay parity were checked separately before adopting the change.
+
 The graph contract retains at most 512 learned latent rows per outer sequence.
 If routing emits more boundaries, the first 512 causal boundaries are kept; a
 future byte cannot retroactively evict an earlier latent. The same effective
