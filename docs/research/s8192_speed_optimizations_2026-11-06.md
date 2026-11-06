@@ -109,6 +109,13 @@ direct reducer-storage reductions. Remaining high-value work is upstream
 Mamba-3 kernel tuning or aggregation of Transformer Engine quantization
 launches, each requiring full fixed-shape parity and an eight-rank rerun.
 
+The Mamba wrapper's `torch.compile(..., fullgraph=True)` was also tested in an
+isolated current-source probe. It fails before the first forward because the
+native `mamba3_siso_combined` custom-autograd path calls `triton.set_allocator`,
+which TorchDynamo cannot trace (`ContextVar.set`). The existing
+`fullgraph=False, dynamic=False` wrapper is therefore retained; no compile
+candidate was benchmarked or promoted.
+
 ## Rejected: Mamba-3 chunk-size variants
 
 A pinned `/tmp/hnet-venv` microbenchmark at `B=16,S=8192,D=1024` compared the
