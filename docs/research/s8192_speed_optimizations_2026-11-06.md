@@ -108,3 +108,13 @@ The DDP/data path is already covered by direct DMA, one-batch prefetch, and
 direct reducer-storage reductions. Remaining high-value work is upstream
 Mamba-3 kernel tuning or aggregation of Transformer Engine quantization
 launches, each requiring full fixed-shape parity and an eight-rank rerun.
+
+## Rejected: Mamba-3 chunk-size variants
+
+A pinned `/tmp/hnet-venv` microbenchmark at `B=16,S=8192,D=1024` compared the
+native Mamba-3 SISO chunk sizes. The canonical `chunk_size=32` was about
+`25.24 ms` median for one forward/backward layer; `16` was `26.40 ms` (+4.6%)
+and `64` was `30.47 ms` (+20.7%). They also changed the recurrence numerics:
+relative to the canonical output, chunk 16 had max absolute difference `4.0`
+and RMS `0.0265`, while chunk 64 had max `1374` and RMS `16.24`. Both variants
+were rejected and the canonical chunk size remains 32.
